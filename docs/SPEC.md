@@ -235,7 +235,7 @@ Deferred until asked for: marks + bulk actions, move-to-session, peek
 
 ## 12. Implementation
 
-**M0–M1: bash + fzf (≥ 0.54), one script.** fzf 0.74 covers every v1
+**M0–M1: bash + a recent fzf, one script.** fzf 0.74 covers every v1
 interaction without leaving the popup:
 
 - inline rename: `^r` → `transform` into rename mode (`change-prompt`,
@@ -256,7 +256,7 @@ editors disturbed by reload, header rows fighting navigation, preview
 latency). Same stack as tmux-agent-sidebar.
 
 **Install:** a TPM plugin (`tmux-home.tmux` sets the bindings and nothing
-else). Dependencies: bash, fzf ≥ 0.54, tmux ≥ 3.3.
+else). Dependencies: bash, a recent fzf (M0 uses `--id-nth`, `--footer` and `wait`; tested with 0.74.4), tmux ≥ 3.3.
 
 **Testing:** all tmux I/O in one function set, exercised against a
 throwaway `tmux -L tmux-home-test` server.
