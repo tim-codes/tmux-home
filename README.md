@@ -4,9 +4,10 @@ A full-window home screen for tmux: every session, window and pane in one
 popup, with the state of your coding agents alongside, and rename, reorder
 and close without ever leaving it.
 
-> **Status: design.** Nothing to install yet. The UX spec is in
-> [`docs/SPEC.md`](docs/SPEC.md); the first milestone (M0) is a bash + fzf
-> script.
+> **Status: M0.** A bash + fzf prototype: grouped window list, type-first
+> filter, preview, `⏎` switch, inline `^r` rename, `M-r` auto-name. Agents,
+> close, reorder and live refresh come in later milestones — see
+> [`docs/SPEC.md`](docs/SPEC.md) §13.
 
 ## Why
 
@@ -21,6 +22,42 @@ and close without ever leaving it.
 tmux-home puts the overview, the management and the agent state in one
 place, and keeps you in it until you choose where to go.
 
+## Install
+
+With [TPM](https://github.com/tmux-plugins/tpm):
+
+```tmux
+set -g @plugin 'tim-codes/tmux-home'
+# set -g @home-keys 'w f'   # prefix keys to bind (default); '' binds nothing
+```
+
+Or clone it and add `run-shell ~/path/to/tmux-home/tmux-home.tmux`.
+
+Try it without installing (from a shell inside tmux, in a checkout):
+
+```sh
+tmux display-popup -E -B -w 100% -h 100% \
+  -e "TMUX_HOME_CLIENT=$(tmux display -p '#{client_name}')" "$PWD/bin/tmux-home"
+```
+
+## Keys (M0)
+
+| Key | Action |
+| --- | --- |
+| type | filter (session, name, command, path) |
+| `↑` `↓` `^p` `^n` `^k` `^j` | move |
+| `⏎` | switch to the window, close |
+| `Esc` | clear the filter; close when empty |
+| `^r` | rename inline (`⏎` save, `Esc` or empty cancels) |
+| `M-r` | back to the automatic name |
+| `^o` | toggle preview |
+| `F1` `^/` | help |
+
+## Tests
+
+`tests/run` drives the real popup through a client attached to a throwaway
+`tmux -L tmux-home-test` server; it never touches your tmux server.
+
 ## Planned
 
 - `prefix w` / `prefix f` open a borderless full-window popup, cursor in the
@@ -33,9 +70,11 @@ place, and keeps you in it until you choose where to go.
   [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)
   publishes.
 
-## Requirements (planned)
+## Requirements
 
-tmux ≥ 3.3, fzf ≥ 0.54, bash. Agent state needs tmux-agent-sidebar.
+tmux ≥ 3.3, a recent fzf (M0 uses `--id-nth`, `--footer` and `wait`;
+tested with fzf 0.74.4 and tmux 3.7c), bash. Agent state (M2) will need
+tmux-agent-sidebar.
 
 ## Licence
 
