@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# tmux-home — full-window tmux popup window manager (M0: bash + fzf).
+#
+# Usage:
+#   tmux-home                 open the finder (run inside `display-popup`)
+#   tmux-home list            print the window rows fzf consumes
+#   tmux-home preview @id     capture the window's active (non-sidebar) pane
+#   tmux-home rename @id NAME rename a window by ID
+#   tmux-home reset-name @id  turn automatic-rename back on for a window
+#   tmux-home help            print the key reference
+#
+# The remaining subcommands (act-*, layout) are fzf callbacks.
+#
+# Environment:
+#   TMUX_HOME_CLIENT  client to switch on ⏎ (set by the popup binding);
+#                     falls back to the client of the pane we run in.
+#   TMUX_HOME_TMUX    tmux command to use, word-split (default: tmux),
+#                     e.g. "tmux -L tmux-home-test" for tests.
+#
+# Every write targets IDs (@window_id, $session_id), never indexes or names.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+TAB=$'\t'
+
+read -r -a TMUX_CMD <<<"${TMUX_HOME_TMUX:-tmux}"
+t() { "${TMUX_CMD[@]}" "$@"; }
+
+# ---------------------------------------------------------------- tmux I/O
+
+# Name of the client whose view we are managing.
+home_client() {
+	if [[ -n ${TMUX_HOME_CLIENT:-} ]]; then
+		printf '%s\n' "$TMUX_HOME_CLIENT"
+	else
+		t display-message -p '#{client_name}' 2>/dev/null || true
+	fi
+}
+
+# "<session_id>\t<window_id>" the client is currently showing (empty if none).
+client_location() {
+	local client
+	client=$(home_client)
+	[[ -n $client ]] || return 0
+	t list-clients -F "#{client_name}${TAB}#{session_id}${TAB}#{window_id}" |
+		awk -F "$TAB" -v c="$client" '$1 == c { print $2 "\t" $3; exit }'
+}
+
+# Window rows, tab-separated:
+#   <session_id> <window_id> <pane_id> <display>
+# grouped by session (the client's session first, then by name), windows in
+# index order. <pane_id> is the pane the preview captures: the active pane
+# unless it is a sidebar (@pane_role=sidebar), else the first non-sidebar
+# pane. Sidebar panes never contribute to a row.
+list_rows() {
+	local loc cur_sid cur_wid
+	loc=$(client_location)
+	cur_sid=${loc%%"$TAB"*}
+	cur_wid=${loc#*"$TAB"}
+	[[ -n $loc ]] || { cur_sid=""; cur_wid=""; }
+
+	t list-panes -a -F "#{session_id}${TAB}#{session_name}${TAB}#{window_id}${TAB}#{window_index}${TAB}#{window_name}${TAB}#{pane_id}${TAB}#{pane_active}${TAB}#{@pane_role}${TAB}#{pane_current_command}${TAB}#{pane_current_path}" |
+		awk -F "$TAB" -v OFS="$TAB" -v home="$HOME" -v csid="$cur_sid" -v cwid="$cur_wid" '
+		function shortpath(p,   n, i, parts, out) {
+			if (p == home) return "~"
+			if (index(p, home "/") == 1) p = "~" substr(p, length(home) + 1)
+			n = split(p, parts, "/")
+			out = parts[1]
+			for (i = 2; i <= n; i++)
+				out = out "/" (i < n && length(parts[i]) > 1 ? substr(parts[i], 1, 1) : parts[i])
+			return out
+		}
+		{
+			sid = $1; wid = $3; key = sid SUBSEP wid
+			if (!(key in seen)) {
+				seen[key] = 1
+				order[++nw] = key
+				wsid[key] = sid; wsname[key] = $2; wwid[key] = wid
+				widx[key] = $4; wname[key] = $5
+			}
+			if ($8 == "sidebar") next
+			# first non-sidebar pane is the fallback; the active one wins
+			if (!(key in pane) || $7 == "1") {
+				pane[key] = $6; cmd[key] = $9; path[key] = shortpath($10)
+			}
+		}
+		END {
+			for (i = 1; i <= nw; i++) {
+				k = order[i]
+				rank = (wsid[k] == csid) ? 0 : 1
+				cur = (wsid[k] == csid && wwid[k] == cwid) ? 1 : 0
+				gsub(/\t/, " ", wname[k])
+				print rank, wsname[k], widx[k], wsid[k], wwid[k], pane[k], cur, wname[k], cmd[k], path[k]
+			}
+		}' |
+		LC_ALL=C sort -t "$TAB" -k1,1n -k2,2 -k3,3n |
+		awk -F "$TAB" -v OFS="$TAB" '
+		BEGIN {
+			bold = "\033[1m"; dim = "\033[2m"; cyan = "\033[36m"
+			yellow = "\033[33m"; reset = "\033[0m"
+		}
+		{ rows[NR] = $0; w = length($2); if (w > sw) sw = w }
+		END {
+			if (sw > 16) sw = 16
+			for (i = 1; i <= NR; i++) {
+				split(rows[i], f, "\t")
+				sname = substr(f[2], 1, sw)
+				# session name on every row keeps it filterable; only the
+				# first row of each group is emphasised, the rest dimmed.
+				if (f[4] != prev) { s = bold cyan sprintf("%-" sw "s", sname) reset; prev = f[4] }
+				else s = dim sprintf("%-" sw "s", sname) reset
+				mark = (f[7] == "1") ? yellow "▶" reset : " "
+				disp = sprintf("%s %s %3s  %-24s  %s%-10s  %s%s", s, mark, f[3], f[8], dim, f[9], f[10], reset)
+				print f[4], f[5], f[6], disp
+			}
+		}'
+}
+
+# Visible content of the window's preview pane, trailing blank lines trimmed
+# so `follow` in the preview window lands on the last real line.
+preview_window() {
+	local wid=$1 pane
+	pane=$(list_rows | awk -F "$TAB" -v w="$wid" '$2 == w { print $3; exit }')
+	[[ -n $pane ]] || { echo "(no pane)"; return 0; }
+	t capture-pane -e -p -t "$pane" |
+		awk '{ l[NR] = $0; s = $0; gsub(/\033\[[0-9;]*m|[ \t]/, "", s); if (s != "") last = NR }
+		     END { for (i = 1; i <= last; i++) print l[i] }'
+}
+
+window_name() { t display-message -p -t "$1" '#{window_name}'; }
+
+rename_window() { t rename-window -t "$1" -- "$2"; }
+
+reset_window_name() { t set-option -w -t "$1" -u automatic-rename; }
+
+switch_to() {
+	local sid=$1 wid=$2 client
+	client=$(home_client)
+	if [[ -n $client ]]; then
+		t switch-client -c "$client" -t "$sid:$wid"
+	else
+		t switch-client -t "$sid:$wid"
+	fi
+}
+
+# ---------------------------------------------------------------- fzf glue
+
+FOOTER_LIST=' ⏎ go   ^r rename   M-r auto-name   ^o preview   Esc clear/close   F1 keys'
+FOOTER_RENAME=' ⏎ save   Esc cancel   (empty name cancels)'
+PROMPT_LIST='> '
+PROMPT_RENAME='rename › '
+
+# Keys that must not act while the rename editor is open.
+LIST_KEYS='change,ctrl-r,alt-r,up,down,ctrl-n,ctrl-p,ctrl-j,ctrl-k,page-up,page-down,ctrl-o,f1,ctrl-/'
+
+# fzf_action NAME ARG: NAME(ARG) with a bracket pair that doesn't occur in
+# ARG, so arbitrary text (window names, queries) can't break the parse.
+fzf_action() {
+	local name=$1 arg=$2 pair
+	for pair in '()' '[]' '{}' '<>' '~~' '!!' '@@' '##' '$$' '%%' '^^' '&&' '**' ';;' '//' '||'; do
+		if [[ $arg != *"${pair:0:1}"* && $arg != *"${pair:1:1}"* ]]; then
+			printf '%s%s%s%s' "$name" "${pair:0:1}" "$arg" "${pair:1:1}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+state_file() { printf '%s/%s\n' "${TMUX_HOME_STATE:?}" "$1"; }
+
+in_rename_mode() { [[ -s $(state_file rename-target) ]]; }
+
+# preview-window spec for the current terminal size (SPEC §5).
+preview_layout() {
+	local cols=$1 lines=$2
+	if ((cols >= 160)); then
+		echo 'right,50%,border-left,follow'
+	elif ((lines >= 30)); then
+		echo 'down,33%,border-top,follow'
+	else
+		echo 'down,50%,border-top,follow,hidden'
+	fi
+}
+
+act_layout() {
+	echo "change-preview-window($(preview_layout "${FZF_COLUMNS:-80}" "${FZF_LINES:-24}"))"
+}
+
+# ^r: open the inline editor pre-filled with the window's current name.
+act_rename_start() {
+	local wid=$1 name
+	[[ -n $wid ]] || return 0
+	name=$(window_name "$wid")
+	printf '%s\n' "$wid" >"$(state_file rename-target)"
+	printf '%s' "${FZF_QUERY:-}" >"$(state_file saved-query)"
+	# change-query:… must be last: the ':' form takes the rest verbatim.
+	printf '%s\n' "track-current+unbind($LIST_KEYS)+disable-search+change-prompt($PROMPT_RENAME)+change-footer($FOOTER_RENAME)+change-query:$name"
+}
+
+# Leave the editor: restore list mode and the filter that was there before.
+rename_finish() {
+	local saved
+	saved=$(cat "$(state_file saved-query)" 2>/dev/null || true)
+	: >"$(state_file rename-target)"
+	local restore='clear-query' # an empty change-query() is not applied
+	[[ -z $saved ]] || restore=$(fzf_action change-query "$saved")
+	# Restore the query BEFORE reloading: while --track looks for the renamed
+	# item in the reloaded list fzf ignores query changes.
+	printf '%s\n' "enable-search+change-prompt($PROMPT_LIST)+change-footer($FOOTER_LIST)+rebind($LIST_KEYS)+$restore+reload-sync:$(printf '%q' "$SELF") list"
+}
+
+act_enter() {
+	if in_rename_mode; then
+		local wid name
+		wid=$(cat "$(state_file rename-target)")
+		name=${FZF_QUERY:-}
+		if [[ -n $name ]]; then
+			rename_window "$wid" "$name" >/dev/null 2>&1 || true
+		fi
+		rename_finish
+	else
+		echo accept
+	fi
+}
+
+act_esc() {
+	if in_rename_mode; then
+		rename_finish
+	else
+		# clear a non-empty filter (back to the top, as typing does), close on
+		# an empty one. Actions from a transform don't fire `change`.
+		if [[ -n ${FZF_QUERY:-} ]]; then echo 'clear-query+wait+first'; else echo abort; fi
+	fi
+}
+
+help_text() {
+	cat <<'EOF'
+tmux-home — keys
+
+  type            filter windows (session, name, command, path)
+  ↑ ↓  ^p ^n  ^k ^j   move selection
+  PgUp PgDn       page
+  ← →  Home End   edit the filter
+  ⏎               switch to the selected window and close
+  Esc             clear the filter; close if it is already empty
+  ^r              rename the window inline (⏎ save, Esc/empty cancel)
+  M-r             reset the window to its automatic name
+  ^o              toggle the preview
+  F1  ^/          this help
+
+press any key to return
+EOF
+}
+
+main() {
+	TMUX_HOME_STATE=$(mktemp -d "${TMPDIR:-/tmp}/tmux-home.XXXXXX")
+	export TMUX_HOME_STATE
+	trap 'rm -rf "$TMUX_HOME_STATE"' EXIT
+	: >"$(state_file rename-target)"
+
+	local rows cur_pos header loc cols lines self_q sel
+	rows=$(list_rows)
+	# start with the selection on the client's current window
+	cur_pos=$(printf '%s\n' "$rows" | awk '/▶/ { print NR; exit }')
+	loc=$(client_location)
+	header=" tmux-home"
+	if [[ -n $loc ]]; then
+		header+="   $(t display-message -p -t "${loc#*"$TAB"}" '#{session_name} ▸ #{window_index}')"
+	fi
+	read -r lines cols < <(stty size 2>/dev/null || echo "24 80")
+	self_q=$(printf '%q' "$SELF")
+
+	export FZF_DEFAULT_OPTS='' FZF_DEFAULT_OPTS_FILE=''
+	sel=$(printf '%s\n' "$rows" | fzf \
+		--with-shell 'bash -c' \
+		--ansi --no-sort --layout=reverse --no-multi --cycle \
+		--delimiter "$TAB" --with-nth 4 --id-nth 2 --track \
+		--prompt "$PROMPT_LIST" \
+		--header "$header" --footer "$FOOTER_LIST" \
+		--info inline-right \
+		--preview "$self_q preview {2}" \
+		--preview-window "$(preview_layout "$cols" "$lines")" \
+		--bind "load:pos(${cur_pos:-1})+unbind(load)" \
+		--bind "change:first" \
+		--bind "resize:transform:$self_q act-layout" \
+		--bind "enter:transform:$self_q act-enter" \
+		--bind "esc:transform:$self_q act-esc" \
+		--bind "ctrl-r:transform:$self_q act-rename-start {2}" \
+		--bind "alt-r:execute-silent($self_q reset-name {2})+reload-sync($self_q list)" \
+		--bind "up:up,down:down,ctrl-p:up,ctrl-n:down,ctrl-k:up,ctrl-j:down" \
+		--bind "page-up:page-up,page-down:page-down" \
+		--bind "ctrl-o:toggle-preview" \
+		--bind "f1:execute($self_q help),ctrl-/:execute($self_q help)" \
+		--bind "ctrl-c:abort,ctrl-g:ignore,ctrl-q:abort" \
+	) || return 0
+
+	local sid wid
+	IFS="$TAB" read -r sid wid _ <<<"$sel"
+	[[ -n $sid && -n $wid ]] && switch_to "$sid" "$wid"
+}
+
+cmd=${1:-}
+case $cmd in
+	'') main ;;
+	list) list_rows ;;
+	preview) preview_window "${2:?window id}" ;;
+	rename) rename_window "${2:?window id}" "${3:?name}" ;;
+	reset-name) reset_window_name "${2:?window id}" ;;
+	help)
+		help_text
+		IFS= read -r -s -n 1 _ </dev/tty || true
+		;;
+	act-layout) act_layout ;;
+	act-enter) act_enter ;;
+	act-esc) act_esc ;;
+	act-rename-start) act_rename_start "${2:-}" ;;
+	*)
+		echo "tmux-home: unknown command: $cmd" >&2
+		exit 2
+		;;
+esac
