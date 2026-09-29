@@ -9,6 +9,7 @@
 #   tmux-home reset-name @id  turn automatic-rename back on for a window
 #   tmux-home busy @id        print the non-shell commands running in a window
 #   tmux-home close @id       close a window (safely for the invoking client)
+#   tmux-home reopen          recreate the most recently closed window
 #   tmux-home help            print the key reference
 #
 # The remaining subcommands (act-*, layout) are fzf callbacks.
@@ -18,6 +19,8 @@
 #                     falls back to the client of the pane we run in.
 #   TMUX_HOME_TMUX    tmux command to use, word-split (default: tmux),
 #                     e.g. "tmux -L tmux-home-test" for tests.
+#   TMUX_HOME_STATE_DIR  where the closed-window stack lives (default:
+#                     ${XDG_STATE_HOME:-~/.local/state}/tmux-home).
 #
 # Every write targets IDs (@window_id, $session_id), never indexes or names.
 
@@ -178,6 +181,119 @@ window_info() {
 	t display-message -p -t "$1" "#{session_id}${TAB}#{session_name}${TAB}#{session_windows}${TAB}#{window_name}"
 }
 
+# ------------------------------------------------ closed-window stack
+#
+# Closing snapshots the window's shape (not its processes) onto a LIFO stack
+# of the last CLOSED_MAX windows, one line each, fields separated by US
+# (\x1f, not a whitespace IFS character, so empty fields survive):
+#   session_name index prev_wid next_wid auto(on|off) active_pane
+#   layout window_name path...
+# where path... is each non-sidebar pane's cwd in pane order.
+
+CLOSED_MAX=10
+US=$'\x1f'
+
+closed_file() {
+	printf '%s/closed\n' "${TMUX_HOME_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-home}"
+}
+
+snapshot_window() {
+	local wid=$1 sid sname idx auto layout wname prev next active=0 i=0 act path role
+	local paths=()
+	IFS="$US" read -r sid sname idx auto layout wname < <(t display-message -p -t "$wid" \
+		"#{session_id}${US}#{session_name}${US}#{window_index}${US}#{?automatic-rename,on,off}${US}#{window_layout}${US}#{window_name}")
+	read -r prev next < <(t list-windows -t "$sid" -F '#{window_id}' |
+		awk -v w="$wid" '$0 == w { found = 1; next } !found { p = $0 } found { n = $0; exit }
+		                 END { print (p == "" ? "-" : p), (n == "" ? "-" : n) }')
+	while IFS="$US" read -r act role path; do
+		[[ $role == sidebar ]] && continue
+		[[ $act == 1 ]] && active=$i
+		paths+=("${path//$US/ }")
+		i=$((i + 1))
+	done < <(t list-panes -t "$wid" -F "#{pane_active}${US}#{@pane_role}${US}#{pane_current_path}")
+	((${#paths[@]})) || paths=("$HOME")
+	# a sidebar pane makes the layout's pane count wrong: drop it
+	((i == $(t display-message -p -t "$wid" '#{window_panes}'))) || layout=''
+	local IFS="$US"
+	printf '%s\n' "$sname${US}$idx${US}$prev${US}$next${US}$auto${US}$active${US}$layout${US}${wname//$'\n'/ }${US}${paths[*]}"
+}
+
+push_closed() {
+	local f
+	f=$(closed_file)
+	mkdir -p "${f%/*}"
+	{
+		cat "$f" 2>/dev/null || true
+		printf '%s\n' "$1"
+	} | tail -n "$CLOSED_MAX" >"$f.tmp"
+	mv "$f.tmp" "$f"
+}
+
+# Remove and print the most recent entry (status 1 if there is none).
+pop_closed() {
+	local f
+	f=$(closed_file)
+	[[ -s $f ]] || return 1
+	tail -n 1 "$f"
+	sed '$d' "$f" >"$f.tmp"
+	mv "$f.tmp" "$f"
+}
+
+# window ID ($1) exists and belongs to session name $2
+window_in_session() {
+	[[ $1 != - ]] && [[ $(t display-message -p -t "$1" '#{session_name}' 2>/dev/null) == "$2" ]]
+}
+
+# Rebuild the most recently closed window with fresh shells in each pane's
+# old cwd, at its old place: the old index if free, else after/before its
+# old neighbour, else at the end; its session is recreated if it has gone.
+# Prints the new window ID; status 4 when the stack is empty.
+reopen_window() {
+	local entry sname idx prev next auto active layout wname new pane p size
+	local -a f paths
+	entry=$(pop_closed) || return 4
+	IFS="$US" read -r -a f <<<"$entry"
+	sname=${f[0]} idx=${f[1]} prev=${f[2]} next=${f[3]} auto=${f[4]}
+	active=${f[5]} layout=${f[6]} wname=${f[7]}
+	paths=("${f[@]:8}")
+	((${#paths[@]})) || paths=("$HOME")
+	local fmt=(-P -F '#{window_id}' -c "${paths[0]}")
+
+	if t has-session -t "=$sname" 2>/dev/null; then
+		new=$(t new-window -d "${fmt[@]}" -t "=$sname:$idx" 2>/dev/null) ||
+			{ window_in_session "$prev" "$sname" && new=$(t new-window -d -a "${fmt[@]}" -t "$prev"); } ||
+			{ window_in_session "$next" "$sname" && new=$(t new-window -d -b "${fmt[@]}" -t "$next"); } ||
+			new=$(t new-window -d "${fmt[@]}" -t "=$sname:")
+	else
+		# size it like the layout it is about to get
+		size=${layout#*,}
+		size=${size%%,*}
+		if [[ $size =~ ^([0-9]+)x([0-9]+)$ ]]; then
+			new=$(t new-session -d "${fmt[@]}" -s "$sname" -x "${BASH_REMATCH[1]}" -y "${BASH_REMATCH[2]}")
+		else
+			new=$(t new-session -d "${fmt[@]}" -s "$sname")
+		fi
+		t move-window -s "$new" -t "=$sname:$idx" 2>/dev/null || true
+	fi
+
+	# split the LAST pane each time so pane order matches the paths; retile
+	# as we go so small windows keep room for the next split
+	pane=$(t display-message -p -t "$new" '#{pane_id}')
+	for p in "${paths[@]:1}"; do
+		pane=$(t split-window -d -P -F '#{pane_id}' -t "$pane" -c "$p") || break
+		t select-layout -t "$new" tiled >/dev/null 2>&1 || true
+	done
+	[[ -z $layout ]] || t select-layout -t "$new" "$layout" >/dev/null 2>&1 || true
+	if [[ $auto == on ]]; then
+		t set-option -w -t "$new" automatic-rename on
+	else
+		t rename-window -t "$new" -- "$wname"
+	fi
+	pane=$(t list-panes -t "$new" -F '#{pane_id}' | sed -n "$((active + 1))p")
+	[[ -z $pane ]] || t select-pane -t "$pane"
+	printf '%s\n' "$new"
+}
+
 # Close a window without taking the popup down with it:
 # - the last window on the server is never closed (it would end the server,
 #   and the popup with it) — returns 3;
@@ -198,12 +314,15 @@ close_window() {
 			t switch-client -c "$client" -t "$other"
 		fi
 	fi
-	t kill-window -t "$wid"
+	local snap
+	snap=$(snapshot_window "$wid") || snap=''
+	t kill-window -t "$wid" || return 1
+	[[ -z $snap ]] || push_closed "$snap"
 }
 
 # ---------------------------------------------------------------- fzf glue
 
-FOOTER_LIST=' ⏎ go   ^r rename   M-r auto-name   ^x close   ^o preview   Esc clear/close   F1 keys'
+FOOTER_LIST=' ⏎ go   ^r rename   M-r auto-name   ^x close   ^t reopen   ^o preview   Esc clear/close   F1 keys'
 FOOTER_RENAME=' ⏎ save   Esc cancel   (empty name cancels)'
 FOOTER_CLOSE=' y close   any other key or Esc cancels'
 PROMPT_LIST='> '
@@ -211,7 +330,7 @@ PROMPT_RENAME='rename › '
 
 # Keys that must not act while an inline editor (rename, close confirm) is
 # open. The confirm keeps `change` bound: that is how it reads the answer.
-MODE_KEYS='ctrl-r,alt-r,ctrl-x,up,down,ctrl-n,ctrl-p,ctrl-j,ctrl-k,page-up,page-down,ctrl-o,f1,ctrl-/'
+MODE_KEYS='ctrl-r,alt-r,ctrl-x,ctrl-t,up,down,ctrl-n,ctrl-p,ctrl-j,ctrl-k,page-up,page-down,ctrl-o,f1,ctrl-/'
 LIST_KEYS="change,$MODE_KEYS"
 
 # fzf_action NAME ARG: NAME(ARG) with a bracket pair that doesn't occur in
@@ -357,6 +476,20 @@ act_change() {
 	fi
 }
 
+# ^t: reopen the most recently closed window (fresh shells, old cwds) and
+# put the cursor on it. The filter is cleared so the new row is visible.
+act_reopen() {
+	local wid pos
+	in_rename_mode || in_close_mode && return 0
+	if ! wid=$(reopen_window 2>/dev/null) || [[ -z $wid ]]; then
+		fzf_action change-footer " nothing to reopen"
+		echo
+		return 0
+	fi
+	pos=$(list_rows | awk -F "$TAB" -v w="$wid" '$2 == w { print NR; exit }')
+	printf '%s+clear-query+%s\n' "$(fzf_action change-footer "$FOOTER_LIST")" "$(reload_at "${pos:-1}")"
+}
+
 act_enter() {
 	if in_close_mode; then
 		close_finish no
@@ -399,6 +532,9 @@ tmux-home — keys
   M-r             reset the window to its automatic name
   ^x              close the window; asks first (y/N) if anything but a
                   shell is running in it, or if it is its session's last
+  ^t              reopen the last closed window (up to 10 back): same
+                  place, name, panes, layout and directories — but fresh
+                  shells; what was running in it is gone
   ^o              toggle the preview
   F1  ^/          this help
 
@@ -413,7 +549,7 @@ main() {
 	: >"$(state_file rename-target)"
 	: >"$(state_file close-target)"
 
-	local rows cur_pos header cols lines self_q sel
+	local rows cur_pos header cols lines self_q sel list_change
 	rows=$(list_rows)
 	# start with the selection on the client's current window
 	cur_pos=$(printf '%s\n' "$rows" | awk '/▶/ { print NR; exit }')
@@ -421,6 +557,8 @@ main() {
 	header=$(header_text)
 	read -r lines cols < <(stty size 2>/dev/null || echo "24 80")
 	self_q=$(printf '%q' "$SELF")
+	# list-mode `change`: back to the top, and drop any one-off footer notice
+	list_change=$(printf '%q' "first+$(fzf_action change-footer "$FOOTER_LIST")")
 
 	export FZF_DEFAULT_OPTS='' FZF_DEFAULT_OPTS_FILE=''
 	sel=$(printf '%s\n' "$rows" | fzf \
@@ -433,12 +571,13 @@ main() {
 		--preview "$self_q preview {2}" \
 		--preview-window "$(preview_layout "$cols" "$lines")" \
 		--bind "load:transform:$self_q act-load" \
-		--bind "change:transform:[[ -s \$TMUX_HOME_STATE/close-target ]] && exec $self_q act-change || echo first" \
+		--bind "change:transform:[[ -s \$TMUX_HOME_STATE/close-target ]] && exec $self_q act-change || echo $list_change" \
 		--bind "resize:transform:$self_q act-layout" \
 		--bind "enter:transform:$self_q act-enter" \
 		--bind "esc:transform:$self_q act-esc" \
 		--bind "ctrl-r:transform:$self_q act-rename-start {2}" \
 		--bind "ctrl-x:transform:$self_q act-close-start {2}" \
+		--bind "ctrl-t:transform:$self_q act-reopen" \
 		--bind "alt-r:execute-silent($self_q reset-name {2})+reload-sync($self_q list)" \
 		--bind "up:up,down:down,ctrl-p:up,ctrl-n:down,ctrl-k:up,ctrl-j:down" \
 		--bind "page-up:page-up,page-down:page-down" \
@@ -461,6 +600,7 @@ case $cmd in
 	reset-name) reset_window_name "${2:?window id}" ;;
 	busy) busy_commands "${2:?window id}" ;;
 	close) close_window "${2:?window id}" ;;
+	reopen) reopen_window ;;
 	help)
 		help_text
 		IFS= read -r -s -n 1 _ </dev/tty || true
@@ -472,6 +612,7 @@ case $cmd in
 	act-close-start) act_close_start "${2:-}" ;;
 	act-change) act_change ;;
 	act-load) act_load ;;
+	act-reopen) act_reopen ;;
 	*)
 		echo "tmux-home: unknown command: $cmd" >&2
 		exit 2

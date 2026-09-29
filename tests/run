@@ -18,6 +18,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/bin/tmux-home"
 
 unset TMUX TMUX_PANE TMUX_HOME_CLIENT
+# closed-window stack in a throwaway dir, never the real state dir
+TMUX_HOME_STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tmux-home-test.XXXXXX")
+export TMUX_HOME_STATE_DIR XDG_STATE_HOME=$TMUX_HOME_STATE_DIR/xdg
+CLOSED=$TMUX_HOME_STATE_DIR/closed
 export TMUX_HOME_TMUX="tmux -L tmux-home-test"
 export SHELL=/bin/sh # predictable, fast pane shells
 export LC_ALL=en_US.UTF-8
@@ -31,7 +35,7 @@ cleanup() {
 	O kill-server 2>/dev/null
 	S kill-server 2>/dev/null
 }
-trap cleanup EXIT
+trap 'cleanup; rm -rf "$TMUX_HOME_STATE_DIR"' EXIT
 cleanup
 
 pass=0 fail=0
@@ -153,6 +157,77 @@ TMUX_HOME_TMUX="tmux -L tmux-home-test-solo" "$BIN" close "$solo_w"
 eq 'close: last window on the server refused (exit 3)' 3 "$?"
 eq 'close: ... and the window survives' "$solo_w" "$(S display-message -p -t solo: '#{window_id}')"
 S kill-server
+
+# ------------------------------------------------------- reopen (CLI)
+echo '# closed-window stack / reopen'
+: >"$CLOSED"
+shape() { # index, name, auto-rename, active pane, pane count, geometry + cwd per pane
+	T display-message -p -t "$1" '#{window_index}|#{window_name}|#{?automatic-rename,on,off}|#{window_panes}'
+	T list-panes -t "$1" -F '#{pane_index}:#{pane_active}:#{pane_width}x#{pane_height}+#{pane_left}+#{pane_top}:#{pane_current_path}'
+}
+T new-window -d -t alpha:5 -n qshape -c /usr
+T split-window -d -h -t alpha:qshape -c /etc
+T split-window -d -v -t alpha:qshape.1 -c /var
+T resize-pane -t alpha:qshape.0 -x 60
+T select-pane -t alpha:qshape.2
+T set-option -w -t alpha:qshape automatic-rename off
+sleep 0.3
+want=$(shape alpha:qshape)
+"$BIN" close "$(wid_of alpha:qshape)"
+check 'close pushes a snapshot' test "$(wc -l <"$CLOSED")" -eq 1
+check '... and the window is gone' bash -c '! tmux -L tmux-home-test list-windows -t alpha -F "#W" | grep -qx qshape'
+new=$("$BIN" reopen)
+sleep 0.3
+eq 'reopen prints the new window ID' "$(wid_of alpha:qshape)" "$new"
+eq 'reopen restores index, name, panes, layout, cwds, active pane' "$want" "$(shape "$new")"
+check 'reopen pops the stack' test ! -s "$CLOSED"
+T kill-window -t "$new"
+
+T new-window -d -t alpha:5 -n qauto
+T set-option -w -t alpha:qauto automatic-rename on
+"$BIN" close "$(wid_of alpha:5)"
+new=$("$BIN" reopen)
+eq 'reopen keeps automatic-rename on' on "$(auto_of "$new")"
+T kill-window -t "$new"
+
+# old index taken: lands right after its old left-hand neighbour
+T new-window -d -t alpha:5 -n qn5
+T new-window -d -t alpha:6 -n qn6
+T new-window -d -t alpha:7 -n qn7
+for n in qn5 qn6 qn7; do T set-option -w -t "alpha:$n" automatic-rename off; done
+"$BIN" close "$(wid_of alpha:qn6)"
+T move-window -s alpha:qn7 -t alpha:6
+new=$("$BIN" reopen)
+eq 'reopen with its index taken goes after its old neighbour' 'qn5 qn6 qn7' \
+	"$(T list-windows -t alpha -F '#W' | grep '^qn' | tr '\n' ' ' | sed 's/ $//')"
+for n in qn5 qn6 qn7; do T kill-window -t "alpha:$n"; done
+
+# a closed session's last window brings the session back
+T new-session -d -s qgone -n qlast -c /usr
+T set-option -w -t qgone:qlast automatic-rename off
+sleep 0.3
+"$BIN" close "$(T display -p -t qgone: '#{window_id}')"
+check 'closing the last window ends the session' bash -c '! tmux -L tmux-home-test has-session -t "=qgone" 2>/dev/null'
+new=$("$BIN" reopen)
+sleep 0.3
+eq 'reopen recreates the session with the window' 'qgone qlast /usr' \
+	"$(T display -p -t "$new" '#{session_name} #{window_name} #{pane_current_path}')"
+T kill-session -t '=qgone'
+
+# LIFO, capped at 10
+T new-session -d -s qstack
+for i in $(seq 1 12); do T new-window -d -t qstack: -n "qs$i"; T set-option -w -t "qstack:qs$i" automatic-rename off; done
+for i in $(seq 1 12); do "$BIN" close "$(wid_of "qstack:qs$i")"; done
+eq 'stack keeps the last 10 closes' 10 "$(wc -l <"$CLOSED" | tr -d ' ')"
+order=''
+for i in $(seq 1 10); do order+="$(name_of "$("$BIN" reopen)") "; done
+eq 'reopen is LIFO' 'qs12 qs11 qs10 qs9 qs8 qs7 qs6 qs5 qs4 qs3 ' "$order"
+nwin=$(T list-windows -a | wc -l)
+"$BIN" reopen >/dev/null
+eq 'reopen on an empty stack exits 4' 4 "$?"
+eq '... and creates nothing' "$nwin" "$(T list-windows -a | wc -l)"
+T kill-session -t '=qstack'
+: >"$CLOSED"
 
 eq 'layout: >=160 cols -> right' 'change-preview-window(right,50%,border-left,follow)' \
 	"$(FZF_COLUMNS=200 FZF_LINES=50 "$BIN" act-layout)"
@@ -368,6 +443,39 @@ keys C-x
 wait_for 'qnext closed' '^> qnext .*0/4'
 esc
 wait_for 'back to the four fixture windows' '^> +.*4/4'
+
+# ^t reopens the last closed window (qnext) and selects it
+keys C-t
+wait_for '^t reopens the last closed window' '^> +.*5/5'
+check '... qnext is back' bash -c 'tmux -L tmux-home-test list-windows -t alpha -F "#W" | grep -qx qnext'
+check '... client not switched' bash -c '[[ $1 != *:qnext ]]' _ "$(client_at)"
+keys C-r
+wait_for '... cursor is on it' '^rename › qnext'
+esc
+wait_for 'back to list' '^> +.*5/5'
+# from a filter that hides it: the filter is cleared, cursor on the window
+typed build
+wait_for 'filter to build' '^> build .*1/5'
+keys C-t
+wait_for '^t from a filter clears it and reopens qside' '^> +.*6/6'
+keys C-r
+wait_for '... cursor is on qside' '^rename › qside'
+esc
+for n in qnext qside; do
+	typed "$n"
+	keys C-x
+	wait_for "re-close $n" "^> $n .*0/"
+	esc
+done
+wait_for 'back to the four fixture windows again' '^> +.*4/4'
+: >"$CLOSED"
+keys C-t
+wait_for '^t with nothing closed: footer notice' 'nothing to reopen'
+check '... no window created' bash -c '[[ $(tmux -L tmux-home-test list-windows -a | wc -l) -eq 4 ]]'
+typed x
+wait_gone '... notice goes once you type' 'nothing to reopen'
+esc
+wait_for 'list mode, 4/4' '^> +.*4/4'
 
 # last window of the client's own session: asks (session will end); y moves
 # the client to another session first so the popup is not detached
