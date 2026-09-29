@@ -148,13 +148,17 @@ row before you commit. No attempt to steer the other client in v1.
 | --- | --- | --- |
 | `^r` | Rename window (session if a session header is selected) | Row becomes an editor pre-filled with the current name, cursor at end. `⏎` commit, `Esc` cancel, empty = cancel. `rename-window -t @id` / `rename-session -t $id`. |
 | `M-r` | Reset to automatic name | `set -w -t @id -u automatic-rename` (rename turns it off; this turns it back on). |
-| `^x` | Close window / pane | Row shows `close "dotfiles-fix"? y/n`. Stronger wording if it hosts a running/waiting agent (`agent still working`), and if it is the session's last window (`session "scratch" will end`). `kill-window -t @id` / `kill-pane -t %id`. |
+| `^x` | Close window / pane | Closes at once if every (non-sidebar) pane sits at a shell prompt. Otherwise the prompt becomes `close "dotfiles-fix"? running: nvim, node (y/N)`: `y` closes, any other key / `⏎` / `Esc` cancels. Stronger wording if it hosts a running/waiting agent (`agent still working`, M2); the session's last window always asks (`session "scratch" will end`). The last window on the server is never closed. `kill-window -t @id` / `kill-pane -t %id`. |
 | `M-↑` `M-↓` | Move window up/down within its session | `swap-window -d -s @a -t @b` with the adjacent window **in the list** (not index ± 1, so index gaps are fine); `-d` so the current window doesn't change. Selection follows the window. |
 | `M-n` | New window after the selection | Inline name editor; `new-window -a -d -t @id -c <cwd>`; selection moves to it; popup stays. |
 
 After any close, tmux-home re-resolves the invoking client's current
 session/window (closing the current window or ending the current session
-moves the client; `detach-on-destroy off` switches it to another session).
+moves the client). Before ending the invoking client's own session,
+tmux-home switches that client to another session itself — otherwise
+`detach-on-destroy on` (the default) would detach it and take the popup
+down mid-action. The cursor stays at the same row position (the next
+window) and the filter is kept.
 
 ## 7. Agent awareness
 
@@ -265,8 +269,8 @@ throwaway `tmux -L tmux-home-test` server.
 
 - **M0 — usable this week:** grouped list, type-first filter, preview,
   `⏎` switch via the invoking client, inline `^r` rename, `M-r` reset.
-- **M1 — tidy up:** `^x` close with confirm + consequence wording,
-  `M-↑↓` reorder, `M-n` new window, live 1 s refresh.
+- **M1 — tidy up:** `^x` close with confirm + consequence wording (done:
+  windows only), `M-↑↓` reorder, `M-n` new window, live 1 s refresh.
 - **M2 — agents:** status column, NEEDS YOU, staleness, agent card, `^g`,
   filter tokens.
 - **M3 — polish:** narrow/half-height layout rules, cross-client hint,
