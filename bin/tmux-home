@@ -7,6 +7,8 @@
 #   tmux-home preview @id     capture the window's active (non-sidebar) pane
 #   tmux-home rename @id NAME rename a window by ID
 #   tmux-home reset-name @id  turn automatic-rename back on for a window
+#   tmux-home busy @id        print the non-shell commands running in a window
+#   tmux-home close @id       close a window (safely for the invoking client)
 #   tmux-home help            print the key reference
 #
 # The remaining subcommands (act-*, layout) are fzf callbacks.
@@ -144,15 +146,73 @@ switch_to() {
 	fi
 }
 
+# A pane is idle when it sits at a shell prompt. Login shells show as "-zsh";
+# anything else (an editor, "node", Claude Code's version string) is busy.
+is_shell() {
+	local c=${1#-}
+	c=${c##*/}
+	case $c in
+	bash | zsh | fish | sh | dash | ksh | mksh | tcsh | csh | nu | ash | yash) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Distinct non-shell commands in a window's panes, comma-separated (empty =
+# every pane idle). Sidebar panes are views, not work: they don't count.
+busy_commands() {
+	local wid=$1 role cmd out=() seen=' '
+	# command first: IFS=tab would swallow an empty leading @pane_role
+	while IFS="$TAB" read -r cmd role; do
+		[[ $role == sidebar ]] && continue
+		is_shell "$cmd" && continue
+		[[ $seen == *" $cmd "* ]] && continue
+		seen+="$cmd "
+		out+=("$cmd")
+	done < <(t list-panes -t "$wid" -F "#{pane_current_command}${TAB}#{@pane_role}")
+	local IFS=,
+	printf '%s\n' "${out[*]}" | sed 's/,/, /g'
+}
+
+# "<session_id>\t<session_name>\t<session_windows>\t<window_name>" of a window.
+window_info() {
+	t display-message -p -t "$1" "#{session_id}${TAB}#{session_name}${TAB}#{session_windows}${TAB}#{window_name}"
+}
+
+# Close a window without taking the popup down with it:
+# - the last window on the server is never closed (it would end the server,
+#   and the popup with it) — returns 3;
+# - if it is the last window of the invoking client's session, the client is
+#   first moved to another session, so detach-on-destroy can't detach it
+#   (which would close the popup mid-action).
+# Closing the client's current window otherwise is left to tmux: the client
+# moves to another window of the same session and the popup stays up.
+close_window() {
+	local wid=$1 sid sname nwin wname loc client other
+	IFS="$TAB" read -r sid sname nwin wname < <(window_info "$wid") || return 1
+	if ((nwin <= 1)); then
+		other=$(t list-sessions -F '#{session_id}' | grep -vxF -- "$sid" | head -1 || true)
+		[[ -n $other ]] || return 3
+		loc=$(client_location)
+		client=$(home_client)
+		if [[ -n $client && ${loc%%"$TAB"*} == "$sid" ]]; then
+			t switch-client -c "$client" -t "$other"
+		fi
+	fi
+	t kill-window -t "$wid"
+}
+
 # ---------------------------------------------------------------- fzf glue
 
-FOOTER_LIST=' ⏎ go   ^r rename   M-r auto-name   ^o preview   Esc clear/close   F1 keys'
+FOOTER_LIST=' ⏎ go   ^r rename   M-r auto-name   ^x close   ^o preview   Esc clear/close   F1 keys'
 FOOTER_RENAME=' ⏎ save   Esc cancel   (empty name cancels)'
+FOOTER_CLOSE=' y close   any other key or Esc cancels'
 PROMPT_LIST='> '
 PROMPT_RENAME='rename › '
 
-# Keys that must not act while the rename editor is open.
-LIST_KEYS='change,ctrl-r,alt-r,up,down,ctrl-n,ctrl-p,ctrl-j,ctrl-k,page-up,page-down,ctrl-o,f1,ctrl-/'
+# Keys that must not act while an inline editor (rename, close confirm) is
+# open. The confirm keeps `change` bound: that is how it reads the answer.
+MODE_KEYS='ctrl-r,alt-r,ctrl-x,up,down,ctrl-n,ctrl-p,ctrl-j,ctrl-k,page-up,page-down,ctrl-o,f1,ctrl-/'
+LIST_KEYS="change,$MODE_KEYS"
 
 # fzf_action NAME ARG: NAME(ARG) with a bracket pair that doesn't occur in
 # ARG, so arbitrary text (window names, queries) can't break the parse.
@@ -170,6 +230,35 @@ fzf_action() {
 state_file() { printf '%s/%s\n' "${TMUX_HOME_STATE:?}" "$1"; }
 
 in_rename_mode() { [[ -s $(state_file rename-target) ]]; }
+in_close_mode() { [[ -s $(state_file close-target) ]]; }
+
+# " tmux-home   <session> ▸ <index>" for the invoking client.
+header_text() {
+	local loc h=' tmux-home'
+	loc=$(client_location)
+	if [[ -n $loc ]]; then
+		h+="   $(t display-message -p -t "${loc#*"$TAB"}" '#{session_name} ▸ #{window_index}')"
+	fi
+	printf '%s\n' "$h"
+}
+
+# Actions that reload the list and put the cursor at position $1 once the
+# new list is in (the `load` handler reads pending-pos), refreshing the
+# header since the client may have moved.
+reload_at() {
+	printf '%s\n' "$1" >"$(state_file pending-pos)"
+	printf '%s+reload-sync:%s list' "$(fzf_action change-header "$(header_text)")" "$(printf '%q' "$SELF")"
+}
+
+# load: apply a pending cursor position (startup, after a close).
+act_load() {
+	local f pos
+	f=$(state_file pending-pos)
+	pos=$(cat "$f" 2>/dev/null || true)
+	: >"$f"
+	[[ -n $pos ]] && echo "pos($pos)"
+	return 0
+}
 
 # preview-window spec for the current terminal size (SPEC §5).
 preview_layout() {
@@ -210,8 +299,68 @@ rename_finish() {
 	printf '%s\n' "enable-search+change-prompt($PROMPT_LIST)+change-footer($FOOTER_LIST)+rebind($LIST_KEYS)+$restore+reload-sync:$(printf '%q' "$SELF") list"
 }
 
+# ^x: close the selected window. Idle (every pane at a shell prompt) → close
+# at once; otherwise, or if it is the session's last window, ask inline.
+act_close_start() {
+	local wid=$1 sid sname nwin wname busy why=''
+	[[ -n $wid ]] || return 0
+	in_rename_mode && return 0
+	IFS="$TAB" read -r sid sname nwin wname < <(window_info "$wid" 2>/dev/null) || return 0
+	busy=$(busy_commands "$wid")
+	if ((nwin <= 1)) && ! t list-sessions -F '#{session_id}' | grep -qvxF -- "$sid"; then
+		fzf_action change-footer " can't close the last window on the server"
+		echo
+		return 0
+	fi
+	if [[ -z $busy ]] && ((nwin > 1)); then
+		close_window "$wid" >/dev/null 2>&1 || true
+		printf '%s+%s\n' "$(fzf_action change-footer "$FOOTER_LIST")" "$(reload_at "${FZF_POS:-1}")"
+		return 0
+	fi
+	[[ -n $busy ]] && why+=" running: $busy"
+	((nwin <= 1)) && why+=" — session \"$sname\" will end"
+	printf '%s\n' "$wid" >"$(state_file close-target)"
+	printf '%s\n' "${FZF_POS:-1}" >"$(state_file close-pos)"
+	printf '%s' "${FZF_QUERY:-}" >"$(state_file saved-query)"
+	# clear-query fires `change` with an empty query: act_change ignores it.
+	printf '%s+%s+%s+clear-query\n' "unbind($MODE_KEYS)+disable-search" \
+		"$(fzf_action change-prompt "close \"$wname\"?$why (y/N) ")" \
+		"$(fzf_action change-footer "$FOOTER_CLOSE")"
+}
+
+# The answer: `y` closes, anything else cancels. Either way back to the list
+# with the filter that was there before.
+close_finish() {
+	local wid pos saved restore='clear-query'
+	wid=$(cat "$(state_file close-target)")
+	pos=$(cat "$(state_file close-pos)" 2>/dev/null || echo 1)
+	saved=$(cat "$(state_file saved-query)" 2>/dev/null || true)
+	: >"$(state_file close-target)"
+	if [[ $1 == yes ]]; then
+		close_window "$wid" >/dev/null 2>&1 || true
+	fi
+	[[ -z $saved ]] || restore=$(fzf_action change-query "$saved")
+	printf '%s\n' "enable-search+change-prompt($PROMPT_LIST)+$(fzf_action change-footer "$FOOTER_LIST")+rebind($MODE_KEYS)+$restore+$(reload_at "$pos")"
+}
+
+# change: in list mode, back to the top as the filter changes; in the close
+# confirm, the keystroke is the answer.
+act_change() {
+	if in_close_mode; then
+		case ${FZF_QUERY:-} in
+		'') ;; # the clear-query that opened the prompt
+		y | Y) close_finish yes ;;
+		*) close_finish no ;;
+		esac
+	else
+		echo first
+	fi
+}
+
 act_enter() {
-	if in_rename_mode; then
+	if in_close_mode; then
+		close_finish no
+	elif in_rename_mode; then
 		local wid name
 		wid=$(cat "$(state_file rename-target)")
 		name=${FZF_QUERY:-}
@@ -225,7 +374,9 @@ act_enter() {
 }
 
 act_esc() {
-	if in_rename_mode; then
+	if in_close_mode; then
+		close_finish no
+	elif in_rename_mode; then
 		rename_finish
 	else
 		# clear a non-empty filter (back to the top, as typing does), close on
@@ -246,6 +397,8 @@ tmux-home — keys
   Esc             clear the filter; close if it is already empty
   ^r              rename the window inline (⏎ save, Esc/empty cancel)
   M-r             reset the window to its automatic name
+  ^x              close the window; asks first (y/N) if anything but a
+                  shell is running in it, or if it is its session's last
   ^o              toggle the preview
   F1  ^/          this help
 
@@ -258,16 +411,14 @@ main() {
 	export TMUX_HOME_STATE
 	trap 'rm -rf "$TMUX_HOME_STATE"' EXIT
 	: >"$(state_file rename-target)"
+	: >"$(state_file close-target)"
 
-	local rows cur_pos header loc cols lines self_q sel
+	local rows cur_pos header cols lines self_q sel
 	rows=$(list_rows)
 	# start with the selection on the client's current window
 	cur_pos=$(printf '%s\n' "$rows" | awk '/▶/ { print NR; exit }')
-	loc=$(client_location)
-	header=" tmux-home"
-	if [[ -n $loc ]]; then
-		header+="   $(t display-message -p -t "${loc#*"$TAB"}" '#{session_name} ▸ #{window_index}')"
-	fi
+	printf '%s\n' "${cur_pos:-1}" >"$(state_file pending-pos)"
+	header=$(header_text)
 	read -r lines cols < <(stty size 2>/dev/null || echo "24 80")
 	self_q=$(printf '%q' "$SELF")
 
@@ -281,12 +432,13 @@ main() {
 		--info inline-right \
 		--preview "$self_q preview {2}" \
 		--preview-window "$(preview_layout "$cols" "$lines")" \
-		--bind "load:pos(${cur_pos:-1})+unbind(load)" \
-		--bind "change:first" \
+		--bind "load:transform:$self_q act-load" \
+		--bind "change:transform:[[ -s \$TMUX_HOME_STATE/close-target ]] && exec $self_q act-change || echo first" \
 		--bind "resize:transform:$self_q act-layout" \
 		--bind "enter:transform:$self_q act-enter" \
 		--bind "esc:transform:$self_q act-esc" \
 		--bind "ctrl-r:transform:$self_q act-rename-start {2}" \
+		--bind "ctrl-x:transform:$self_q act-close-start {2}" \
 		--bind "alt-r:execute-silent($self_q reset-name {2})+reload-sync($self_q list)" \
 		--bind "up:up,down:down,ctrl-p:up,ctrl-n:down,ctrl-k:up,ctrl-j:down" \
 		--bind "page-up:page-up,page-down:page-down" \
@@ -307,6 +459,8 @@ case $cmd in
 	preview) preview_window "${2:?window id}" ;;
 	rename) rename_window "${2:?window id}" "${3:?name}" ;;
 	reset-name) reset_window_name "${2:?window id}" ;;
+	busy) busy_commands "${2:?window id}" ;;
+	close) close_window "${2:?window id}" ;;
 	help)
 		help_text
 		IFS= read -r -s -n 1 _ </dev/tty || true
@@ -315,6 +469,9 @@ case $cmd in
 	act-enter) act_enter ;;
 	act-esc) act_esc ;;
 	act-rename-start) act_rename_start "${2:-}" ;;
+	act-close-start) act_close_start "${2:-}" ;;
+	act-change) act_change ;;
+	act-load) act_load ;;
 	*)
 		echo "tmux-home: unknown command: $cmd" >&2
 		exit 2

@@ -24,10 +24,12 @@ export LC_ALL=en_US.UTF-8
 
 T() { tmux -L tmux-home-test -f /dev/null "$@"; }
 O() { tmux -L tmux-home-test-outer -f /dev/null "$@"; }
+S() { tmux -L tmux-home-test-solo -f /dev/null "$@"; }
 
 cleanup() {
 	T kill-server 2>/dev/null
 	O kill-server 2>/dev/null
+	S kill-server 2>/dev/null
 }
 trap cleanup EXIT
 cleanup
@@ -130,6 +132,27 @@ eq 'rename: turns automatic-rename off' off "$(auto_of "$w")"
 eq 'reset-name: automatic-rename back on' on "$(auto_of "$w")"
 T set-option -w -t "$w" automatic-rename off
 T rename-window -t "$w" 'win two'
+
+# busy: what counts as work when deciding whether ^x must ask
+T new-window -d -t alpha: -n qb-shell
+T new-window -d -t alpha: -n qb-two 'sleep 1000'
+T split-window -d -t alpha:qb-two 'tail -f /dev/null'
+T new-window -d -t alpha: -n qb-side
+T split-window -d -h -t alpha:qb-side 'sleep 1000'
+T set-option -p -t alpha:qb-side.1 @pane_role sidebar
+sleep 0.3
+eq 'busy: idle shell -> nothing' '' "$("$BIN" busy "$(wid_of alpha:qb-shell)")"
+eq 'busy: lists each non-shell command' 'sleep, tail' "$("$BIN" busy "$(wid_of alpha:qb-two)")"
+eq 'busy: sidebar panes do not count' '' "$("$BIN" busy "$(wid_of alpha:qb-side)")"
+for w in qb-shell qb-two qb-side; do T kill-window -t "alpha:$w"; done
+
+# close refuses the last window on the server (it would end the server)
+S new-session -d -s solo
+solo_w=$(S display-message -p -t solo: '#{window_id}')
+TMUX_HOME_TMUX="tmux -L tmux-home-test-solo" "$BIN" close "$solo_w"
+eq 'close: last window on the server refused (exit 3)' 3 "$?"
+eq 'close: ... and the window survives' "$solo_w" "$(S display-message -p -t solo: '#{window_id}')"
+S kill-server
 
 eq 'layout: >=160 cols -> right' 'change-preview-window(right,50%,border-left,follow)' \
 	"$(FZF_COLUMNS=200 FZF_LINES=50 "$BIN" act-layout)"
@@ -254,6 +277,115 @@ keys F1
 wait_for 'F1 shows help' 'press any key to return'
 keys q
 wait_for 'help returns to the list' '^> +.*4/4'
+
+# ------------------------------------------------------------ ^x close
+esc
+wait_gone 'popup closed before close tests' '^> +.*4/4'
+for n in qone qtwo qnext qside; do T new-window -d -t alpha: -n "$n"; done
+T new-window -d -t alpha: -n qbusy 'sleep 1000'
+T split-window -d -h -t alpha:qside 'sleep 1000'
+T set-option -p -t alpha:qside.1 @pane_role sidebar
+T send-keys -t alpha:qnext 'echo QNEXT-MARKER' Enter
+T new-window -t alpha: -n qcur # not -d: the client's current window
+for n in qone qtwo qnext qside qbusy qcur; do T set-option -w -t "alpha:$n" automatic-rename off; done
+qcur=$(wid_of alpha:qcur)
+wid_exists() { T list-windows -a -F '#{window_id}' | grep -qxF -- "$1"; }
+client_at() { T list-clients -F '#{session_name}:#{window_name}' | head -1; }
+
+open_popup 'popup opens on the client current window (qcur)'
+wait_for 'header shows qcur' "tmux-home +alpha ▸ $(T display -p -t alpha:qcur '#{window_index}')"
+keys C-x
+wait_for "^x on the client's current (idle) window closes it at once" '^> +.*9/9'
+check '... qcur is gone' bash -c '! tmux -L tmux-home-test list-windows -a -F "#{window_id}" | grep -qxF "$1"' _ "$qcur"
+check '... server still up, client still attached' test -n "$(T list-clients -F '#{client_name}')"
+check '... client moved to another alpha window' bash -c '[[ $1 == alpha:* && $1 != alpha:qcur ]]' _ "$(client_at)"
+wait_for '... header follows the client' "tmux-home +alpha ▸ $(T display -p -t "$(T list-clients -F '#{window_id}' | head -1)" '#{window_index}')"
+check '... popup still open' popup_open
+
+typed qone
+wait_for 'filter to qone' '^> qone .*1/9'
+qone=$(wid_of alpha:qone)
+keys C-x
+wait_for '^x closes an idle window at once, filter kept' '^> qone .*0/8'
+check '... qone is gone' bash -c '! tmux -L tmux-home-test list-windows -a -F "#{window_id}" | grep -qxF "$1"' _ "$qone"
+esc
+wait_for 'filter cleared after close' '^> +.*8/8'
+
+# cursor: closing row 3 (qtwo) leaves the cursor on the next row (qnext)
+keys Down
+keys Down
+keys C-x
+wait_for '^x leaves the cursor on the next row (preview shows qnext)' 'QNEXT-MARKER'
+wait_for '... qtwo closed' '^> +.*7/7'
+check '... qtwo is gone' bash -c '! tmux -L tmux-home-test list-windows -t alpha -F "#W" | grep -qx qtwo'
+
+# ^x must not act while the rename editor is open
+keys C-r
+wait_for 'rename editor open on qnext' '^rename › qnext'
+keys C-x
+sleep 0.5
+check '^x ignored during rename: editor still open' bash -c 'tmux -L tmux-home-test-outer capture-pane -p -t outer | grep -q "^rename › qnext"'
+check '^x ignored during rename: window kept' wid_exists "$(wid_of alpha:qnext)"
+esc
+wait_for 'back to the list' '^> +.*7/7'
+
+# busy window: inline confirm; anything but y cancels
+typed qbusy
+wait_for 'filter to qbusy' '^> qbusy .*1/7'
+qbusy=$(wid_of alpha:qbusy)
+keys C-x
+wait_for '^x on a busy window asks, naming the command' '^close "qbusy"\? running: sleep \(y/N\)'
+typed n
+wait_for 'n cancels, filter restored' '^> qbusy .*1/7'
+check '... window kept after n' wid_exists "$qbusy"
+keys C-x
+wait_for 'confirm again' '^close "qbusy"\?'
+esc
+wait_for 'Esc cancels, filter restored' '^> qbusy .*1/7'
+check '... window kept after Esc' wid_exists "$qbusy"
+keys C-x
+wait_for 'confirm again (⏎)' '^close "qbusy"\?'
+keys Enter
+wait_for '⏎ cancels (default N)' '^> qbusy .*1/7'
+check '... window kept after ⏎' wid_exists "$qbusy"
+check '... popup still open' popup_open
+keys C-x
+wait_for 'confirm again (y)' '^close "qbusy"\?'
+typed y
+wait_for 'y closes it, filter restored' '^> qbusy .*0/6'
+check '... qbusy is gone' bash -c '! tmux -L tmux-home-test list-windows -a -F "#{window_id}" | grep -qxF "$1"' _ "$qbusy"
+esc
+
+# a sidebar pane running a program doesn't make the window busy
+typed qside
+wait_for 'filter to qside' '^> qside .*1/6'
+keys C-x
+wait_for 'window whose only program is a sidebar closes at once' '^> qside .*0/5'
+esc
+typed qnext
+wait_for 'filter to qnext' '^> qnext .*1/5'
+keys C-x
+wait_for 'qnext closed' '^> qnext .*0/4'
+esc
+wait_for 'back to the four fixture windows' '^> +.*4/4'
+
+# last window of the client's own session: asks (session will end); y moves
+# the client to another session first so the popup is not detached
+esc
+wait_gone 'popup closed' '^> +.*4/4'
+T new-session -d -s qdelta -n qd
+T switch-client -c "$client" -t qdelta
+open_popup 'popup opens in the one-window session qdelta'
+wait_for 'header shows qdelta' 'tmux-home +qdelta ▸ 0'
+keys C-x
+wait_for "^x on the session's last window warns the session will end" '^close "qd"\? — session "qdelta" will end \(y/N\)'
+typed y
+wait_for 'y closes it; list back to the fixture' '^> +.*4/4'
+check '... session qdelta is gone' bash -c '! tmux -L tmux-home-test has-session -t "=qdelta" 2>/dev/null'
+check '... server still up, client still attached' test -n "$(T list-clients -F '#{client_name}')"
+check '... client moved to another session' bash -c '[[ $1 == alpha:* || $1 == beta:* ]]' _ "$(client_at)"
+wait_for '... header follows the client' 'tmux-home +(alpha|beta) ▸ [0-9]'
+check '... popup still open' popup_open
 
 # ⏎ switches the invoking client and closes
 typed build
