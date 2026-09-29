@@ -6,7 +6,7 @@ and close without ever leaving it.
 
 > **Status: M0 + close.** A bash + fzf prototype: grouped window list,
 > type-first filter, preview, `⏎` switch, inline `^r` rename, `M-r`
-> auto-name, `^x` close with an inline confirm. Agents, reorder and live
+> auto-name, `^x` close with an inline confirm, `^t` reopen. Agents, reorder and live
 > refresh come in later milestones — see [`docs/SPEC.md`](docs/SPEC.md) §13.
 
 ## Why
@@ -51,6 +51,7 @@ tmux display-popup -E -B -w 100% -h 100% \
 | `^r` | rename inline (`⏎` save, `Esc` or empty cancels) |
 | `M-r` | back to the automatic name |
 | `^x` | close the window, staying in the popup (see below) |
+| `^t` | reopen the last closed window |
 | `^o` | toggle preview |
 | `F1` `^/` | help |
 
@@ -61,6 +62,14 @@ closes; any other key, `⏎` or `Esc` cancels and restores the filter. The
 session's last window always asks (`session "x" will end`); if that is the
 session you are in, tmux-home first moves you to another session so the
 popup isn't detached. The last window on the server is never closed.
+
+`^t` (or `tmux-home reopen` from a shell or your own binding) rebuilds the
+most recently closed window — like reopening a browser tab, up to 10 back:
+same session (recreated if it ended), same place, name, pane count, layout,
+directories and active pane, but **fresh shells**: whatever was running in
+it is gone. The popup stays open with the cursor on it. The stack lives in
+`${XDG_STATE_HOME:-~/.local/state}/tmux-home/closed` (override with
+`TMUX_HOME_STATE_DIR`).
 
 ## Tests
 

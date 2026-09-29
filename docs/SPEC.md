@@ -150,6 +150,7 @@ row before you commit. No attempt to steer the other client in v1.
 | `M-r` | Reset to automatic name | `set -w -t @id -u automatic-rename` (rename turns it off; this turns it back on). |
 | `^x` | Close window / pane | Closes at once if every (non-sidebar) pane sits at a shell prompt. Otherwise the prompt becomes `close "dotfiles-fix"? running: nvim, node (y/N)`: `y` closes, any other key / `⏎` / `Esc` cancels. Stronger wording if it hosts a running/waiting agent (`agent still working`, M2); the session's last window always asks (`session "scratch" will end`). The last window on the server is never closed. `kill-window -t @id` / `kill-pane -t %id`. |
 | `M-↑` `M-↓` | Move window up/down within its session | `swap-window -d -s @a -t @b` with the adjacent window **in the list** (not index ± 1, so index gaps are fine); `-d` so the current window doesn't change. Selection follows the window. |
+| `^t` | Reopen the last closed window | Every close snapshots the window's shape (session, index, neighbours, name / auto-name, layout, each pane's cwd, active pane) onto a 10-deep LIFO stack in `${XDG_STATE_HOME:-~/.local/state}/tmux-home/closed`. Reopen rebuilds it with fresh shells — no processes are restarted — at its old index (else after its old neighbour, else at the end), recreating the session if it ended; cursor moves to it, filter cleared, no switch. Also `tmux-home reopen`. |
 | `M-n` | New window after the selection | Inline name editor; `new-window -a -d -t @id -c <cwd>`; selection moves to it; popup stays. |
 
 After any close, tmux-home re-resolves the invoking client's current
@@ -225,7 +226,7 @@ so it follows whatever theme the terminal has.
 - Replacing the sidebar: the sidebar is the always-on glance, tmux-home the
   on-demand full view.
 - Mouse support beyond what comes free.
-- Undo.
+- Undo (beyond `^t` rebuilding a closed window's shape).
 
 Deferred until asked for: marks + bulk actions, move-to-session, peek
 (switch but stay open), prebuilt release binaries, more config options.
@@ -270,7 +271,7 @@ throwaway `tmux -L tmux-home-test` server.
 - **M0 — usable this week:** grouped list, type-first filter, preview,
   `⏎` switch via the invoking client, inline `^r` rename, `M-r` reset.
 - **M1 — tidy up:** `^x` close with confirm + consequence wording (done:
-  windows only), `M-↑↓` reorder, `M-n` new window, live 1 s refresh.
+  windows only; plus `^t` reopen), `M-↑↓` reorder, `M-n` new window, live 1 s refresh.
 - **M2 — agents:** status column, NEEDS YOU, staleness, agent card, `^g`,
   filter tokens.
 - **M3 — polish:** narrow/half-height layout rules, cross-client hint,
