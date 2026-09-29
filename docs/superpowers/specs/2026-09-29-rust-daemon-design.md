@@ -186,30 +186,58 @@ since they are its own.
 
 ## 6. Git and repos
 
-**Source:** stray's git layer, vendored (MIT, same author): porcelain-v2
-status, unpushed commits against *all* remotes, no-upstream/gone branches,
-stashes, `worktree list --porcelain`, the `.git` file/dir/bare classification.
-`GIT_OPTIONAL_LOCKS=0` everywhere; never writes to a repo; never fetches.
+**Base:** stray's git layer, vendored (MIT, same author): porcelain-v2
+status (whose `branch.ab` gives upstream ahead/behind in the same fork),
+unpushed commits against *all* remotes, no-upstream/gone branches, stashes,
+numeric staged/modified/untracked/conflict counts, `worktree list
+--porcelain`, the `.git` file/dir/bare classification and `.strayignore`.
+Never writes to a repo (no git config, no cache in `.git`); never fetches.
 
-**From worktrunk** we borrow vocabulary, not code: its status symbols and
-worktree-path conventions, so badges read the same as `wt list`. Worktrunk's
-library API is unpublished and unstable, and stray's layer already yields
-the same facts in-process; `wt list --format=json` is not a dependency.
+**Folded in from worktrunk** (ideas reimplemented; any verbatim code is
+recorded in `NOTICE` per §14). Source paths refer to worktrunk v0.79.0.
 
-**Per window:** active pane's `pane_current_path` → repo root → a
-`RepoStatus` shared by every window in that repo. Refreshed on cwd change,
-on window focus, and every 10 s for repos that have a window; git runs off
-the async runtime, at most 4 in parallel.
+| # | Change | worktrunk source | When |
+| --- | --- | --- | --- |
+| 1 | Scrub inherited `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY` on every git call (a daemon started from a hook would otherwise query the wrong repo); set `LC_ALL=C` (stray parses translated `upstream:track` text); keep `GIT_OPTIONAL_LOCKS=0`. | `shell_exec.rs` | R3 |
+| 2 | `status --untracked-files=normal` always, so a repo's `showUntrackedFiles=no` can't make it look clean. | `working_tree.rs::status_porcelain_cached` | R3 |
+| 3 | One fork per branch for unpushed commits: `log --no-show-signature -n1001 <branch> --not --remotes`, count lines, keep 20 (was `rev-list --count` + `log`). | `collect/mod.rs` | R3 |
+| 4 | **Refs snapshot memo:** one `for-each-ref refs/heads refs/remotes refs/stash` per tick; branch-level results (unpushed, ahead/behind, stray, stash) recomputed only when a relevant SHA changed. Memo lives in daemon memory, never in `.git`. | `sha_cache.rs`, `ref_snapshot.rs` (concept) | R3 |
+| 5 | Operation in progress (`↻`: merge, rebase, cherry-pick, revert, bisect) and conflicts (`✘`) from file checks — no fork. | `working_tree.rs::operation_in_progress` | R3 |
+| 6 | Parse `locked`, `prunable`, `detached`, `bare` from `worktree list`; flag duplicate-branch / path mismatch (`⚑`). | `git/parse.rs`, `model/state.rs` | R3 |
+| 7 | Default branch, read-only: `worktrunk.default-branch` config → `<remote>/HEAD` → local inference (only branch, `init.defaultBranch`, main/master/develop/trunk). No `ls-remote`, no write-back. | `config.rs::default_branch` | R3 |
+| 8 | "Integrated" (`⊂`) for stray branches, cheap tiers only (same commit, `merge-base --is-ancestor`, empty three-dot diff, equal trees) against an upstream-aware base (compare with `origin/main` when local main lags). Squash-merged branches stop looking unpushed forever. Runs in the repos scan only. | `git/mod.rs::check_integration`, `integration.rs::integration_targets` | R3 |
+| 9 | Ahead/behind vs default branch (`↑↓`) via one `for-each-ref %(ahead-behind:BASE)`. | `ref_snapshot.rs::capture_ahead_behind` | later |
+| 10 | Expensive integration tiers (`merge-tree`, patch-id), would-conflict `✗`, line stats, `worktrunk.state.*.marker` interop, `taskpolicy -b` for the scan. | various | later |
+
+Deliberate departure from worktrunk: every git call has a timeout
+(`kill_on_drop`, 10 s badge / 30 s scan) and per-repo in-flight coalescing —
+a daemon can't let a hung git hold a permit forever. A timed-out badge shows
+its last value marked stale, not an error.
+
+**Per window:** active pane's `pane_current_path` → repo root → one
+`RepoStatus` shared by every window in that repo. Work is ordered fast-first
+and each field publishes as it lands: branch/HEAD from `.git/HEAD` (no
+fork) → `git status` → ref-derived fields (only when the refs memo says
+something changed). `git status` runs on cwd change, on window focus, and on
+an adaptive interval: `max(10 s, 20 × last status duration)`.
 
 **Repos view:** stray's scan of `@home-repos-root` (default `~/dev`, depth
-8, honouring `~/.strayignore`), run at daemon start, every 10 min, and on
-`r`. Repos that have a tmux window are marked; `⏎` on one jumps to its
-window if there is one (otherwise does nothing — no window creation in
-phase 2).
+8, honouring `~/.strayignore`), at daemon start, every 10 min, and on `r`.
+Scan-only status runs with `-c core.fsmonitor=false` so the scan never spawns
+fsmonitor daemons across `~/dev`. Repos with a tmux window are marked; `⏎`
+on one jumps to its window if there is one (no window creation in phase 2).
 
-**Badge** (compact form): branch, `(wt)` for a linked worktree, then
-worktrunk-style symbols — `+` staged, `!` modified, `?` untracked, `↑n`
-unpushed, `↓n` behind, `$` stash, `⚠` stray branches.
+**Concurrency:** one global git semaphore of 4 permits shared by badges and
+the scan; the scan may hold at most 2, so it never delays a focus refresh.
+
+**Badge symbols** (worktrunk's vocabulary where it has one, so badges read
+like `wt list`): branch, `(wt)` for a linked worktree, then
+`+` staged · `!` modified · `?` untracked · `✘` conflicts · `↻` operation in
+progress · `⊟ ⊞ ⊘ ⚑` prunable / locked / detached / mismatch ·
+`⇡n ⇣n` ahead/behind upstream · `|` in sync · plus two tmux-home symbols
+defined in the help legend: `$n` stashes, `⚠n` stray branches (unpushed,
+no upstream or gone, not integrated). `↑↓` stay reserved for "vs default
+branch" (later).
 
 ## 7. Popup (Rust)
 
@@ -330,11 +358,14 @@ Writes are atomic (write + rename) under a store lock (`state.lock`), separate f
 Vendored code keeps its origin in a header comment and in `NOTICE`:
 stray (MIT, tim-codes), tmux-agent-sidebar (hook handlers and status
 precedence; licence checked and recorded before copying), worktrunk
-(symbol vocabulary only; MIT OR Apache-2.0).
+(MIT OR Apache-2.0; taken under MIT — ideas reimplemented per §6, and any
+function copied verbatim, e.g. `operation_in_progress`, keeps worktrunk's
+copyright line in `NOTICE`).
 
 ## 15. Decisions taken for you (say if any is wrong)
 
-1. Git data comes from stray's vendored layer, not `wt list --format=json`.
+1. Git data comes from stray's vendored layer improved with worktrunk's
+   techniques (§6), not from `wt list --format=json` or the worktrunk crate.
 2. Agent state is written to tmux pane options *and* sent to the daemon, so
    it survives daemon restarts and works in degraded mode.
 3. New `@home_*` option namespace rather than reusing the sidebar's
