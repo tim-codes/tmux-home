@@ -263,6 +263,63 @@ defined in the help legend: `$n` stashes, `⚠n` stray branches (unpushed,
 no upstream or gone, not integrated). `↑↓` stay reserved for "vs default
 branch" (later).
 
+**Implementation note (pass 5b, 2026-10-01).** Badges are in; the repos
+view, density cycling and items 9–10 are not. Where the code settled
+details this section leaves open, or departs from it:
+
+- *Layout:* `src/git/` (vendored `model`/`status`/`scan`/`ignore` plus
+  `exec`, `repo`, `refs`, `badge`) and `src/daemon/git.rs` (the task). The
+  snapshot gains `git: { paths: cwd → root, repos: root → RepoStatus }`,
+  hashed as its own section (`Sections.git`), so git never forces a tmux
+  push and a tmux push always carries the latest git section.
+- *Targets:* every window's row pane cwd and every agent pane's cwd (the
+  agent row's badge is the lead agent's repo — its worktree when it runs in
+  one). cwd → root is a walk up for `.git` (no fork), re-checked every 10 s.
+- *Triggers:* cwd change, focus (a client's session's active window), the
+  adaptive interval, **plus a change stamp** not in the spec: once a second
+  the task `stat`s the index, HEAD and its reflog, `packed-refs`,
+  `FETCH_HEAD`, the stash reflog, the operation state files and the
+  worktree registry, and refreshes a repo whose stamp moved. Git commands
+  run in a pane show within ~1 s; plain file edits wait for the interval or
+  a focus change (no fsmonitor).
+- *Publishing:* each stage lands in the task's state as it completes; the
+  task publishes the section when it changed, at most once per second.
+  A timed-out status keeps its values with `stale` (badge `~`); a failure
+  also records `error` (shown on the card). A timeout counts as the
+  status's duration, so a hung repo backs off to `20 × 10 s`.
+- *Item 1:* the scrub removes every inherited `GIT_*` variable except
+  `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`/`GIT_CONFIG_NOSYSTEM` (they pick
+  user config files, not a repo); calls also pass `-c color.ui=false -c
+  log.showSignature=false` and `GIT_TERMINAL_PROMPT=0`. `$TMUX_HOME_GIT`
+  replaces the binary (tests).
+- *Item 4:* the probe is `for-each-ref
+  %(refname)%00%(objectname)%00%(symref)%00%(upstream)%00%(upstream:track)`;
+  its key also covers the worktree registry's mtime. A branch whose tip is
+  a remote ref's commit has 0 unpushed without a fork. Stashes are the
+  lines of `logs/refs/stash` (no fork; also right after `stash drop
+  stash@{1}`, which leaves `refs/stash` alone).
+- *Item 6:* `⚑` is a branch checked out in two worktrees, or a linked
+  worktree whose directory name and branch (`/` as `-`) don't contain one
+  another — a stand-in for worktrunk's path template, which tmux-home
+  doesn't know.
+- *Item 7:* one `config -z --get-regexp` fork reads
+  `worktrunk.default-branch`, `init.defaultBranch` and the remotes;
+  `<remote>/HEAD` comes from the probe's `%(symref)`.
+- *Item 8 in badges, not only the scan:* stray (`⚠`) means unpushed > 0,
+  no upstream or a gone one, and not integrated; the cheap tiers run only
+  for those candidates, memoised by (branch SHA, target SHA), so they are
+  cheap enough for badges. Targets: the default branch and its upstream.
+- *Badge order* (as the pass brief's example): `branch (wt) +!?✘ ⇡n ⇣n |
+  $n ⚠n ↻⊟⊞⊘⚑ ~`; `|` only once a status has landed, no arrows for a gone
+  upstream.
+- *Measured* (release build, `core.fsmonitor=false`, 9 repos under `~/dev`,
+  warm cache): HEAD stage 20–40 µs; `git status` 8–16 ms; refs probe
+  8–13 ms when nothing changed (1 fork). The first refs pass is 3–7 forks /
+  25–165 ms for most repos, and 49–67 forks / 0.6–1.4 s for the two with
+  20–30 stray-candidate branches (one `log` and up to a few integration
+  forks each, memoised afterwards). Steady state per repo: ~20–30 ms of git
+  per refresh, every 10 s.
+
 ## 7. Popup (Rust)
 
 Launched as today (`display-popup -E -B -w 100% -h 100%`, invoking client

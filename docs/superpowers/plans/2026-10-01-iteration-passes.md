@@ -60,6 +60,7 @@ Exit: daily use shows agent status.
   - git work runs in a separate daemon task, off the poll path;
   - results are keyed by repo root, use the refs memo, and are coalesced to at most one push per second.
 - The Repos view comes later. Its scan results persist in the state dir, so a version restart doesn't rescan `~/dev`.
+- *Done (5b, branch `passes-6`):* badges on window and agent rows, the git card and the F1 legend; items 1–8 (item 8 cheap tiers, also used by badges). Notes: design spec §6 "Implementation note".
 
 ## Pass 6: R4 sidebar, then the R5 cutover
 
