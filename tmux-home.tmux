@@ -5,12 +5,15 @@
 #
 # The popup is the Rust one when target/release/tmux-home is built, else the
 # bash + fzf fallback in bin/. TMUX_HOME_POPUP=bash forces the fallback.
+#
+# Environment (tests): TMUX_HOME_TMUX  tmux command, word-split (default: tmux)
+#                      TMUX_HOME_BIN   the Rust binary (default: target/release/tmux-home)
 
 set -euo pipefail
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOME_BIN="$CURRENT_DIR/bin/tmux-home"
-RUST_BIN="$CURRENT_DIR/target/release/tmux-home"
+RUST_BIN="${TMUX_HOME_BIN:-$CURRENT_DIR/target/release/tmux-home}"
 
 read -r -a TMUX_CMD <<<"${TMUX_HOME_TMUX:-tmux}"
 t() { "${TMUX_CMD[@]}" "$@"; }
