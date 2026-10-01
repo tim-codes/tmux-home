@@ -58,3 +58,30 @@ async fn dead_server_is_an_error() {
     s.tmux(&["kill-server"]);
     assert!(read_snapshot(&t).await.is_err());
 }
+
+#[tokio::test]
+async fn newline_in_pane_path_round_trips() {
+    let env = common::TestEnv::new();
+    let s = common::TestServer::start();
+    let dir = env.state.join("nl\ndir");
+    std::fs::create_dir_all(&dir).unwrap();
+    // pane_current_path is the shell's cwd as the OS reports it, i.e. with
+    // symlinks resolved (macOS: /var -> /private/var).
+    let dir = dir.canonicalize().unwrap();
+    s.tmux(&["new-window", "-d", "-n", "nl", "-c", dir.to_str().unwrap()]);
+    s.wait_settled();
+    let (snap, _) = read_snapshot(&Tmux::new(s.socket.clone())).await.unwrap();
+    let nl = snap.windows.iter().find(|w| w.name == "nl").unwrap();
+    let pane = snap.panes.iter().find(|p| p.window_id == nl.id).unwrap();
+    assert_eq!(pane.current_path, dir.to_str().unwrap());
+    assert_eq!(snap.windows.len(), 2);
+}
+
+#[test]
+fn unparseable_record_is_skipped() {
+    let good = "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1falpha\x1ft\x1fw\x1e\n";
+    let panes = format!("garbage\x1e\n{good}");
+    let snap = tmux_home::tmux::snapshot::parse(&panes, "also garbage\x1e\n");
+    assert_eq!(snap.panes.len(), 1);
+    assert!(snap.clients.is_empty());
+}

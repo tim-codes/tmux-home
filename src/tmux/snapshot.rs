@@ -47,12 +47,17 @@ pub struct Client {
 }
 
 const SEP: char = '\x1f';
+/// Record terminator: every format below ends in `\x1e`, so a record is
+/// `...\x1e\n`. Splitting on that pair (rather than on `\n`) keeps a newline
+/// inside a field — legal in a directory name, so in `pane_current_path` —
+/// from splitting one record into two.
+const REC_END: &str = "\x1e\n";
 
 // Field separator is ASCII unit separator \x1f (not typeable at a prompt, so it
 // cannot appear in names tmux-home's users type in). Names are the *last* field
 // in each format so a stray separator elsewhere can't shift the other fields.
-const PANE_FMT: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{session_name}\x1f#{pane_title}\x1f#{window_name}";
-const CLIENT_FMT: &str = "#{client_name}\x1f#{client_tty}\x1f#{session_id}\x1f#{client_flags}";
+const PANE_FMT: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
+const CLIENT_FMT: &str = "#{client_name}\x1f#{client_tty}\x1f#{session_id}\x1f#{client_flags}\x1e";
 
 /// Reads a full snapshot of the tmux server and a hash of its contents.
 ///
@@ -63,17 +68,53 @@ const CLIENT_FMT: &str = "#{client_name}\x1f#{client_tty}\x1f#{session_id}\x1f#{
 pub async fn read_snapshot(t: &Tmux) -> anyhow::Result<(Snapshot, u64)> {
     let panes = t.run(&["list-panes", "-a", "-F", PANE_FMT]).await?;
     let clients = t.run(&["list-clients", "-F", CLIENT_FMT]).await?;
-    let snapshot = parse(&panes, &clients)?;
+    let snapshot = parse(&panes, &clients);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     serde_json::to_vec(&snapshot)?.hash(&mut h);
     Ok((snapshot, h.finish()))
 }
 
-pub fn parse(panes: &str, clients: &str) -> anyhow::Result<Snapshot> {
+/// Splits tmux output into records (see `REC_END`). A last record that
+/// lacks its trailing `\n` still has its `\x1e` stripped.
+fn records(out: &str) -> impl Iterator<Item = &str> {
+    out.split(REC_END)
+        .map(|r| r.strip_suffix('\x1e').unwrap_or(r))
+        .filter(|r| !r.is_empty())
+}
+
+struct PaneRec<'a> {
+    f: Vec<&'a str>,
+    window_index: u32,
+    pane_index: u32,
+}
+
+fn pane_record(rec: &str) -> Option<PaneRec<'_>> {
+    let f: Vec<&str> = rec.splitn(13, SEP).collect();
+    if f.len() != 13 {
+        return None;
+    }
+    Some(PaneRec {
+        window_index: f[2].parse().ok()?,
+        pane_index: f[6].parse().ok()?,
+        f,
+    })
+}
+
+/// Parses `list-panes`/`list-clients` output. An unparseable record is
+/// logged and skipped rather than failing the whole read: one odd pane must
+/// not blank the picture of every other one.
+pub fn parse(panes: &str, clients: &str) -> Snapshot {
     let mut s = Snapshot::default();
-    for line in panes.lines() {
-        let f: Vec<&str> = line.splitn(13, SEP).collect();
-        anyhow::ensure!(f.len() == 13, "bad list-panes line: {line:?}");
+    for rec in records(panes) {
+        let Some(PaneRec {
+            f,
+            window_index,
+            pane_index,
+        }) = pane_record(rec)
+        else {
+            eprintln!("tmux-home: skipping unparseable list-panes record: {rec:?}");
+            continue;
+        };
         let (sid, wid) = (f[0].to_string(), f[1].to_string());
         if !s.sessions.iter().any(|x| x.id == sid) {
             s.sessions.push(Session {
@@ -86,7 +127,7 @@ pub fn parse(panes: &str, clients: &str) -> anyhow::Result<Snapshot> {
             s.windows.push(Window {
                 id: wid.clone(),
                 session_id: sid.clone(),
-                index: f[2].parse()?,
+                index: window_index,
                 active: f[3] == "1",
                 automatic_rename: f[4] == "1",
                 name: f[12].to_string(),
@@ -96,16 +137,19 @@ pub fn parse(panes: &str, clients: &str) -> anyhow::Result<Snapshot> {
             id: f[5].to_string(),
             window_id: wid,
             session_id: sid,
-            index: f[6].parse()?,
+            index: pane_index,
             active: f[7] == "1",
             current_command: f[8].to_string(),
             current_path: f[9].to_string(),
             title: f[11].to_string(),
         });
     }
-    for line in clients.lines() {
-        let f: Vec<&str> = line.splitn(4, SEP).collect();
-        anyhow::ensure!(f.len() == 4, "bad list-clients line: {line:?}");
+    for rec in records(clients) {
+        let f: Vec<&str> = rec.splitn(4, SEP).collect();
+        if f.len() != 4 {
+            eprintln!("tmux-home: skipping unparseable list-clients record: {rec:?}");
+            continue;
+        }
         if f[3].split(',').any(|x| x == "control-mode") {
             continue; // our own control client, never a user client
         }
@@ -119,5 +163,5 @@ pub fn parse(panes: &str, clients: &str) -> anyhow::Result<Snapshot> {
         }
     }
     s.sessions.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(s)
+    s
 }
