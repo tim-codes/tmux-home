@@ -108,9 +108,15 @@ async fn control_attached(tmux: &Tmux, tx: &mpsc::Sender<SourceEvent>) -> anyhow
     // A failed write means the client already exited (e.g. the last session
     // went away between `session_count` and the attach); the EOF below then
     // ends this attachment normally, so it is not an error here.
-    let _ = stdin
-        .write_all(b"refresh-client -B 'th-panes:%*:#{pane_current_command}#{pane_current_path}#{pane_title}'\n")
-        .await;
+    // the agent options too, so an agent event is picked up at once
+    let agent: String = crate::agent::OPTIONS
+        .iter()
+        .map(|o| format!("#{{{o}}}"))
+        .collect();
+    let sub = format!(
+        "refresh-client -B 'th-panes:%*:#{{pane_current_command}}#{{pane_current_path}}#{{pane_title}}{agent}'\n"
+    );
+    let _ = stdin.write_all(sub.as_bytes()).await;
 
     refresh(tmux, tx).await?;
     let mut dirty = false;

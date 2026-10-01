@@ -79,7 +79,10 @@ fn newline_in_pane_path_round_trips() {
 
 #[test]
 fn unparseable_record_is_skipped() {
-    let good = "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1f\x1falpha\x1ft\x1fw\x1e\n";
+    let opts = "\x1f".repeat(tmux_home::agent::OPTIONS.len());
+    let good = format!(
+        "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1f\x1f{opts}alpha\x1ft\x1fw\x1e\n"
+    );
     let panes = format!("garbage\x1e\n{good}");
     let snap = tmux_home::tmux::snapshot::parse(&panes, "also garbage\x1e\n");
     assert_eq!(snap.panes.len(), 1);
@@ -91,4 +94,37 @@ fn server_without_sessions_is_an_empty_snapshot() {
     let s = common::TestServer::start_empty();
     let snap = read_snapshot(&Tmux::new(s.socket.clone())).unwrap();
     assert_eq!(snap, tmux_home::tmux::snapshot::Snapshot::default());
+}
+
+/// The agent options are read per pane (empty ones dropped); a run's start
+/// time is stored, so the hash holds still while a run goes on and moves
+/// only when an option changes.
+#[test]
+fn agent_options_are_read_and_hashed() {
+    let s = common::TestServer::start();
+    let t = Tmux::new(s.socket.clone());
+    s.wait_settled();
+    let pane = s.tmux(&["display", "-p", "-t", "alpha:0", "#{pane_id}"]);
+    let pane = pane.trim();
+    for (k, v) in [
+        ("@pane_agent", "claude"),
+        ("@pane_status", "running"),
+        ("@pane_started_at", "1790864748"),
+        ("@pane_prompt", "fix | the \x1e build"),
+    ] {
+        s.tmux(&["set-option", "-p", "-t", pane, k, v]);
+    }
+    let snap = read_snapshot(&t).unwrap();
+    let p = &snap.panes[0];
+    assert_eq!(p.agent_opts.get("@pane_status").unwrap(), "running");
+    assert_eq!(
+        p.agent_opts.get("@pane_prompt").unwrap(),
+        "fix | the \x1e build"
+    );
+    assert!(!p.agent_opts.contains_key("@pane_attention"));
+    let h1 = snap.sections();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert_eq!(read_snapshot(&t).unwrap().sections(), h1, "no tick");
+    s.tmux(&["set-option", "-p", "-t", pane, "@pane_status", "waiting"]);
+    assert_ne!(read_snapshot(&t).unwrap().sections(), h1);
 }

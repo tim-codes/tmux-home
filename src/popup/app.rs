@@ -671,6 +671,7 @@ mod tests {
                 current_path: "/home/u/dev/x".into(),
                 title: String::new(),
                 role: String::new(),
+                agent_opts: Default::default(),
             });
         }
         // a sidebar pane never describes the row
@@ -684,6 +685,7 @@ mod tests {
             current_path: "/".into(),
             title: String::new(),
             role: "sidebar".into(),
+            agent_opts: Default::default(),
         });
         s.clients.push(Client {
             name: "/dev/ttys1".into(),

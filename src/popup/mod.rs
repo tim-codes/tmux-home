@@ -569,6 +569,7 @@ mod tests {
                 current_path: "/tmp".into(),
                 title: String::new(),
                 role: String::new(),
+                agent_opts: Default::default(),
             });
         }
         s.clients.push(Client {
