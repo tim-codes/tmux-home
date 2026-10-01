@@ -577,9 +577,15 @@ impl TempDir {
 
     /// A new repo `name` in this directory on branch `main` with one commit.
     pub fn repo(&self, name: &str) -> PathBuf {
+        self.repo_in(name, "sha1")
+    }
+
+    /// `repo` with the given object format (`sha1`, `sha256`).
+    pub fn repo_in(&self, name: &str, format: &str) -> PathBuf {
         let r = self.0.join(name);
         std::fs::create_dir_all(&r).unwrap();
-        git_at(&r, &["init", "-q", "-b", "main"]);
+        let fmt = format!("--object-format={format}");
+        git_at(&r, &["init", "-q", "-b", "main", &fmt]);
         write(&r, "README", "hello\n");
         commit_all(&r, "init");
         r

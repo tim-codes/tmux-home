@@ -147,6 +147,7 @@ branches by name, worktree (linked, main, locked…) and the default branch.
 | `⚠n` | stray branches: commits on no remote, no upstream (or a gone one), not merged into the default branch; in a repo with no remote, every branch other than the default one that isn't merged into it |
 | `↻` | merge, rebase, cherry-pick, revert or bisect in progress |
 | `⊟` `⊞` `⊘` `⚑` | worktree prunable, locked, detached, branch/path mismatch |
+| `⊗` | limited: the repo's config names a command under a key that can't be switched off; only HEAD is shown, no status runs |
 | `~` | stale: the last check timed out or failed (the values are older) |
 
 `F1` shows the same legend. The symbols follow worktrunk's `wt list`;
@@ -167,8 +168,9 @@ At most 4 git processes run at once, each with a 10 s timeout
 once a second. Git runs read-only and runs nothing a repo or your config
 names: `--no-optional-locks`, no fetch or any transport, no config
 written, fsmonitor off (no hook, no `fsmonitor--daemon`), no hooks, no
-clean/process filters, textconv or external diff (attributes are read
-from the empty tree), inherited `GIT_DIR`-style variables removed,
+clean/process filters, textconv or external diff (every such key in the
+repo's config, whatever its name, is overridden to nothing, and attributes
+are read from the empty tree), inherited `GIT_DIR`-style variables removed,
 `LC_ALL=C`, each call in its own process group. One consequence: a
 stat-dirty LFS or `text=auto` file can show as modified (`!`) until your
 own git refreshes the index.

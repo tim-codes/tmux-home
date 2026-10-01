@@ -430,6 +430,14 @@ pub async fn collect(git: &Git, found: &Found, scan_root: &Path) -> Repo {
     };
 
     let bare = kind == RepoKind::Bare;
+    // every later call in this repo overrides its command-running keys
+    let git = &match git.guarded(&root).await {
+        Ok(g) => g,
+        Err(e) => {
+            repo.errors.push(e.to_string());
+            return repo;
+        }
+    };
 
     if !bare {
         match status_counts(git, &root).await {

@@ -243,20 +243,14 @@ impl RefsMemo {
         // config and worktrees change without any ref moving (`remote add`,
         // `worktree lock`, a switch inside a linked worktree): both are read
         // on every refresh, config into the key, worktrees outside the memo
-        forks += 1;
-        let cfg_out = git
-            .output(
-                dir,
-                &[
-                    "config",
-                    "-z",
-                    "--get-regexp",
-                    r"^(worktrunk\.default-branch|init\.defaultbranch|remote\..*\.url)$",
-                ],
-            )
-            .await
-            .map(|(_, o)| o)
-            .unwrap_or_default();
+        // the guard's config read (one fork, unless the caller's `Git` is
+        // already guarded) carries the keys item 7 needs; its output is
+        // part of the key, so a new filter or remote counts as a change
+        if git.guard.is_none() {
+            forks += 1;
+        }
+        let git = &git.guarded(dir).await?;
+        let cfg_out = git.guard.as_ref().expect("guarded").config.clone();
         forks += 1;
         self.fields.worktrees = match git.run(dir, &["worktree", "list", "--porcelain"]).await {
             Ok(o) => parse_worktrees(&o),

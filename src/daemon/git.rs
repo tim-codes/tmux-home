@@ -263,6 +263,7 @@ impl Task {
         let git = Git {
             timeout: cfg.timeout,
             gate: Some(Arc::new(Semaphore::new(cfg.permits))),
+            guard: None,
         };
         let t = Task {
             stamped: Instant::now(),
@@ -631,8 +632,32 @@ async fn refresh(
         st = h;
         let _ = tx.send(stage(st.clone()));
     }
-    // 2. git status
+    // 2. the guard: the repo's command-running config keys, each to be
+    // overridden; one that can't be leaves a HEAD-only badge, `limited`
     let t0 = Instant::now();
+    let git = match git.guarded(&p.root).await {
+        Ok(g) => {
+            st.limited = false;
+            g
+        }
+        Err(e) => {
+            let took = if e == GitError::Timeout {
+                git.timeout
+            } else {
+                t0.elapsed()
+            };
+            if let GitError::Limited(_) = e {
+                st = git::limited(&st);
+            } else {
+                st.stale = true;
+                st.error = (e != GitError::Timeout).then(|| e.to_string());
+            }
+            let _ = tx.send(stage(st));
+            let _ = tx.send(done(memo, Some(took)));
+            return;
+        }
+    };
+    // 3. git status
     match git::read_status(&git, &p).await {
         Ok(s) => {
             git::apply_status(&mut st, &s);
@@ -655,7 +680,7 @@ async fn refresh(
         }
     }
     let took = t0.elapsed();
-    // 3. refs: a probe, then more only if something changed
+    // 4. refs: a probe, then more only if something changed
     match memo.refresh(&git, &p).await {
         Ok(_) => {
             git::apply_refs(&mut st, &memo.fields, &p);

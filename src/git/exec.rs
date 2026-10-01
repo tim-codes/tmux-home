@@ -59,6 +59,9 @@ pub enum GitError {
     Spawn(String),
     /// git exited non-zero; its stderr.
     Failed(String),
+    /// The repo's config names a command under a key `-c` can't override
+    /// (`Guard`): nothing but file reads may run there.
+    Limited(String),
 }
 
 impl std::fmt::Display for GitError {
@@ -67,17 +70,25 @@ impl std::fmt::Display for GitError {
             GitError::Timeout => write!(f, "timed out"),
             GitError::Spawn(e) => write!(f, "failed to run git: {e}"),
             GitError::Failed(e) => write!(f, "{e}"),
+            GitError::Limited(k) => write!(
+                f,
+                "limited: config key {k:?} names a command tmux-home can't switch off"
+            ),
         }
     }
 }
 
 impl std::error::Error for GitError {}
 
-/// How git is run: timeout and optional shared semaphore.
+/// How git is run: timeout, optional shared semaphore, and the repo's
+/// guard (its command-running config keys, each overridden). A `Git`
+/// without a guard reads one before every call; `guarded` reads it once
+/// for a series of calls in one repo.
 #[derive(Clone, Debug)]
 pub struct Git {
     pub timeout: Duration,
     pub gate: Option<Arc<Semaphore>>,
+    pub guard: Option<Arc<Guard>>,
 }
 
 impl Default for Git {
@@ -85,7 +96,92 @@ impl Default for Git {
         Git {
             timeout: BADGE_TIMEOUT,
             gate: None,
+            guard: None,
         }
+    }
+}
+
+/// Every config key, in every scope git reads for the repo, that can make
+/// a read-only call run a command — plus the few keys the refs stage needs
+/// (item 7), so one `config --get-regexp` serves both.
+pub const GUARD_REGEX: &str = concat!(
+    r"^((filter|diff|merge)\..+\.(clean|smudge|process|textconv|command|driver|required)",
+    r"|credential\..+|core\.(fsmonitor|hookspath|sshcommand|askpass)|diff\.external",
+    r"|worktrunk\.default-branch|init\.defaultbranch|remote\..+\.url)$"
+);
+
+/// A repo's command-running config keys, read once (`Git::guarded`): the
+/// `-c key=value` overrides that switch each one off, by its exact name,
+/// and the raw `config --get-regexp` output (the refs stage parses it).
+#[derive(Clone, Debug, Default)]
+pub struct Guard {
+    pub overrides: Vec<String>,
+    pub config: String,
+}
+
+/// The overrides for `config -z --get-regexp GUARD_REGEX` output, or the key
+/// that can't be overridden (an `=` in it, or a record that doesn't parse
+/// as one of the expected keys — e.g. a newline in a subsection).
+pub fn parse_guard(out: &str) -> Result<Vec<String>, String> {
+    let mut v = Vec::new();
+    for rec in out.split('\0').filter(|r| !r.is_empty()) {
+        let key = rec.split_once('\n').map_or(rec, |(k, _)| k);
+        if key.contains('=') {
+            return Err(key.to_string());
+        }
+        let (section, rest) = key.split_once('.').ok_or_else(|| key.to_string())?;
+        match section {
+            // single-valued keys SAFE_CONFIG already overrides, and the refs
+            // stage's own keys
+            "core" | "worktrunk" | "init" | "remote" => continue,
+            "diff" if rest == "external" => continue,
+            "credential" if rest == "helper" => continue,
+            _ => {}
+        }
+        let Some((sub, var)) = rest.rsplit_once('.') else {
+            if section == "credential" {
+                continue; // credential.<var> other than helper: not a command
+            }
+            return Err(key.to_string());
+        };
+        let value = match (section, var) {
+            ("filter", "required") => "false",
+            (
+                "filter" | "diff" | "merge",
+                "clean" | "smudge" | "process" | "textconv" | "command" | "driver",
+            ) => "",
+            ("credential", "helper") => "",
+            ("credential", _) => continue,
+            _ => return Err(key.to_string()),
+        };
+        if sub.is_empty() {
+            return Err(key.to_string());
+        }
+        v.push(format!("{key}={value}"));
+        if section == "filter" {
+            v.push(format!("{section}.{sub}.required=false"));
+        }
+    }
+    v.sort();
+    v.dedup();
+    Ok(v)
+}
+
+/// Logs a limited repo once per process.
+fn log_limited(dir: &Path, key: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dir.to_path_buf())
+    {
+        eprintln!(
+            "tmux-home: {}: config key {key:?} names a command that can't be switched off; \
+             git badges there show HEAD only",
+            dir.display()
+        );
     }
 }
 
@@ -106,7 +202,8 @@ const EMPTY_TREE_SHA256: &str = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b
 
 /// Per-repo facts the safety flags need, from files: the empty tree's ID in
 /// the repo's hash, and the filter/diff driver names `info/attributes`
-/// uses (in-tree and global attributes are not read at all).
+/// uses (in-tree and global attributes are not read at all). The names are
+/// a second layer under the guard, which overrides every configured driver.
 fn repo_flags(dir: &Path) -> (&'static str, Vec<String>) {
     let Some(p) = super::repo::resolve(dir) else {
         return (EMPTY_TREE_SHA1, Vec::new());
@@ -126,13 +223,13 @@ fn repo_flags(dir: &Path) -> (&'static str, Vec<String>) {
         };
         for tok in text.split_whitespace() {
             for kind in ["filter=", "diff=", "merge="] {
+                // any name as-is; one with an `=` can't go through `-c`,
+                // and if config defines it the guard fails closed
                 if let Some(name) = tok.strip_prefix(kind)
                     && !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                    && !name.contains('=')
                 {
-                    drivers.push(format!("{}{name}", &kind[..kind.len() - 1]));
+                    drivers.push(format!("{}.{name}", &kind[..kind.len() - 1]));
                 }
             }
         }
@@ -163,8 +260,37 @@ impl Git {
         }
     }
 
-    /// The command for `git -C dir <args>`, scrubbed and read-only.
-    pub fn command(&self, dir: &Path, args: &[&str]) -> tokio::process::Command {
+    /// This `Git` with `dir`'s guard read (one fork, unless it has one):
+    /// every later call overrides the repo's command-running keys.
+    /// `GitError::Limited` when one can't be overridden.
+    pub async fn guarded(&self, dir: &Path) -> Result<Git, GitError> {
+        if self.guard.is_some() {
+            return Ok(self.clone());
+        }
+        let args = ["config", "-z", "--get-regexp", GUARD_REGEX];
+        let out = self.spawn(dir, &args, &[]).await?;
+        let config = match out.status.code() {
+            Some(0) | Some(1) => String::from_utf8_lossy(&out.stdout).into_owned(),
+            _ => return Err(failed(&out)),
+        };
+        let overrides = parse_guard(&config).map_err(|k| {
+            log_limited(dir, &k);
+            GitError::Limited(k)
+        })?;
+        Ok(Git {
+            guard: Some(Arc::new(Guard { overrides, config })),
+            ..self.clone()
+        })
+    }
+
+    /// The command for `git -C dir <args>`, scrubbed and read-only, with
+    /// `overrides` (`key=value`) passed as `-c`.
+    pub fn command(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        overrides: &[String],
+    ) -> tokio::process::Command {
         let mut c = tokio::process::Command::new(git_bin());
         for (k, _) in std::env::vars_os() {
             let Some(k) = k.to_str() else { continue };
@@ -194,6 +320,9 @@ impl Git {
                 c.arg("-c").arg(format!("{d}.required=false"));
             }
         }
+        for kv in overrides {
+            c.arg("-c").arg(kv);
+        }
         c.process_group(0);
         c.arg("-C")
             .arg(dir)
@@ -205,8 +334,20 @@ impl Git {
         c
     }
 
-    /// Runs git to completion (or its timeout) under a permit.
+    /// Runs git under the repo's guard (read first, if this `Git` has none).
     async fn raw(&self, dir: &Path, args: &[&str]) -> Result<std::process::Output, GitError> {
+        let g = self.guarded(dir).await?;
+        let overrides = &g.guard.as_ref().expect("guarded").overrides;
+        self.spawn(dir, args, overrides).await
+    }
+
+    /// Runs git to completion (or its timeout) under a permit.
+    async fn spawn(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        overrides: &[String],
+    ) -> Result<std::process::Output, GitError> {
         let _permit = match &self.gate {
             Some(g) => Some(
                 g.clone()
@@ -217,7 +358,7 @@ impl Git {
             None => None,
         };
         let child = self
-            .command(dir, args)
+            .command(dir, args, overrides)
             .spawn()
             .map_err(|e| GitError::Spawn(e.to_string()))?;
         let pgid = child.id();
@@ -276,4 +417,60 @@ fn failed(out: &std::process::Output) -> GitError {
     } else {
         err
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guard_overrides_each_key_verbatim() {
+        let out = "filter.a+b.clean\nx\0filter.with space.process\ny\0diff.Odd.Name.textconv\nz\0\
+                   credential.https://h.example.helper\nh\0credential.helper\nh\0\
+                   core.fsmonitor\ntrue\0remote.origin.url\nu\0merge.m.driver\nd\0";
+        let v = parse_guard(out).unwrap();
+        for want in [
+            "filter.a+b.clean=",
+            "filter.a+b.required=false",
+            "filter.with space.process=",
+            "filter.with space.required=false",
+            "diff.Odd.Name.textconv=",
+            "credential.https://h.example.helper=",
+            "merge.m.driver=",
+        ] {
+            assert!(v.iter().any(|k| k == want), "{want} missing: {v:?}");
+        }
+        assert!(
+            !v.iter()
+                .any(|k| k.starts_with("core.") || k.starts_with("remote."))
+        );
+    }
+
+    #[test]
+    fn guard_fails_closed_on_unrepresentable_keys() {
+        assert_eq!(
+            parse_guard("filter.a=b.clean\nx\0"),
+            Err("filter.a=b.clean".into())
+        );
+        // a record that isn't one of the expected keys (e.g. split by a
+        // newline in a subsection) fails closed too
+        assert!(parse_guard("filter.a\0").is_err());
+        assert!(parse_guard("diff.x.weird\nv\0").is_err());
+    }
+
+    #[test]
+    fn info_attributes_names_are_full_keys() {
+        let d = std::env::temp_dir().join(format!("th-exec-{}", std::process::id()));
+        std::fs::create_dir_all(d.join(".git/info")).unwrap();
+        std::fs::write(d.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            d.join(".git/info/attributes"),
+            "*.a filter=lfs diff=a+b\n*.b filter=x=y merge=m\n",
+        )
+        .unwrap();
+        let (tree, drivers) = repo_flags(&d);
+        assert_eq!(tree, EMPTY_TREE_SHA1);
+        assert_eq!(drivers, ["diff.a+b", "filter.lfs", "merge.m"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

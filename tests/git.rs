@@ -162,12 +162,13 @@ async fn a_hung_git_times_out_and_is_killed() {
     );
     unsafe { std::env::set_var("TMUX_HOME_GIT", &fake) };
     let t0 = Instant::now();
-    let r = Git::with_timeout(Duration::from_millis(300))
+    // long enough for the stand-in to start and write its pid under load
+    let r = Git::with_timeout(Duration::from_millis(1500))
         .run(&t.0, &["status"])
         .await;
     unsafe { std::env::remove_var("TMUX_HOME_GIT") };
     assert_eq!(r, Err(GitError::Timeout));
-    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
     let pid = std::fs::read_to_string(&pid).unwrap();
     // killed: gone, or a zombie until tokio's reaper collects it
     wait_until("the hung git to be killed", || {
@@ -577,7 +578,8 @@ async fn a_timeout_kills_the_whole_process_group() {
         &format!("sleep 30 & echo $! > '{}'; wait", pid.display()),
     );
     unsafe { std::env::set_var("TMUX_HOME_GIT", &fake) };
-    let r = Git::with_timeout(Duration::from_millis(300))
+    // long enough for the stand-in to start and write its pid under load
+    let r = Git::with_timeout(Duration::from_millis(1500))
         .run(&t.0, &["status"])
         .await;
     unsafe { std::env::remove_var("TMUX_HOME_GIT") };
@@ -695,4 +697,76 @@ async fn stray_without_a_remote_is_unmerged_non_default_branches() {
     assert!(!st.has_remote);
     assert_eq!(st.stray_names, ["spike"], "{st:?}");
     assert_eq!(st.badge_text(), "main ⚠1");
+}
+
+// ---- re-review: odd driver names, from config, in sha1 and sha256 repos ----
+
+/// A repo of `format` with `x.odd` committed, then `.git/info/attributes`
+/// naming `attr` for it and the config keys `keys` set to a script that
+/// leaves `marker`; finally `x.odd` is changed (stat-dirty and different).
+fn odd_repo(
+    t: &TempDir,
+    format: &str,
+    attr: &str,
+    keys: &[&str],
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = t.repo_in(&format!("r-{format}"), format);
+    write(&root, "x.odd", "one\n");
+    commit_all(&root, "odd");
+    let marker = t.0.join(format!("marker-{format}"));
+    let script = fake_git(&t.0, &format!("touch '{}'; cat", marker.display()));
+    write(&root, ".git/info/attributes", &format!("*.odd {attr}\n"));
+    for k in keys {
+        git_at(&root, &["config", k, script.to_str().unwrap()]);
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    write(&root, "x.odd", "two\n");
+    (root, marker)
+}
+
+#[tokio::test]
+async fn odd_driver_names_never_run() {
+    git_env();
+    for format in ["sha1", "sha256"] {
+        for (attr, keys) in [
+            (
+                "filter=a+b",
+                &["filter.a+b.clean", "filter.a+b.process"][..],
+            ),
+            ("diff=x+y", &["diff.x+y.textconv", "diff.x+y.command"][..]),
+            // a name attributes can't even spell: config is the only layer
+            (
+                "filter=plain",
+                &["filter.with space.clean", "filter.plain.clean"][..],
+            ),
+        ] {
+            let t = TempDir::new("odd");
+            let (root, marker) = odd_repo(&t, format, attr, keys);
+            let st = full(&root).await;
+            assert!(!st.limited && !st.stale, "{format} {attr}: {st:?}");
+            assert_eq!(st.modified, 1, "{format} {attr}: {st:?}");
+            let diff = file_diff(&Git::default(), &root, " M", "x.odd").await;
+            assert!(diff.contains("+two"), "{format} {attr}: {diff}");
+            assert!(!marker.exists(), "{format} {attr}: a driver ran");
+        }
+    }
+}
+
+/// A key `-c` can't carry (an `=` in the subsection): fail closed — no
+/// status, no diff checks, a HEAD-only badge marked limited.
+#[tokio::test]
+async fn an_unrepresentable_key_fails_closed() {
+    git_env();
+    for format in ["sha1", "sha256"] {
+        let t = TempDir::new("eq");
+        let (root, marker) = odd_repo(&t, format, "filter=a=b", &["filter.a=b.clean"]);
+        let st = full(&root).await;
+        assert!(st.limited, "{format}: {st:?}");
+        assert_eq!(st.branch, "main");
+        assert_eq!(st.phase, tmux_home::git::badge::Phase::Head);
+        assert_eq!(st.badge_text(), "main ⊗", "{format}");
+        let diff = file_diff(&Git::default(), &root, " M", "x.odd").await;
+        assert!(!diff.contains("+two"), "{format}: diffed anyway: {diff}");
+        assert!(!marker.exists(), "{format}: the driver ran");
+    }
 }

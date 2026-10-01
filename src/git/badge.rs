@@ -1,12 +1,14 @@
 //! A repo's status as the snapshot carries it (`Snapshot::git`), and the
 //! compact badge drawn from it (spec §6 "Badge symbols").
 //!
-//! `branch (wt) +!?✘ ⇡n ⇣n | $n ⚠n ↻⊟⊞⊘⚑ ~`:
+//! `branch (wt) +!?✘ ⇡n ⇣n | $n ⚠n ↻⊟⊞⊘⚑⊗ ~`:
 //! `+` staged · `!` modified · `?` untracked · `✘` conflicts ·
 //! `⇡n ⇣n` ahead/behind upstream · `|` in sync with it · `$n` stashes ·
 //! `⚠n` stray branches · `↻` operation in progress · `⊟` prunable ·
 //! `⊞` locked · `⊘` detached · `⚑` branch/worktree mismatch ·
-//! `~` stale (the last check timed out or failed; the values are older).
+//! `⊗` limited (the repo's config names a command tmux-home can't switch
+//! off: HEAD only) · `~` stale (the last check timed out or failed; the
+//! values are older).
 //! `↑↓` stay reserved for "vs default branch" (later).
 
 use super::repo::Operation;
@@ -104,6 +106,11 @@ pub struct RepoStatus {
     /// named after its branch.
     #[serde(default)]
     pub mismatch: bool,
+    /// The repo's config names a command under a key tmux-home can't
+    /// neutralise (`exec::Guard`): only HEAD is shown (`⊗`); no status or
+    /// diff-based check runs.
+    #[serde(default)]
+    pub limited: bool,
     /// The last check timed out or failed: the values are the last good ones.
     #[serde(default)]
     pub stale: bool,
@@ -192,6 +199,9 @@ impl RepoStatus {
                 state.push(c);
             }
         }
+        if self.limited {
+            state.push('⊗');
+        }
         if !state.is_empty() {
             v.push((state, Part::State));
         }
@@ -212,7 +222,7 @@ impl RepoStatus {
 }
 
 /// The badge legend (F1 help, README).
-pub const LEGEND: &str = "  git badge       branch (wt) +!?✘ ⇡n⇣n | $n ⚠n ↻⊟⊞⊘⚑ ~
+pub const LEGEND: &str = "  git badge       branch (wt) +!?✘ ⇡n⇣n | $n ⚠n ↻⊟⊞⊘⚑⊗ ~
                   (wt) linked worktree   + staged   ! modified
                   ? untracked   ✘ conflicts   ⇡n ⇣n ahead/behind upstream
                   | in sync with upstream   $n stashes
@@ -221,6 +231,8 @@ pub const LEGEND: &str = "  git badge       branch (wt) +!?✘ ⇡n⇣n | $n ⚠
                      any branch not merged into the default branch)
                   ↻ merge/rebase/cherry-pick/revert/bisect in progress
                   ⊟ prunable  ⊞ locked  ⊘ detached  ⚑ branch/path mismatch
+                  ⊗ limited: the repo's config names a command that
+                     can't be switched off; only HEAD is shown
                   ~ stale: the last check timed out or failed";
 
 #[cfg(test)]

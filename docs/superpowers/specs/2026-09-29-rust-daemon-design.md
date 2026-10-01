@@ -296,7 +296,16 @@ details this section leaves open, or departs from it:
   `GIT_NO_LAZY_FETCH=1`, empty `credential.helper` and `diff.external`,
   `--no-ext-diff --no-textconv` on diffs, and attributes from the empty
   tree (`--attr-source`, sha1 or sha256) with global/system attributes
-  off and drivers named in `info/attributes` overridden, so no
+  off. Re-review fix: the primary layer doesn't parse attributes at all —
+  before a repo's calls, one `config -z --get-regexp` (every scope, the
+  same scrubbed env) lists every `filter|diff|merge.<any>.<command
+  key>` and `credential.<url>.helper`, and each is overridden by its exact
+  name (`-c <key>=`, `filter.<x>.required=false`); a key `-c` can't carry
+  (an `=` in it, an unparseable record) fails closed: HEAD-only badge
+  `⊗` (limited), no status or diff checks, logged once. That read also
+  carries item 7's keys, so it replaces the refs stage's config fork (no
+  extra fork) and is part of the memo key. Driver names in
+  `info/attributes` are overridden too, as a second layer. So no
   clean/process filter or textconv runs (trade-off: a stat-dirty LFS or
   `text=auto` file can read as modified). Each call runs in its own
   process group, killed as a whole on timeout. Also `color.ui=false`,

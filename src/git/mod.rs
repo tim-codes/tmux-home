@@ -129,10 +129,35 @@ pub async fn read_status(git: &Git, p: &RepoPaths) -> Result<StatusPart, GitErro
     Ok(StatusPart { counts, info })
 }
 
+/// The badge of a repo whose config names a command that can't be switched
+/// off (`exec::Guard`): only what the HEAD stage read from files, marked
+/// `limited` (`⊗`).
+pub fn limited(st: &RepoStatus) -> RepoStatus {
+    RepoStatus {
+        branch: st.branch.clone(),
+        detached: st.detached,
+        linked: st.linked,
+        main_root: st.main_root.clone(),
+        operation: st.operation,
+        stashes: st.stashes,
+        limited: true,
+        ..RepoStatus::default()
+    }
+}
+
 /// All three stages at once, for one-off callers (`query`, tests, perf).
 pub async fn full_status(git: &Git, p: &RepoPaths, memo: &mut RefsMemo) -> RepoStatus {
     let mut st = RepoStatus::default();
     apply_head(&mut st, p);
+    let git = &match git.guarded(&p.root).await {
+        Ok(g) => g,
+        Err(GitError::Limited(_)) => return limited(&st),
+        Err(e) => {
+            st.stale = true;
+            st.error = Some(e.to_string());
+            return st;
+        }
+    };
     match read_status(git, p).await {
         Ok(s) => apply_status(&mut st, &s),
         Err(e) => {
