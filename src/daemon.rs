@@ -211,12 +211,13 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>) {
     let mut latest = shared.latest.subscribe();
     // A subscriber places its cursor from its first snapshot, and a
     // `refresh` follows the client's own write: both get a read made now,
-    // not the source's last (up to a poll old). If the read fails, the
-    // published snapshot will do.
-    if matches!(req, Request::Subscribe { .. } | Request::Refresh { .. })
-        && let Err(e) = shared.refresh().await
-    {
-        eprintln!("tmux-home: refresh failed: {e:#}");
+    // not the source's last (up to a poll old).
+    if matches!(req, Request::Subscribe { .. } | Request::Refresh { .. }) {
+        let read = shared.refresh().await;
+        if let Some(err) = refresh_failed(&req, read) {
+            let _ = write_msg(&mut w, &err).await;
+            return;
+        }
     }
     // wait for the first snapshot if the source hasn't produced one yet
     if latest.wait_for(|s| s.is_some()).await.is_err() {
@@ -236,6 +237,19 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>) {
     }
 }
 
+/// What a failed fresh read means for `req`: a `refresh` must not be
+/// answered with the published snapshot (it may predate the client's
+/// write, and its seq would become the client's floor), so it gets an
+/// error and the client reads tmux itself. A subscription falls back to the
+/// published snapshot; newer ones follow.
+fn refresh_failed(req: &Request, read: anyhow::Result<()>) -> Option<Reply> {
+    let e = read.err()?;
+    eprintln!("tmux-home: refresh failed: {e:#}");
+    matches!(req, Request::Refresh { .. }).then(|| Reply::Error {
+        msg: format!("refresh failed: {e:#}"),
+    })
+}
+
 async fn send(
     w: &mut tokio::net::unix::OwnedWriteHalf,
     epoch: u64,
@@ -253,6 +267,21 @@ mod tests {
 
     fn sections(tmux: u64) -> Sections {
         Sections { tmux }
+    }
+
+    #[test]
+    fn a_failed_refresh_is_an_error_but_a_subscription_goes_on() {
+        let refresh = Request::Refresh { v: "x".into() };
+        let sub = Request::Subscribe {
+            v: "x".into(),
+            client: "t".into(),
+        };
+        assert!(refresh_failed(&refresh, Ok(())).is_none());
+        assert!(matches!(
+            refresh_failed(&refresh, Err(anyhow::anyhow!("tmux gone"))),
+            Some(Reply::Error { msg }) if msg.contains("tmux gone")
+        ));
+        assert!(refresh_failed(&sub, Err(anyhow::anyhow!("tmux gone"))).is_none());
     }
 
     #[test]

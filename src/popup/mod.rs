@@ -12,7 +12,7 @@ use crate::{
     tmux::snapshot::{Snapshot, read_snapshot},
 };
 use app::{Action, App, HELP, Mode, Row};
-use fresh::{Floor, Stamp};
+use fresh::{Guard, Stamp};
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyEventKind},
@@ -36,7 +36,7 @@ struct Feed {
 const DEGRADED_EVERY: Duration = Duration::from_secs(1);
 const PREVIEW_EVERY: Duration = Duration::from_millis(1000);
 /// Budget for the daemon's first reply to a subscription (a fresh read).
-const SUBSCRIBE_BUDGET: Duration = Duration::from_millis(150);
+const SUBSCRIBE_BUDGET: Duration = Duration::from_millis(400);
 /// Budget for a `refresh` after a write; past it the popup reads tmux itself.
 const REFRESH_BUDGET: Duration = Duration::from_millis(300);
 /// While degraded, a daemon is (re)started at most this often (at once
@@ -106,8 +106,8 @@ struct Runtime {
     live: bool,
     preview: (Option<String>, String),
     preview_at: Instant,
-    /// Set by `refresh` after our own write: older snapshots are dropped.
-    floor: Option<Floor>,
+    /// Set by `refresh` after our own write: older snapshots are held back.
+    guard: Guard<Snapshot>,
 }
 
 impl Runtime {
@@ -136,7 +136,7 @@ impl Runtime {
     /// from then on, snapshots older than this read are ignored.
     fn refresh(&mut self, app: &mut App) {
         if let Some((s, stamp)) = self.read_now() {
-            self.floor = Some(Floor::of(stamp));
+            self.guard.set_floor(stamp);
             let rows = self.rows(&s);
             app.set_rows(rows);
         }
@@ -234,6 +234,10 @@ impl Runtime {
                 }
             }
         }
+        // the closed-window store reports a reset stack here, not on stderr
+        if let Some(n) = self.store.take_notice() {
+            app.notice = Some(format!(" {n}"));
+        }
         true
     }
 }
@@ -253,7 +257,7 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
         live: false,
         preview: (None, String::new()),
         preview_at: Instant::now(),
-        floor: None,
+        guard: Guard::default(),
     };
     let mut app = App::new();
     // first picture: read tmux directly, so the cursor lands on the window
@@ -289,8 +293,13 @@ fn event_loop(
             rt.live = live;
         }
         let now = Instant::now();
-        if let Some(f) = latest.filter(|f| fresh::accept(rt.floor.as_ref(), &f.stamp, now)) {
-            let rows = rt.rows(&f.snap);
+        let apply = match latest {
+            Some(f) => rt.guard.offer(f.snap, &f.stamp, now),
+            None => None,
+        }
+        .or_else(|| rt.guard.tick(now));
+        if let Some(snap) = apply {
+            let rows = rt.rows(&snap);
             app.set_rows(rows);
             dirty = true;
         }
@@ -508,7 +517,11 @@ pub fn reopen_cli(socket: Option<PathBuf>) -> anyhow::Result<i32> {
     let socket = client::current_socket(socket)
         .ok_or_else(|| anyhow::anyhow!("not inside tmux and no --socket"))?;
     let store = Store::for_socket(&socket)?;
-    match Tx::new(socket).reopen(&store)? {
+    let reopened = Tx::new(socket).reopen(&store);
+    if let Some(n) = store.take_notice() {
+        eprintln!("tmux-home: {n}");
+    }
+    match reopened? {
         Some(w) => {
             println!("{w}");
             Ok(0)

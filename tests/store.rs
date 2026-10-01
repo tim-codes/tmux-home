@@ -86,6 +86,11 @@ fn corrupt_file_is_moved_aside() {
     let store = Store::new(srv.clone(), None);
     assert_eq!(store.pop().unwrap(), None, "a corrupt stack reads as empty");
     assert_eq!(corrupt_files(&srv), [b"{not json"], "kept for inspection");
+    let n = store
+        .take_notice()
+        .expect("the reset is reported to the caller");
+    assert!(n.contains("kept as closed.json.corrupt."), "{n}");
+    assert_eq!(store.take_notice(), None, "once");
     store.push(entry(1)).unwrap();
     assert_eq!(store.pop().unwrap(), Some(entry(1)));
     // a second corrupt file doesn't overwrite the first one kept
@@ -113,6 +118,10 @@ fn corrupt_file_that_cannot_move_reads_as_empty() {
     std::fs::set_permissions(&srv, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(got.unwrap(), 0);
     assert!(corrupt_files(&srv).is_empty());
+    let n = store
+        .take_notice()
+        .expect("reported to the caller, not printed");
+    assert!(n.contains("could not be moved aside"), "{n}");
 }
 
 #[test]

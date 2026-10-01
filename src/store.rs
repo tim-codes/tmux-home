@@ -36,11 +36,28 @@ pub struct Store {
     dir: PathBuf,
     /// The bash version's stack (`<state root>/closed`), imported once.
     legacy: Option<PathBuf>,
+    /// Something the user should hear about (an unreadable stack was reset);
+    /// the caller shows it (`take_notice`): the popup can't print while it
+    /// owns the screen.
+    notice: std::sync::Mutex<Option<String>>,
 }
 
 impl Store {
     pub fn new(dir: PathBuf, legacy: Option<PathBuf>) -> Store {
-        Store { dir, legacy }
+        Store {
+            dir,
+            legacy,
+            notice: Default::default(),
+        }
+    }
+
+    /// The pending notice, if any (cleared).
+    pub fn take_notice(&self) -> Option<String> {
+        self.notice.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn set_notice(&self, n: String) {
+        *self.notice.lock().unwrap_or_else(|e| e.into_inner()) = Some(n);
     }
 
     /// The store for a tmux server's state dir, importing the bash stack from
@@ -86,13 +103,13 @@ impl Store {
                 // keep it for inspection and start an empty stack (even if
                 // it can't be moved aside: the next write replaces it)
                 Err(_) => {
-                    let aside = self.dir.join(corrupt_name(std::time::SystemTime::now()));
-                    if let Err(e) = std::fs::rename(self.file(), &aside) {
-                        eprintln!(
-                            "tmux-home: unreadable {} not moved aside: {e}",
-                            self.file().display()
-                        );
-                    }
+                    let name = corrupt_name(std::time::SystemTime::now());
+                    self.set_notice(match std::fs::rename(self.file(), self.dir.join(&name)) {
+                        Ok(()) => format!("closed.json was unreadable: kept as {name}, reopen stack reset"),
+                        Err(e) => format!(
+                            "closed.json is unreadable and could not be moved aside ({e}): reopen stack reset"
+                        ),
+                    });
                     Ok(vec![])
                 }
             },

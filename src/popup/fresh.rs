@@ -7,7 +7,8 @@
 //! afterwards (a push already in flight, a degraded read that started
 //! earlier); applying it would undo the write on screen until the next
 //! change. The read the popup applied sets a `Floor`; anything older than
-//! the floor is dropped. This is the one staleness guard: the daemon's fresh
+//! the floor is held back (`Guard`), and applied only if nothing newer comes
+//! before the floor expires. This is the one staleness guard: the daemon's fresh
 //! read on subscribe and the popup's wanted selection (`App::want`) only
 //! make the first picture right and keep the cursor put.
 
@@ -69,6 +70,58 @@ pub fn accept(floor: Option<&Floor>, s: &Stamp, now: Instant) -> bool {
         // another daemon, or a floor from a direct read: only a
         // connection opened after the floor's read is surely newer
         Stamp::Live { since, .. } => since >= f.at,
+    }
+}
+
+/// The popup's side of the guard: the floor, plus the newest snapshot it
+/// held back. A held snapshot is not lost: when the floor expires it is
+/// released (`tick`), so a real change that arrived on a connection opened
+/// before the floor (a live subscription after a failed `refresh`) shows
+/// at most `FLOOR_TTL` late instead of waiting for the next change.
+#[derive(Debug)]
+pub struct Guard<T> {
+    floor: Option<Floor>,
+    held: Option<T>,
+}
+
+impl<T> Default for Guard<T> {
+    fn default() -> Self {
+        Guard {
+            floor: None,
+            held: None,
+        }
+    }
+}
+
+impl<T> Guard<T> {
+    /// The popup applied its own post-write read stamped `s`: anything
+    /// held so far predates it.
+    pub fn set_floor(&mut self, s: Stamp) {
+        self.floor = Some(Floor::of(s));
+        self.held = None;
+    }
+
+    /// A snapshot arrived: `Some` to apply it now, `None` if it is held
+    /// back (replacing an older held one).
+    pub fn offer(&mut self, item: T, s: &Stamp, now: Instant) -> Option<T> {
+        if accept(self.floor.as_ref(), s, now) {
+            self.held = None;
+            Some(item)
+        } else {
+            self.held = Some(item);
+            None
+        }
+    }
+
+    /// Called every tick: once the floor has expired, it is dropped and a
+    /// held snapshot is released to be applied.
+    pub fn tick(&mut self, now: Instant) -> Option<T> {
+        let f = self.floor?;
+        if now.saturating_duration_since(f.at) < FLOOR_TTL {
+            return None;
+        }
+        self.floor = None;
+        self.held.take()
     }
 }
 
@@ -141,5 +194,39 @@ mod tests {
             t(100) + FLOOR_TTL - Duration::from_millis(1)
         ));
         assert!(accept(Some(&f), &old, t(100) + FLOOR_TTL));
+    }
+
+    /// Pass 3 review: refresh failed while live, so the floor is a direct
+    /// read and the live subscription (opened before it) is held back. The
+    /// newest held push is applied once the floor expires, not lost.
+    #[test]
+    fn a_held_push_is_applied_when_the_floor_expires() {
+        let mut g = Guard::default();
+        g.set_floor(Stamp::Direct { at: t(100) });
+        assert_eq!(g.offer("old", &live(1, 4, 0), t(110)), None);
+        assert_eq!(g.offer("change", &live(1, 5, 0), t(120)), None);
+        assert_eq!(g.tick(t(100) + FLOOR_TTL - Duration::from_millis(1)), None);
+        assert_eq!(g.tick(t(100) + FLOOR_TTL), Some("change"));
+        assert_eq!(g.tick(t(100) + FLOOR_TTL), None, "released once");
+        // no floor any more: everything applies
+        assert_eq!(g.offer("next", &live(1, 6, 0), t(2500)), Some("next"));
+    }
+
+    /// An accepted snapshot is newer than anything held: the held one is
+    /// dropped, and a new floor drops it too.
+    #[test]
+    fn accepted_or_new_floor_drops_the_held_one() {
+        let mut g = Guard::default();
+        g.set_floor(Stamp::Direct { at: t(100) });
+        assert_eq!(g.offer("held", &live(1, 4, 0), t(110)), None);
+        assert_eq!(
+            g.offer("fresh", &Stamp::Direct { at: t(120) }, t(130)),
+            Some("fresh")
+        );
+        assert_eq!(g.tick(t(100) + FLOOR_TTL), None);
+        g.set_floor(Stamp::Direct { at: t(3000) });
+        assert_eq!(g.offer("held", &live(1, 9, 0), t(3010)), None);
+        g.set_floor(Stamp::Direct { at: t(3020) });
+        assert_eq!(g.tick(t(3020) + FLOOR_TTL), None);
     }
 }
