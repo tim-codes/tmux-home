@@ -80,9 +80,15 @@ impl Store {
 
     fn read(&self) -> anyhow::Result<Vec<ClosedWindow>> {
         match std::fs::read(self.file()) {
-            Ok(b) => Ok(serde_json::from_slice::<ClosedFile>(&b)
-                .map(|f| f.closed)
-                .unwrap_or_default()),
+            Ok(b) => match serde_json::from_slice::<ClosedFile>(&b) {
+                Ok(f) => Ok(f.closed),
+                // hand-edited, truncated or from an incompatible version:
+                // keep it for inspection and start an empty stack
+                Err(_) => {
+                    std::fs::rename(self.file(), self.dir.join("closed.json.corrupt"))?;
+                    Ok(vec![])
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let imported = self.import_legacy();
                 if !imported.is_empty() {

@@ -61,3 +61,35 @@ fn imports_bash_stack_once() {
     assert_eq!(store.pop().unwrap(), None);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn corrupt_file_is_moved_aside() {
+    let d = tempfile::tempdir().unwrap();
+    let srv = d.path().join("srv");
+    std::fs::create_dir_all(&srv).unwrap();
+    std::fs::write(srv.join("closed.json"), b"{not json").unwrap();
+    let store = Store::new(srv.clone(), None);
+    assert_eq!(store.pop().unwrap(), None, "a corrupt stack reads as empty");
+    assert_eq!(
+        std::fs::read(srv.join("closed.json.corrupt")).unwrap(),
+        b"{not json",
+        "kept for inspection"
+    );
+    store.push(entry(1)).unwrap();
+    assert_eq!(store.pop().unwrap(), Some(entry(1)));
+}
+
+#[test]
+fn unknown_fields_are_ignored() {
+    let d = tempfile::tempdir().unwrap();
+    let srv = d.path().join("srv");
+    std::fs::create_dir_all(&srv).unwrap();
+    std::fs::write(
+        srv.join("closed.json"),
+        r#"{"future":true,"closed":[{"session":"s","index":1,"prev":"-","next":"-","automatic_rename":false,"active":0,"layout":"","name":"a","paths":["/"],"closed_at":123}]}"#,
+    )
+    .unwrap();
+    let store = Store::new(srv.clone(), None);
+    assert_eq!(store.pop().unwrap().unwrap().name, "a");
+    assert!(!srv.join("closed.json.corrupt").exists());
+}

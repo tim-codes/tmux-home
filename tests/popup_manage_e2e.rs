@@ -436,3 +436,19 @@ fn degraded_mode_without_a_daemon() {
     o.wait_cursor_on("polled");
     assert!(sessions(&s).len() == 2 && window_ids(&s).len() == 5);
 }
+
+/// A hand-broken closed.json is moved aside; ^x and ^t keep working.
+#[test]
+fn corrupt_store_does_not_break_close_and_reopen() {
+    let (_env, s, o) = popup_fixture();
+    let dir = Paths::for_socket(&s.socket).unwrap().state_dir;
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("closed.json"), "{\"closed\": [trunc").unwrap();
+    o.open_popup();
+    close_idle(&o, "win two");
+    o.wait_for(r"^> +.*3/3");
+    o.keys(&["C-t"]);
+    o.wait_for(r"^> +.*4/4");
+    o.wait_cursor_on("win two");
+    assert!(dir.join("closed.json.corrupt").exists());
+}
