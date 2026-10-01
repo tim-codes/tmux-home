@@ -132,7 +132,10 @@ async fn serves_server_without_sessions() {
     let _env = common::TestEnv::new();
     let s = common::TestServer::start_empty();
     let p = Paths::for_socket(&s.socket).unwrap();
-    let d = tokio::spawn(tmux_home::daemon::run(s.socket.clone(), SourceKind::Control));
+    let d = tokio::spawn(tmux_home::daemon::run(
+        s.socket.clone(),
+        SourceKind::Control,
+    ));
     let (r, mut w) = connect(&p).await.into_split();
     let mut r = BufReader::new(r);
     write_msg(
@@ -164,4 +167,55 @@ async fn serves_server_without_sessions() {
         .expect("daemon should exit with its server")
         .unwrap()
         .unwrap();
+}
+
+/// tmux kills `run-shell -b` jobs on kill-server; the daemon must still
+/// clean up its socket (and release its lock) on SIGTERM, SIGHUP and SIGINT.
+#[tokio::test]
+async fn signals_clean_up_socket() {
+    let _env = common::TestEnv::new();
+    let s = common::TestServer::start();
+    let p = Paths::for_socket(&s.socket).unwrap();
+    for sig in ["TERM", "HUP", "INT"] {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tmux-home"))
+            .args(["daemon", "--socket"])
+            .arg(&s.socket)
+            .spawn()
+            .unwrap();
+        let _ = connect(&p).await;
+        let st = std::process::Command::new("kill")
+            .arg(format!("-{sig}"))
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let mut exited = false;
+        for _ in 0..100 {
+            if child.try_wait().unwrap().is_some() {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(exited, "daemon did not exit on SIG{sig}");
+        assert!(!p.sock.exists(), "socket left behind after SIG{sig}");
+    }
+}
+
+/// A socket path the platform can't bind (sun_path) fails early with a
+/// clear error instead of an opaque bind failure.
+#[tokio::test]
+async fn overlong_socket_path_is_a_clear_error() {
+    let env = common::TestEnv::new();
+    let s = common::TestServer::start();
+    let long = env.runtime.join("x".repeat(120));
+    // SAFETY: single-threaded test process (RUST_TEST_THREADS=1).
+    unsafe {
+        std::env::set_var("TMUX_HOME_RUNTIME_DIR", &long);
+    }
+    let err = tmux_home::daemon::run(s.socket.clone(), SourceKind::Poll)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("too long"), "{err:#}");
+    assert!(!long.exists(), "nothing created for an unusable path");
 }
