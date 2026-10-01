@@ -42,61 +42,102 @@ pub const MAX_PROMPT: usize = 2000;
 
 pub struct Sidebar;
 
+/// The option names a source reads, field by field. The sidebar and
+/// tmux-home's own hooks (`home`) write the same value vocabulary under
+/// different names, so both read through `read_named`.
+pub struct Names {
+    pub agent: &'static str,
+    pub status: &'static str,
+    pub attention: &'static str,
+    pub wait_reason: &'static str,
+    pub started: &'static str,
+    pub prompt: &'static str,
+    pub prompt_source: &'static str,
+    pub subagents: &'static str,
+    pub bg_cmd: &'static str,
+    pub permission_mode: &'static str,
+    pub worktree_name: &'static str,
+    pub worktree_branch: &'static str,
+    pub session_id: &'static str,
+}
+
+pub const NAMES: Names = Names {
+    agent: "@pane_agent",
+    status: "@pane_status",
+    attention: "@pane_attention",
+    wait_reason: "@pane_wait_reason",
+    started: "@pane_started_at",
+    prompt: "@pane_prompt",
+    prompt_source: "@pane_prompt_source",
+    subagents: "@pane_subagents",
+    bg_cmd: "@pane_bg_cmd",
+    permission_mode: "@pane_permission_mode",
+    worktree_name: "@pane_worktree_name",
+    worktree_branch: "@pane_worktree_branch",
+    session_id: "@pane_session_id",
+};
+
 impl AgentSource for Sidebar {
     fn options(&self) -> &'static [&'static str] {
         OPTIONS
     }
 
     fn read(&self, pane: &Pane) -> Option<AgentState> {
-        let get = |k: &str| {
-            pane.agent_opts
-                .get(k)
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-        };
-        let agent = get("@pane_agent");
-        let status_raw = get("@pane_status");
-        if agent.is_none() && status_raw.is_none() {
-            return None;
-        }
-        let status = match status_raw.unwrap_or("") {
-            "running" => Status::Running,
-            "background" => Status::Background,
-            "waiting" | "notification" => Status::Waiting,
-            "idle" => Status::Idle,
-            "error" => Status::Error,
-            _ => Status::Unknown,
-        };
-        let wait_reason = get("@pane_wait_reason").map(|r| parse_reason(r, status));
-        let worktree = match (get("@pane_worktree_name"), get("@pane_worktree_branch")) {
-            (None, None) => None,
-            (n, b) => Some(Worktree {
-                name: n.unwrap_or("").into(),
-                branch: b.unwrap_or("").into(),
-            }),
-        };
-        Some(AgentState {
-            kind: AgentKind::parse(agent.unwrap_or("")),
-            status,
-            attention: get("@pane_attention") == Some("notification"),
-            wait_reason,
-            run_started: get("@pane_started_at").and_then(|s| s.parse().ok()),
-            prompt: get("@pane_prompt").map(|p| p.chars().take(MAX_PROMPT).collect()),
-            prompt_is_reply: get("@pane_prompt_source") == Some("response"),
-            subagents: get("@pane_subagents")
-                .map(|s| {
-                    s.split(',')
-                        .filter(|e| !e.trim().is_empty())
-                        .map(|e| e.split(':').next().unwrap_or(e).trim().to_string())
-                        .collect()
-                })
-                .unwrap_or_default(),
-            bg_cmd: get("@pane_bg_cmd").map(str::to_string),
-            permission_mode: get("@pane_permission_mode").map(str::to_string),
-            worktree,
-            session_id: get("@pane_session_id").map(str::to_string),
-        })
+        read_named(&NAMES, pane)
     }
+}
+
+/// A pane's agent state from the options `n` names; `None` unless the
+/// agent or status option is set.
+pub fn read_named(n: &Names, pane: &Pane) -> Option<AgentState> {
+    let get = |k: &str| {
+        pane.agent_opts
+            .get(k)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+    };
+    let agent = get(n.agent);
+    let status_raw = get(n.status);
+    if agent.is_none() && status_raw.is_none() {
+        return None;
+    }
+    let status = match status_raw.unwrap_or("") {
+        "running" => Status::Running,
+        "background" => Status::Background,
+        "waiting" | "notification" => Status::Waiting,
+        "idle" => Status::Idle,
+        "error" => Status::Error,
+        _ => Status::Unknown,
+    };
+    let wait_reason = get(n.wait_reason).map(|r| parse_reason(r, status));
+    let worktree = match (get(n.worktree_name), get(n.worktree_branch)) {
+        (None, None) => None,
+        (nm, b) => Some(Worktree {
+            name: nm.unwrap_or("").into(),
+            branch: b.unwrap_or("").into(),
+        }),
+    };
+    Some(AgentState {
+        kind: AgentKind::parse(agent.unwrap_or("")),
+        status,
+        attention: get(n.attention) == Some("notification"),
+        wait_reason,
+        run_started: get(n.started).and_then(|s| s.parse().ok()),
+        prompt: get(n.prompt).map(|p| p.chars().take(MAX_PROMPT).collect()),
+        prompt_is_reply: get(n.prompt_source) == Some("response"),
+        subagents: get(n.subagents)
+            .map(|s| {
+                s.split(',')
+                    .filter(|e| !e.trim().is_empty())
+                    .map(|e| e.split(':').next().unwrap_or(e).trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        bg_cmd: get(n.bg_cmd).map(str::to_string),
+        permission_mode: get(n.permission_mode).map(str::to_string),
+        worktree,
+        session_id: get(n.session_id).map(str::to_string),
+    })
 }
 
 fn parse_reason(r: &str, status: Status) -> WaitReason {

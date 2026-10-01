@@ -6,18 +6,22 @@
 //! alive. The popup (and `ops`) only ever see `AgentState`, `PaneAgent`,
 //! `WindowAgents` and `Tally`; they never read an option by name.
 //!
-//! Today the only source is tmux-agent-sidebar's `@pane_*` options
-//! (`sidebar`). Pass 5 adds tmux-home's own hooks writing `@home_*`: one more
-//! module implementing `AgentSource`, put first in `SOURCES`; `OPTIONS`
-//! picks up its names. Nothing in the UI changes.
+//! Two sources, in order: tmux-home's own `@home_*` options (`home`,
+//! written by `tmux-home hook`, through an `adapter::AgentAdapter` such as
+//! `claude`), then tmux-agent-sidebar's `@pane_*` options (`sidebar`) as
+//! the fallback for panes tmux-home's hooks haven't seen. `OPTIONS` is the
+//! union of their names. Nothing in the UI knows which source answered.
 
+pub mod adapter;
+pub mod claude;
+pub mod home;
 pub mod sidebar;
 
 use crate::tmux::snapshot::Pane;
 use std::sync::LazyLock;
 
 /// Sources in priority order: the first that recognises a pane wins.
-pub const SOURCES: &[&dyn AgentSource] = &[&sidebar::Sidebar];
+pub const SOURCES: &[&dyn AgentSource] = &[&home::Home, &sidebar::Sidebar];
 
 /// Every pane option any source reads, each once, in source order; the
 /// snapshot fetches these.
@@ -551,9 +555,10 @@ pub(crate) mod tests {
 
     #[test]
     fn options_are_every_sources_names_once() {
-        for o in sidebar::OPTIONS {
+        for o in sidebar::OPTIONS.iter().chain(home::OPTIONS) {
             assert!(OPTIONS.contains(o), "{o}");
         }
+        assert_eq!(OPTIONS[0], "@home_agent", "home's names come first");
         let mut v = OPTIONS.clone();
         v.sort();
         v.dedup();
