@@ -68,7 +68,13 @@ doesn't, for a status line. It never starts a daemon that is simply down,
 so after the server's daemon dies the chip shows `○` until something (the
 popup, `tmux-home query`) starts a new one. After a rebuild, the old
 daemon's `Restart` reply makes `status` itself start the new build's daemon:
-the chip shows `○` once, then `●` from its next refresh.
+the chip shows `○` once, then `●` from its next refresh. Only the plugin's
+own binary (`target/release/tmux-home`) does this, unless
+`TMUX_HOME_STATUS_RESPAWN` says otherwise (`0` never, anything else always).
+
+Don't point a development build at your live tmux server: each build
+restarts the other's daemon on every request (one per server, one build at
+a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 
 ## Keys
 

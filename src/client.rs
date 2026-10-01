@@ -216,10 +216,23 @@ pub fn query(socket: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `status` (running as `exe`) starts a daemon after a `Restart`
+/// reply. `TMUX_HOME_STATUS_RESPAWN` (`env`) decides when set (`0`: no);
+/// otherwise only the plugin's own build (`…/target/release/tmux-home`)
+/// does. A dev build run against the live server would otherwise replace
+/// the plugin's daemon, whose next status call replaces it back, and so on.
+pub fn respawn_on_restart(exe: &Path, env: Option<&str>) -> bool {
+    match env {
+        Some(v) => v != "0",
+        None => exe.ends_with("target/release/tmux-home"),
+    }
+}
+
 /// `tmux-home status`: `●` if the daemon answers within 100 ms, else `○`;
 /// nothing outside tmux. A daemon that is down stays down (the status line
 /// must not start one), but one replaced by a newer build (`Restart`) is
-/// respawned at once, so the chip shows `○` only until its next refresh.
+/// respawned at once (see `respawn_on_restart`), so the chip shows `○` only
+/// until its next refresh.
 pub fn status(socket: Option<PathBuf>) -> anyhow::Result<()> {
     let Some(socket) = current_socket(socket) else {
         return Ok(());
@@ -227,7 +240,11 @@ pub fn status(socket: Option<PathBuf>) -> anyhow::Result<()> {
     let up = match ask(&socket, &query_req(), Duration::from_millis(100)) {
         Answer::Snapshot { .. } => true,
         Answer::Restart => {
-            revive(&socket, true);
+            let exe = std::env::current_exe().unwrap_or_default();
+            let env = std::env::var("TMUX_HOME_STATUS_RESPAWN").ok();
+            if respawn_on_restart(&exe, env.as_deref()) {
+                revive(&socket, true);
+            }
             false
         }
         Answer::Down => false,
@@ -239,6 +256,16 @@ pub fn status(socket: Option<PathBuf>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_plugin_build_respawns_from_status() {
+        let release = Path::new("/p/tmux-home/target/release/tmux-home");
+        let dev = Path::new("/p/tmux-home-mvp/target/debug/tmux-home");
+        assert!(respawn_on_restart(release, None));
+        assert!(!respawn_on_restart(dev, None));
+        assert!(respawn_on_restart(dev, Some("1")));
+        assert!(!respawn_on_restart(release, Some("0")));
+    }
 
     #[test]
     fn log_rotates_at_the_cap() {

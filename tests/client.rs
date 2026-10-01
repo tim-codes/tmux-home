@@ -127,28 +127,51 @@ fn rebuild_at_the_same_version_replaces_the_daemon() {
     s.tmux(&["kill-server"]);
 }
 
-/// `status` shows ○ for a daemon of an old build, and respawns the current
-/// build's daemon there and then, so the chip is ● again on its next run.
+/// Runs `tmux-home status` (a debug build) with `respawn` as
+/// TMUX_HOME_STATUS_RESPAWN (unset if `None`).
+fn status(s: &common::TestServer, respawn: Option<&str>) -> String {
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_tmux-home"));
+    c.args(["status", "--socket"]).arg(&s.socket);
+    match respawn {
+        Some(v) => c.env("TMUX_HOME_STATUS_RESPAWN", v),
+        None => c.env_remove("TMUX_HOME_STATUS_RESPAWN"),
+    };
+    let out = c.output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// `status` shows ○ for a daemon of an old build, and (allowed to) respawns
+/// the current build's daemon there and then, so the chip is ● again on
+/// its next run.
 #[test]
 fn status_respawns_a_daemon_after_a_restart() {
     let _env = common::TestEnv::new();
     let s = common::TestServer::start();
     let (rt, old) = old_build_daemon(&s);
-    let status = || {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_tmux-home"))
-            .args(["status", "--socket"])
-            .arg(&s.socket)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
-    };
-    assert_eq!(status(), "○");
+    assert_eq!(status(&s, Some("1")), "○");
     rt.block_on(async { tokio::time::timeout(Duration::from_secs(2), old).await })
         .expect("old daemon should exit after replying Restart")
         .unwrap()
         .unwrap();
-    common::wait_until("status ● again", || status() == "●");
+    common::wait_until("status ● again", || status(&s, Some("1")) == "●");
+    s.tmux(&["kill-server"]);
+}
+
+/// A dev build's `status` doesn't replace another build's daemon: no
+/// ping-pong with the plugin's binary on a live server.
+#[test]
+fn a_dev_build_status_does_not_respawn() {
+    let _env = common::TestEnv::new();
+    let s = common::TestServer::start();
+    let (rt, old) = old_build_daemon(&s);
+    assert_eq!(status(&s, None), "○");
+    rt.block_on(async { tokio::time::timeout(Duration::from_secs(2), old).await })
+        .expect("old daemon should exit after replying Restart")
+        .unwrap()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(status(&s, None), "○", "no daemon was started");
     s.tmux(&["kill-server"]);
 }
 
