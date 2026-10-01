@@ -74,6 +74,12 @@ impl Tx {
         Ok(())
     }
 
+    /// Make `pane` its window's active pane (by `%id`).
+    pub fn select_pane(&self, pane: &str) -> anyhow::Result<()> {
+        self.run(&["select-pane", "-t", pane])?;
+        Ok(())
+    }
+
     pub fn window_name(&self, wid: &str) -> anyhow::Result<String> {
         self.display(wid, "#{window_name}")
     }

@@ -170,7 +170,12 @@ State comes from the pane options the tmux-agent-sidebar hooks publish
 > tmux-agent-sidebar's `@pane_*` options, read in the same `list-panes` call
 > as everything else. The model (`src/agent/`) reads them through an
 > `AgentSource`; pass 5's own hooks write `@home_*` and add a second source
-> ahead of it, without UI changes. Pass-4 details: a status token
+> ahead of it, without UI changes. Pass-4 details: there is also an
+> `@background` token; staleness is a positive check per kind (Claude is
+> alive only as its version, `claude` or `node`; other kinds as any
+> non-shell); a notification on a *running* agent doesn't need you (the
+> sidebar flags TaskCompleted mid-run); the lead pane (card, preview, `⏎`
+> focus) is the one that needs you; a status token
 > (`@running`, …) matches a window with a live agent in that status, and
 > several are alternatives; `@agent` includes stale agents; `s:` is a
 > case-insensitive prefix; free text matches prompts word by word as

@@ -265,6 +265,8 @@ pub enum Action {
     Switch {
         sid: String,
         wid: String,
+        /// An agent window's lead pane, focused after the switch.
+        pane: Option<String>,
     },
     Rename {
         wid: String,
@@ -480,6 +482,29 @@ impl App {
             .collect();
     }
 
+    /// The key of the window the cursor should land on once `wid` is
+    /// closed: the next window row below the selection (pinned copies
+    /// skipped, as `wid`'s own rows go too); `None` at the end.
+    pub fn next_after_close(&self, wid: &str) -> Option<String> {
+        self.visible
+            .iter()
+            .skip(self.sel + 1)
+            .map(|&i| &self.rows[i])
+            .find(|r| !r.pinned && r.wid != wid)
+            .map(|r| r.key.clone())
+    }
+
+    /// Some visible row shows a live run time, so the clock must tick.
+    pub fn ticking(&self) -> bool {
+        self.visible.iter().any(|&i| {
+            self.rows[i].agents.as_ref().is_some_and(|a| {
+                a.panes
+                    .iter()
+                    .any(|p| p.live() && p.state.run_started.is_some())
+            })
+        })
+    }
+
     /// `^g`: the next window needing you, after the selection, cycling. A
     /// window pinned in NEEDS YOU is visited there, not again in its
     /// session.
@@ -625,6 +650,7 @@ impl App {
             KeyCode::Enter => {
                 return match sel {
                     Some(r) => Action::Switch {
+                        pane: r.agents.as_ref().map(|a| a.lead().pane.clone()),
                         sid: r.sid,
                         wid: r.wid,
                     },
@@ -874,7 +900,8 @@ mod tests {
             a.key(key(KeyCode::Enter)),
             Action::Switch {
                 sid: "$0".into(),
-                wid: "@1".into()
+                wid: "@1".into(),
+                pane: None,
             }
         );
         // Esc clears, then closes
@@ -1249,6 +1276,7 @@ mod tests {
         assert_eq!(q("staging deploy"), "!@1 @1");
         assert_eq!(q("codex"), "@3");
         assert_eq!(q("@bogus"), "", "unknown tokens are text");
+        assert_eq!(q("@background"), "");
     }
 
     #[test]
@@ -1301,6 +1329,102 @@ mod tests {
         a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
         assert_eq!(a.selected().unwrap().key, "@1");
         assert_eq!(a.selected().unwrap().wid, "@1");
+    }
+
+    /// ⏎ on an agent window also focuses its lead pane (the one that
+    /// needs you); on a plain window it leaves the panes alone.
+    #[test]
+    fn enter_on_an_agent_row_focuses_the_lead_pane() {
+        let mut s = agent_snap();
+        // win two gets a second, running agent pane, active and more urgent
+        // by status than nothing, but %1 is the one waiting
+        let mut p = s.panes[1].clone();
+        p.id = "%7".into();
+        p.index = 1;
+        p.agent_opts.insert("@pane_status".into(), "running".into());
+        s.panes[1].active = false;
+        s.panes.push(p);
+        let mut a = App::new();
+        a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
+        a.select_wid("@1");
+        assert_eq!(a.selected().unwrap().pane.as_deref(), Some("%7"));
+        assert_eq!(a.selected().unwrap().preview_pane().as_deref(), Some("%1"));
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Action::Switch {
+                sid: "$0".into(),
+                wid: "@1".into(),
+                pane: Some("%1".into()),
+            }
+        );
+        a.select_wid("@2");
+        assert!(matches!(
+            a.key(key(KeyCode::Enter)),
+            Action::Switch { pane: None, .. }
+        ));
+    }
+
+    #[test]
+    fn background_token() {
+        let mut s = agent_snap();
+        s.panes[3]
+            .agent_opts
+            .insert("@pane_status".into(), "background".into());
+        let mut a = App::new();
+        a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
+        typed(&mut a, "@background");
+        assert_eq!(keys_visible(&a), ["@3"]);
+        a.clear_filter();
+        typed(&mut a, "@running @background");
+        assert_eq!(keys_visible(&a), ["@3"]);
+    }
+
+    /// Closing a window that's also pinned removes two rows; the cursor
+    /// goes to the next window in the list, not one further.
+    #[test]
+    fn close_lands_on_the_next_window() {
+        let mut a = agent_app();
+        assert_eq!(keys_visible(&a), ["!@1", "@2", "@3", "@0", "@1"]);
+        // from the session row of the last window: no next, keep position
+        a.select_wid("@1");
+        assert_eq!(a.next_after_close("@1"), None);
+        // from beta/build: next is alpha/editor
+        a.select_wid("@3");
+        assert_eq!(a.next_after_close("@3").as_deref(), Some("@0"));
+        // from the pinned copy of win two: next is the first other window
+        a.key(ctrl('g'));
+        assert_eq!(a.selected().unwrap().key, "!@1");
+        assert_eq!(a.next_after_close("@1").as_deref(), Some("@2"));
+        // the order of a list [!@1, @0, @1, @2]: closing @1 from its row
+        // lands on @2
+        let mut s = agent_snap();
+        s.clients[0].session_id = "$0".into();
+        let mut a = App::new();
+        a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
+        assert_eq!(keys_visible(&a), ["!@1", "@0", "@1", "@2", "@3"]);
+        a.select_wid("@1");
+        assert_eq!(a.next_after_close("@1").as_deref(), Some("@2"));
+    }
+
+    /// The run-time clock only needs ticking while a visible row shows one.
+    #[test]
+    fn ticks_only_for_visible_runs() {
+        let mut a = agent_app();
+        assert!(!a.ticking(), "no run_started anywhere");
+        let mut s = agent_snap();
+        s.panes[3]
+            .agent_opts
+            .insert("@pane_started_at".into(), "100".into());
+        a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
+        assert!(a.ticking());
+        typed(&mut a, "editor");
+        assert!(!a.ticking(), "the running row is filtered out");
+        // a stale agent's left-over start time doesn't tick
+        s.panes[0]
+            .agent_opts
+            .insert("@pane_started_at".into(), "100".into());
+        a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
+        assert!(!a.ticking());
     }
 
     #[test]

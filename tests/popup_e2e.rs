@@ -230,7 +230,8 @@ fn cursor_opens_on_the_window_selected_just_before() {
 /// A live agent pane in `beta:<window>` (`fake_claude`) with these
 /// `@pane_*` options, faked the way tmux-agent-sidebar's hooks write them.
 fn fake_agent(s: &TestServer, window: &str, opts: &[(&str, &str)]) {
-    let target = format!("beta:{window}");
+    // its first pane: the agent, whichever pane is active
+    let target = format!("beta:{window}.0");
     if s.tmux(&["list-windows", "-t", "beta", "-F", "#W"])
         .lines()
         .all(|w| w != window)
@@ -276,6 +277,10 @@ fn needs_you_rows(screen: &str) -> Vec<String> {
 fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
     let (_env, s, o) = popup_fixture();
     fake_agent(&s, "agent", &[]);
+    // a second pane, active: ⏎ must still focus the agent's
+    let agent_pane = fmt(&s, "beta:agent.0", "#{pane_id}");
+    s.tmux(&["split-window", "-t", "beta:agent"]);
+    assert_ne!(fmt(&s, "beta:agent", "#{pane_id}"), agent_pane);
     o.open_popup();
     o.wait_for(r"^> .*5/5");
     assert!(!o.screen().contains("NEEDS YOU"), "{}", o.screen());
@@ -305,6 +310,51 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
     o.keys(&["Enter"]);
     o.wait_gone("F1 help");
     wait_until("client on beta:agent", || client_at(&s) == "beta:agent");
+    wait_until("the agent's pane focused", || {
+        fmt(&s, "beta:agent", "#{pane_id}") == agent_pane
+    });
+}
+
+/// ^x from a pinned copy asks with the agent wording, and once closed the
+/// cursor lands on the next window (both copies are gone).
+#[test]
+fn close_from_a_pinned_copy() {
+    let (_env, s, o) = popup_fixture();
+    fake_agent(&s, "agent", WAITING);
+    let target = wid(&s, "beta:agent");
+    o.open_popup();
+    o.wait_for("─ NEEDS YOU ─");
+    o.keys(&["C-g"]);
+    o.wait_cursor_on("agent");
+    o.keys(&["C-x"]);
+    o.wait_for(r#"^close "agent"\? agent still working — running: claude \(y/N\)"#);
+    o.keys(&["y"]);
+    wait_until("window closed", || !window_ids(&s).contains(&target));
+    o.wait_for(r"^> .*4/4");
+    o.wait_gone("NEEDS YOU");
+    o.wait_cursor_on("editor");
+}
+
+/// The agent is answered while its pinned copy is selected: the group
+/// goes and the cursor stays on that window, in its session.
+#[test]
+fn answered_while_its_pinned_copy_is_selected() {
+    let (_env, s, o) = popup_fixture();
+    fake_agent(&s, "agent", WAITING);
+    o.open_popup();
+    o.wait_for("─ NEEDS YOU ─");
+    o.keys(&["C-g"]);
+    o.wait_cursor_on("agent");
+    fake_agent(
+        &s,
+        "agent",
+        &[("@pane_status", "running"), ("@pane_attention", "clear")],
+    );
+    o.wait_gone("NEEDS YOU");
+    o.wait_cursor_on("agent");
+    let row = o.cursor_row().unwrap();
+    assert!(row.contains("● running"), "{row}");
+    assert!(row.starts_with("▌beta"), "in its session: {row}");
 }
 
 /// `@waiting` keeps only the waiting agent's window; an agent whose pane

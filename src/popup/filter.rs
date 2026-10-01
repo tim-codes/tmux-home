@@ -1,5 +1,5 @@
-//! The filter line: tokens (`@attn @agent @running @waiting @idle @error
-//! s:<session>`) plus free text.
+//! The filter line: tokens (`@attn @agent @running @waiting @background
+//! @idle @error s:<session>`) plus free text.
 //!
 //! - Status tokens are alternatives (`@running @waiting`: either); every
 //!   other token, and the text, must also hold.
@@ -35,6 +35,7 @@ impl Query {
                 "@running" => Some(Status::Running),
                 "@waiting" => Some(Status::Waiting),
                 "@idle" => Some(Status::Idle),
+                "@background" => Some(Status::Background),
                 "@error" => Some(Status::Error),
                 _ => None,
             };

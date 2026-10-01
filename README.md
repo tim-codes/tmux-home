@@ -86,7 +86,7 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | `↑` `↓` `^p` `^n` `^k` `^j` | move (wraps) |
 | `PgUp` `PgDn` | page |
 | `←` `→` `Home` `End` `^a` `^e` `^u` `^w` | edit the filter |
-| `⏎` | switch to the window and close |
+| `⏎` | switch to the window and close (an agent window: also focus the agent's pane) |
 | `^g` | jump to the next window that needs you (cycles through NEEDS YOU) |
 | `Esc` | clear the filter; close when it is already empty |
 | `^r` | rename inline (`⏎` saves; `Esc` or an empty name cancels) |
@@ -99,8 +99,8 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | `F1` `^/` | help |
 
 Filter tokens combine with text: `@attn` (needs you), `@agent` (any agent
-window, stale ones included), `@running`, `@waiting`, `@idle`, `@error`
-(either of the statuses given), `s:<session>` (session name prefix, any
+window, stale ones included), `@running`, `@waiting`, `@background`,
+`@idle`, `@error` (either of the statuses given), `s:<session>` (session name prefix, any
 case). For example `@waiting s:main api`.
 
 ### Agents
@@ -117,8 +117,9 @@ an agent window starts with an agent card: status, run time, wait reason,
 subagents, background command, worktree, permission mode and the prompt (or
 last reply), then the pane's last lines.
 
-An agent whose pane is back at its shell prompt (the agent crashed and left
-its options behind) is **stale**: dimmed with `(ended?)`, never pinned or
+An agent whose pane has moved on (the agent crashed and left its options
+behind: Claude counts as alive only while its pane runs its versioned binary,
+`claude` or `node`; other agents while it isn't a shell) is **stale**: dimmed with `(ended?)`, never pinned or
 counted. Without the sidebar, windows are listed as before, with no agent
 column.
 

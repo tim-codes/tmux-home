@@ -162,9 +162,12 @@ impl Runtime {
         match a {
             Action::None | Action::Redraw => {}
             Action::Quit => return false,
-            Action::Switch { sid, wid } => {
+            Action::Switch { sid, wid, pane } => {
                 ratatui::restore();
                 let _ = self.tx.switch_to(self.client.as_deref(), &sid, &wid);
+                if let Some(p) = pane {
+                    let _ = self.tx.select_pane(&p);
+                }
                 return false;
             }
             Action::Rename { wid, name } => {
@@ -187,8 +190,11 @@ impl Runtime {
                 Err(_) => self.refresh(app),
             },
             Action::Close(wid) => {
-                // the cursor stays at the same row position (the next window)
+                // the cursor moves to the next window; a pinned copy of the
+                // closed window goes too, so that isn't simply the same
+                // row position
                 let pos = app.sel;
+                let next = app.next_after_close(&wid);
                 match self
                     .tx
                     .close_window(&wid, self.client.as_deref(), &self.store)
@@ -205,6 +211,9 @@ impl Runtime {
                 app.sel_wid = None;
                 app.sel = pos;
                 self.refresh(app);
+                if let Some(k) = next {
+                    app.select_wid(&k);
+                }
             }
             Action::Reopen => match self.tx.reopen(&self.store) {
                 Ok(Some(wid)) => {
@@ -313,7 +322,7 @@ fn event_loop(
         }
         // agent rows show run time: redraw as the clock moves
         let now = crate::agent::now();
-        if now != drawn_at && app.rows.iter().any(|r| r.agents.is_some()) {
+        if now != drawn_at && app.ticking() {
             dirty = true;
         }
         if dirty {
@@ -527,7 +536,8 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, now: u64) {
         } else {
             dim
         };
-        let editing = !r.pinned
+        // the editor/confirm is on the selected row, pinned copy or not
+        let editing = selected
             && match &app.mode {
                 Mode::Rename { wid, .. } | Mode::Confirm { wid, .. } => wid == &r.wid,
                 _ => false,
@@ -797,6 +807,33 @@ mod tests {
         a.select_wid("@3");
         let s = screen(&mut a, 200, 50);
         assert!(!s.contains("·  claude"), "{s}");
+    }
+
+    /// ^r (or ^x's confirm) from a pinned copy marks that copy, the row
+    /// the cursor is on; from the session row, that row.
+    #[test]
+    fn the_editor_shows_on_the_selected_copy() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let underlined = |a: &mut App| -> Vec<u16> {
+            let mut t = Terminal::new(TestBackend::new(120, 20)).unwrap();
+            t.draw(|f| draw(f, a, true, "", NOW)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..20)
+                .filter(|&y| (0..120).any(|x| buf[(x, y)].modifier.contains(Modifier::UNDERLINED)))
+                .collect()
+        };
+        let mut a = agent_app();
+        a.key(ctrl('g'));
+        assert_eq!(a.selected().unwrap().key, "!@0");
+        a.key(ctrl('r'));
+        assert!(matches!(&a.mode, Mode::Rename { wid, .. } if wid == "@0"));
+        // header, prompt line, NEEDS YOU rule, then the pinned row (y=3)
+        assert_eq!(underlined(&mut a), [3]);
+        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        a.select_wid("@0");
+        a.key(ctrl('r'));
+        // ... the sessions rule (y=4), then the session row of fix (y=5)
+        assert_eq!(underlined(&mut a), [5]);
     }
 
     #[test]
