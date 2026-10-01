@@ -15,6 +15,9 @@
 //!   `max(10 s, 20 × last status duration)`.
 //! - **Per-repo coalescing:** at most one refresh per root in flight; a
 //!   trigger meanwhile sets `rerun`, which starts one more when it ends.
+//!   Each tracking of a root is a new generation: a root dropped (its
+//!   windows gone) has its refresh aborted, and anything a refresh of an
+//!   older generation still reports is ignored.
 //! - **Fast first:** a refresh publishes HEAD (file reads), then `git
 //!   status`, then the ref-derived fields (only when the refs memo saw a
 //!   change), each as it lands.
@@ -23,6 +26,9 @@
 //!   its last values, marked `stale`.
 //! - **Output:** the `git` section, published through `Shared::offer_git`
 //!   at most once per `PUBLISH_EVERY`.
+//! - **Failure:** a refresh that panics resets its root (stale, a fresh
+//!   memo); a panic of the task itself marks every badge stale and the task
+//!   restarts (`spawn` supervises it).
 
 use super::Shared;
 use crate::git::{
@@ -35,13 +41,14 @@ use crate::git::{
 use crate::tmux::snapshot::Snapshot;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
     sync::{Semaphore, mpsc},
-    task::{JoinHandle, JoinSet},
+    task::{AbortHandle, JoinHandle, JoinSet},
 };
 
 /// Git processes the daemon runs at once (spec §6 "Concurrency").
@@ -54,12 +61,19 @@ pub const INTERVAL_FACTOR: u32 = 20;
 /// A focus change doesn't re-run a refresh started this recently.
 pub const FOCUS_GAP: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(200);
+/// Pause before restarting a git task that panicked.
+const RESTART_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Per git call.
     pub timeout: Duration,
     pub permits: usize,
+    /// At most one git publish per this.
     pub publish_every: Duration,
+    /// How often the change stamps are checked.
+    pub stamp_every: Duration,
+    /// The adaptive interval's floor.
     pub min_interval: Duration,
 }
 
@@ -76,8 +90,15 @@ impl Default for Config {
             timeout,
             permits: PERMITS,
             publish_every: PUBLISH_EVERY,
+            stamp_every: STAMP_EVERY,
             min_interval: MIN_INTERVAL,
         }
+    }
+}
+
+impl Config {
+    fn tick(&self) -> Duration {
+        TICK.min(self.stamp_every).min(self.publish_every)
     }
 }
 
@@ -125,25 +146,34 @@ pub fn targets(s: &Snapshot) -> Targets {
     t
 }
 
-/// What a running refresh reports.
+/// What a running refresh reports; `generation` is the tracking it belongs to.
 enum Msg {
     /// A stage landed: the root's status as it now stands.
-    Stage(PathBuf, RepoStatus),
+    Stage {
+        root: PathBuf,
+        generation: u64,
+        status: RepoStatus,
+    },
     /// The refresh ended; `took` is its `git status` time (the timeout, if
     /// it timed out), `None` if it never got that far.
     Done {
         root: PathBuf,
+        generation: u64,
         memo: Box<RefsMemo>,
         took: Option<Duration>,
     },
 }
 
 struct Tracked {
+    /// Which tracking of this root this is.
+    generation: u64,
     paths: RepoPaths,
     status: RepoStatus,
     /// `None` while a refresh holds it.
     memo: Option<Box<RefsMemo>>,
     in_flight: bool,
+    /// The running refresh, aborted when the root is dropped.
+    worker: Option<AbortHandle>,
     rerun: bool,
     started: Option<Instant>,
     due: Instant,
@@ -162,6 +192,9 @@ struct Task {
     tx: mpsc::UnboundedSender<Msg>,
     /// Running refreshes; dropped (their git children killed) with the task.
     workers: JoinSet<()>,
+    /// Which root (and generation) each running refresh is for.
+    worker_of: HashMap<tokio::task::Id, (PathBuf, u64)>,
+    next_gen: u64,
     targets: Targets,
     cwds: HashMap<String, Resolved>,
     repos: HashMap<PathBuf, Tracked>,
@@ -170,31 +203,41 @@ struct Task {
     stamped: Instant,
 }
 
+/// Aborts a task when dropped: the supervisor's run of the git task ends
+/// with the supervisor.
+struct AbortOnDrop(AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Starts the git task under a supervisor: if it panics, every badge is
+/// marked stale and it starts again. Aborting the returned handle stops it.
 pub(super) fn spawn(shared: Arc<Shared>, cfg: Config) -> JoinHandle<()> {
-    tokio::spawn(run(shared, cfg))
+    tokio::spawn(async move {
+        loop {
+            let h = tokio::spawn(run(shared.clone(), cfg.clone()));
+            let guard = AbortOnDrop(h.abort_handle());
+            let r = h.await;
+            drop(guard);
+            match r {
+                Err(e) if e.is_panic() => {
+                    eprintln!("tmux-home: git task panicked; restarting: {e}");
+                    shared.mark_git_stale("git task restarted");
+                    tokio::time::sleep(RESTART_AFTER).await;
+                }
+                _ => return,
+            }
+        }
+    })
 }
 
 async fn run(shared: Arc<Shared>, cfg: Config) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
     let mut snaps = shared.latest.subscribe();
-    let git = Git {
-        timeout: cfg.timeout,
-        gate: Some(Arc::new(Semaphore::new(cfg.permits))),
-    };
-    let mut t = Task {
-        cfg,
-        shared,
-        git,
-        tx,
-        workers: JoinSet::new(),
-        targets: Targets::default(),
-        cwds: HashMap::new(),
-        repos: HashMap::new(),
-        dirty: false,
-        published: None,
-        stamped: Instant::now(),
-    };
-    let mut tick = tokio::time::interval(TICK);
+    let (mut t, mut rx) = Task::new(shared, cfg);
+    let mut tick = tokio::time::interval(t.cfg.tick());
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -215,6 +258,30 @@ async fn run(shared: Arc<Shared>, cfg: Config) {
 }
 
 impl Task {
+    fn new(shared: Arc<Shared>, cfg: Config) -> (Task, mpsc::UnboundedReceiver<Msg>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let git = Git {
+            timeout: cfg.timeout,
+            gate: Some(Arc::new(Semaphore::new(cfg.permits))),
+        };
+        let t = Task {
+            stamped: Instant::now(),
+            cfg,
+            shared,
+            git,
+            tx,
+            workers: JoinSet::new(),
+            worker_of: HashMap::new(),
+            next_gen: 0,
+            targets: Targets::default(),
+            cwds: HashMap::new(),
+            repos: HashMap::new(),
+            dirty: false,
+            published: None,
+        };
+        (t, rx)
+    }
+
     /// New targets from a snapshot: refresh what a cwd change or a focus
     /// change touches.
     async fn retarget(&mut self, new: Targets) {
@@ -297,32 +364,67 @@ impl Task {
                 used.insert(p.root.clone(), p.clone());
             }
         }
-        let before = self.repos.len();
-        self.repos.retain(|root, _| used.contains_key(root));
-        if self.repos.len() != before {
-            self.dirty = true;
+        let gone: Vec<PathBuf> = self
+            .repos
+            .keys()
+            .filter(|r| !used.contains_key(*r))
+            .cloned()
+            .collect();
+        for root in gone {
+            self.untrack(&root);
         }
         for (root, paths) in used {
             if let Some(tr) = self.repos.get_mut(&root) {
                 tr.paths = paths; // e.g. a worktree re-registered
                 continue;
             }
-            self.repos.insert(
-                root.clone(),
-                Tracked {
-                    paths,
-                    status: RepoStatus::default(),
-                    memo: Some(Box::default()),
-                    in_flight: false,
-                    rerun: false,
-                    started: None,
-                    due: now,
-                    stamp: None,
-                },
-            );
-            self.dirty = true;
+            self.track(root.clone(), paths);
             self.trigger(&root, false);
         }
+    }
+
+    /// Starts tracking `root` as a new generation; returns it.
+    fn track(&mut self, root: PathBuf, paths: RepoPaths) -> u64 {
+        self.next_gen += 1;
+        self.repos.insert(
+            root,
+            Tracked {
+                generation: self.next_gen,
+                paths,
+                status: RepoStatus::default(),
+                memo: Some(Box::default()),
+                in_flight: false,
+                worker: None,
+                rerun: false,
+                started: None,
+                due: Instant::now(),
+                stamp: None,
+            },
+        );
+        self.dirty = true;
+        self.next_gen
+    }
+
+    /// Stops tracking `root`; its running refresh is aborted (its git
+    /// killed) and anything it already sent is ignored.
+    fn untrack(&mut self, root: &Path) {
+        if let Some(tr) = self.repos.remove(root) {
+            if let Some(w) = tr.worker {
+                w.abort();
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Runs `fut` as the refresh of `root`'s current generation.
+    fn spawn_worker(&mut self, root: &Path, fut: impl Future<Output = ()> + Send + 'static) {
+        let Some(tr) = self.repos.get_mut(root) else {
+            return;
+        };
+        let h = self.workers.spawn(fut);
+        self.worker_of
+            .insert(h.id(), (root.to_path_buf(), tr.generation));
+        tr.worker = Some(h);
     }
 
     /// Starts a refresh of `root`, or asks the running one for another.
@@ -341,33 +443,53 @@ impl Task {
         tr.in_flight = true;
         tr.rerun = false;
         tr.started = Some(Instant::now());
-        self.workers.spawn(refresh(
+        let fut = refresh(
             self.git.clone(),
             tr.paths.clone(),
+            tr.generation,
             tr.status.clone(),
             memo,
             self.tx.clone(),
-        ));
+        );
+        self.spawn_worker(root, fut);
+    }
+
+    /// The tracked root `root` if it is still generation `generation`.
+    fn current(&mut self, root: &Path, generation: u64) -> Option<&mut Tracked> {
+        self.repos
+            .get_mut(root)
+            .filter(|t| t.generation == generation)
     }
 
     fn receive(&mut self, m: Msg) {
         match m {
-            Msg::Stage(root, st) => {
-                if let Some(tr) = self.repos.get_mut(&root)
-                    && tr.status != st
+            Msg::Stage {
+                root,
+                generation,
+                status,
+            } => {
+                if let Some(tr) = self.current(&root, generation)
+                    && tr.status != status
                 {
-                    tr.status = st;
+                    tr.status = status;
                     self.dirty = true;
                 }
             }
-            Msg::Done { root, memo, took } => {
-                let Some(tr) = self.repos.get_mut(&root) else {
+            Msg::Done {
+                root,
+                generation,
+                memo,
+                took,
+            } => {
+                let timeout = self.cfg.timeout;
+                let min = self.cfg.min_interval;
+                let Some(tr) = self.current(&root, generation) else {
                     return;
                 };
                 tr.memo = Some(memo);
                 tr.in_flight = false;
-                let took = took.unwrap_or(self.cfg.timeout);
-                tr.due = Instant::now() + next_interval(self.cfg.min_interval, took);
+                tr.worker = None;
+                tr.due = Instant::now() + next_interval(min, took.unwrap_or(timeout));
                 if tr.rerun {
                     self.trigger(&root, false);
                 }
@@ -375,10 +497,39 @@ impl Task {
         }
     }
 
+    /// Collects finished refreshes. One that panicked never sent `Done`:
+    /// its root is reset (stale, a fresh memo) so it can refresh again.
+    fn reap(&mut self) {
+        while let Some(r) = self.workers.try_join_next_with_id() {
+            let (id, err) = match r {
+                Ok((id, ())) => (id, None),
+                Err(e) => (e.id(), Some(e)),
+            };
+            let Some((root, generation)) = self.worker_of.remove(&id) else {
+                continue;
+            };
+            let Some(e) = err.filter(|e| e.is_panic()) else {
+                continue;
+            };
+            eprintln!("tmux-home: git refresh of {} panicked: {e}", root.display());
+            let min = self.cfg.min_interval;
+            if let Some(tr) = self.current(&root, generation) {
+                tr.in_flight = false;
+                tr.worker = None;
+                tr.rerun = false;
+                tr.memo = Some(Box::default());
+                tr.status.stale = true;
+                tr.status.error = Some("internal error: the refresh panicked".into());
+                tr.due = Instant::now() + min;
+                self.dirty = true;
+            }
+        }
+    }
+
     async fn tick(&mut self) {
-        while self.workers.try_join_next().is_some() {}
+        self.reap();
         let now = Instant::now();
-        if now.duration_since(self.stamped) >= STAMP_EVERY {
+        if now.duration_since(self.stamped) >= self.cfg.stamp_every {
             self.stamped = now;
             self.resolve().await;
             let paths: Vec<RepoPaths> = self.repos.values().map(|t| t.paths.clone()).collect();
@@ -449,13 +600,20 @@ impl Task {
 async fn refresh(
     git: Git,
     p: RepoPaths,
+    generation: u64,
     mut st: RepoStatus,
     mut memo: Box<RefsMemo>,
     tx: mpsc::UnboundedSender<Msg>,
 ) {
     let root = p.root.clone();
+    let stage = |status: RepoStatus| Msg::Stage {
+        root: root.clone(),
+        generation,
+        status,
+    };
     let done = |memo, took| Msg::Done {
         root: root.clone(),
+        generation,
         memo,
         took,
     };
@@ -471,7 +629,7 @@ async fn refresh(
     };
     if let Ok(h) = head {
         st = h;
-        let _ = tx.send(Msg::Stage(root.clone(), st.clone()));
+        let _ = tx.send(stage(st.clone()));
     }
     // 2. git status
     let t0 = Instant::now();
@@ -480,14 +638,19 @@ async fn refresh(
             git::apply_status(&mut st, &s);
             st.stale = false;
             st.error = None;
-            let _ = tx.send(Msg::Stage(root.clone(), st.clone()));
+            let _ = tx.send(stage(st.clone()));
         }
         Err(e) => {
             st.stale = true;
             st.error = (e != GitError::Timeout).then(|| e.to_string());
-            let _ = tx.send(Msg::Stage(root.clone(), st.clone()));
-            let took = (e == GitError::Timeout).then_some(git.timeout);
-            let _ = tx.send(done(memo, took));
+            let _ = tx.send(stage(st.clone()));
+            // back off from what it cost: the timeout, or the real time
+            let took = if e == GitError::Timeout {
+                git.timeout
+            } else {
+                t0.elapsed()
+            };
+            let _ = tx.send(done(memo, Some(took)));
             return;
         }
     }
@@ -496,12 +659,12 @@ async fn refresh(
     match memo.refresh(&git, &p).await {
         Ok(_) => {
             git::apply_refs(&mut st, &memo.fields, &p);
-            let _ = tx.send(Msg::Stage(root.clone(), st));
+            let _ = tx.send(stage(st));
         }
         Err(e) => {
             st.stale = true;
             st.error = (e != GitError::Timeout).then(|| e.to_string());
-            let _ = tx.send(Msg::Stage(root.clone(), st));
+            let _ = tx.send(stage(st));
         }
     }
     let _ = tx.send(done(memo, Some(took)));
@@ -537,6 +700,104 @@ mod tests {
             automatic_rename: false,
             active,
         }
+    }
+
+    fn paths(root: &str) -> RepoPaths {
+        RepoPaths {
+            root: root.into(),
+            git_dir: format!("{root}/.git").into(),
+            common_dir: format!("{root}/.git").into(),
+            linked: false,
+        }
+    }
+
+    fn task() -> (Task, mpsc::UnboundedReceiver<Msg>) {
+        Task::new(Arc::new(Shared::for_test()), Config::default())
+    }
+
+    fn named(branch: &str) -> RepoStatus {
+        RepoStatus {
+            branch: branch.into(),
+            ..RepoStatus::default()
+        }
+    }
+
+    /// A root dropped while its refresh ran, then tracked again: the old
+    /// refresh is aborted and whatever it still reports is ignored.
+    #[tokio::test]
+    async fn an_old_generation_never_touches_a_new_one() {
+        let (mut t, _rx) = task();
+        let root = PathBuf::from("/r");
+        let g1 = t.track(root.clone(), paths("/r"));
+        // generation 1's refresh is running (forever)
+        let memo1 = t.repos.get_mut(&root).unwrap().memo.take().unwrap();
+        t.repos.get_mut(&root).unwrap().in_flight = true;
+        t.spawn_worker(&root, std::future::pending());
+        t.untrack(&root);
+        let g2 = t.track(root.clone(), paths("/r"));
+        assert_ne!(g1, g2);
+        let tr = t.repos.get_mut(&root).unwrap();
+        tr.in_flight = true;
+        tr.memo = None;
+        tr.status = named("new");
+        // late messages from generation 1
+        t.receive(Msg::Stage {
+            root: root.clone(),
+            generation: g1,
+            status: named("old"),
+        });
+        t.receive(Msg::Done {
+            root: root.clone(),
+            generation: g1,
+            memo: memo1,
+            took: Some(Duration::ZERO),
+        });
+        let tr = &t.repos[&root];
+        assert_eq!(tr.status.branch, "new");
+        assert!(
+            tr.in_flight && tr.memo.is_none(),
+            "generation 2's refresh still owns it"
+        );
+        // generation 1's worker was aborted
+        let r = t.workers.join_next().await.unwrap();
+        assert!(r.unwrap_err().is_cancelled());
+        // generation 2's own messages land
+        t.receive(Msg::Stage {
+            root: root.clone(),
+            generation: g2,
+            status: named("newer"),
+        });
+        t.receive(Msg::Done {
+            root: root.clone(),
+            generation: g2,
+            memo: Box::default(),
+            took: Some(Duration::ZERO),
+        });
+        let tr = &t.repos[&root];
+        assert_eq!(tr.status.branch, "newer");
+        assert!(!tr.in_flight && tr.memo.is_some());
+    }
+
+    /// A refresh that panics resets its root instead of leaving it in
+    /// flight forever.
+    #[tokio::test]
+    async fn a_panicked_refresh_resets_its_root() {
+        let (mut t, _rx) = task();
+        let root = PathBuf::from("/r");
+        t.track(root.clone(), paths("/r"));
+        let tr = t.repos.get_mut(&root).unwrap();
+        tr.memo = None;
+        tr.in_flight = true;
+        tr.status = named("main");
+        t.spawn_worker(&root, async { panic!("boom") });
+        while !t.workers.is_empty() {
+            tokio::task::yield_now().await;
+            t.reap();
+        }
+        let tr = &t.repos[&root];
+        assert!(!tr.in_flight && tr.memo.is_some(), "can refresh again");
+        assert!(tr.status.stale && tr.status.error.is_some());
+        assert_eq!(tr.status.branch, "main", "keeps its values");
     }
 
     #[test]

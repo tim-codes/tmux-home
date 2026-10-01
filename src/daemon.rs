@@ -106,6 +106,20 @@ impl Shared {
         }
     }
 
+    /// Marks every repo in the published git section stale (the git task
+    /// died and is restarting): the badges keep their values, dimmed `~`.
+    fn mark_git_stale(&self, why: &str) {
+        let mut git = {
+            let m = self.model.lock().unwrap_or_else(|e| e.into_inner());
+            m.git.clone()
+        };
+        for st in git.repos.values_mut() {
+            st.stale = true;
+            st.error = Some(why.to_string());
+        }
+        self.offer_git(git);
+    }
+
     /// Publishes a new git section over the latest tmux read, if it
     /// changed; tmux reads offered later carry it too.
     fn offer_git(&self, git: GitSection) {
@@ -166,6 +180,16 @@ pub async fn run_with_version(
     kind: SourceKind,
     version: impl Into<String>,
 ) -> anyhow::Result<()> {
+    run_with(tmux_socket, kind, version, git::Config::default()).await
+}
+
+/// `run_with_version` with the git task's timings given (tests shrink them).
+pub async fn run_with(
+    tmux_socket: PathBuf,
+    kind: SourceKind,
+    version: impl Into<String>,
+    git_cfg: git::Config,
+) -> anyhow::Result<()> {
     let version = version.into();
     let paths = Paths::for_socket(&tmux_socket)?;
     let len = paths.sock.as_os_str().len();
@@ -206,7 +230,7 @@ pub async fn run_with_version(
     let mut events = source::start(kind, Tmux::new(tmux_socket));
     // git badges: a task of its own, fed by the published snapshots, so no
     // git work ever sits on the tmux poll's path
-    let git_task = git::spawn(shared.clone(), git::Config::default());
+    let git_task = git::spawn(shared.clone(), git_cfg);
     // tmux kills `run-shell -b` jobs on kill-server: on these signals, exit
     // through the normal cleanup below (remove the socket, release the lock).
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -305,6 +329,21 @@ async fn send(
 }
 
 #[cfg(test)]
+impl Shared {
+    /// A `Shared` for unit tests (its tmux socket is never used).
+    pub(crate) fn for_test() -> Shared {
+        Shared {
+            epoch: 1,
+            version: "test".into(),
+            tmux: Tmux::new(PathBuf::from("/nonexistent")),
+            model: Mutex::new(Inner::default()),
+            latest: watch::channel(None).0,
+            restart: Notify::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -366,6 +405,29 @@ mod tests {
         // a tmux read carrying the same git section is unchanged
         let s = Sections { tmux: 1, git: 7 };
         assert_eq!(m.offer(s, Instant::now()), Offer::Unchanged(2));
+    }
+
+    /// A restarting git task leaves the badges, marked stale.
+    #[test]
+    fn mark_git_stale_keeps_values() {
+        use crate::git::badge::RepoStatus;
+        let sh = Shared::for_test();
+        sh.offer(Snapshot::default(), Instant::now());
+        let mut g = GitSection::default();
+        g.repos.insert(
+            "/r".into(),
+            RepoStatus {
+                branch: "main".into(),
+                ..RepoStatus::default()
+            },
+        );
+        sh.offer_git(g);
+        sh.mark_git_stale("git task restarted");
+        let (_, snap) = sh.latest.borrow().clone().unwrap();
+        let st = &snap.git.repos["/r"];
+        assert_eq!(st.branch, "main");
+        assert!(st.stale);
+        assert_eq!(st.badge_text(), "main ~");
     }
 
     /// Change detection sees only the tmux section's content.

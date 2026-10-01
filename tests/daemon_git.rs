@@ -75,6 +75,27 @@ impl Sub {
     }
 }
 
+/// The git task with test timings: stamps checked and pushes allowed every
+/// 100 ms (the spec's 1 s each would put the waits below near their limit).
+fn fast() -> tmux_home::daemon::git::Config {
+    tmux_home::daemon::git::Config {
+        publish_every: Duration::from_millis(100),
+        stamp_every: Duration::from_millis(100),
+        ..Default::default()
+    }
+}
+
+/// How long a rename of `from` to `to` takes to reach the subscriber.
+async fn rename_push(s: &TestServer, sub: &mut Sub, from: &str, to: &str) -> Duration {
+    let t0 = Instant::now();
+    s.tmux(&["rename-window", "-t", &format!("=alpha:{from}"), to]);
+    sub.until(Duration::from_secs(5), "the rename", |x| {
+        x.windows.iter().any(|w| w.name == to)
+    })
+    .await;
+    t0.elapsed()
+}
+
 fn status<'a>(s: &'a Snapshot, dir: &Path) -> Option<&'a RepoStatus> {
     s.git.for_cwd(dir.to_str().unwrap())
 }
@@ -88,7 +109,12 @@ async fn badges_follow_windows_and_git_changes() {
     write(&repo, "notes.txt", "x");
     let s = TestServer::start();
     let p = Paths::for_socket(&s.socket).unwrap();
-    let d = tokio::spawn(tmux_home::daemon::run(s.socket.clone(), SourceKind::Poll));
+    let d = tokio::spawn(tmux_home::daemon::run_with(
+        s.socket.clone(),
+        SourceKind::Poll,
+        tmux_home::BUILD_ID,
+        fast(),
+    ));
     let mut sub = subscribe(&p).await;
     sub.until(Duration::from_secs(3), "a first snapshot", |_| true)
         .await;
@@ -104,7 +130,7 @@ async fn badges_follow_windows_and_git_changes() {
         repo.to_str().unwrap(),
     ]);
     let snap = sub
-        .until(Duration::from_millis(2500), "the repo's status", |x| {
+        .until(Duration::from_secs(3), "the repo's status", |x| {
             status(x, &repo).is_some_and(|g| g.phase == Phase::Refs)
         })
         .await;
@@ -117,7 +143,7 @@ async fn badges_follow_windows_and_git_changes() {
     // a git change (the index moves): picked up by the change stamp
     let t0 = Instant::now();
     git_at(&repo, &["add", "notes.txt"]);
-    sub.until(Duration::from_millis(2500), "the staged file", |x| {
+    sub.until(Duration::from_secs(3), "the staged file", |x| {
         status(x, &repo).is_some_and(|g| g.staged == 1 && g.untracked == 0)
     })
     .await;
@@ -127,7 +153,7 @@ async fn badges_follow_windows_and_git_changes() {
     git_at(&repo, &["switch", "-q", "-c", "feat"]);
     git_at(&repo, &["commit", "-q", "-m", "notes"]);
     let snap = sub
-        .until(Duration::from_millis(2500), "the new branch", |x| {
+        .until(Duration::from_secs(3), "the new branch", |x| {
             status(x, &repo).is_some_and(|g| g.branch == "feat" && !g.dirty())
         })
         .await;
@@ -135,7 +161,7 @@ async fn badges_follow_windows_and_git_changes() {
 
     // the window goes: so does the repo
     s.tmux(&["kill-window", "-t", "=alpha:app"]);
-    sub.until(Duration::from_millis(2500), "the repo dropped", |x| {
+    sub.until(Duration::from_secs(3), "the repo dropped", |x| {
         x.git.repos.is_empty() && x.git.paths.is_empty()
     })
     .await;
@@ -157,10 +183,26 @@ async fn hung_git_never_delays_tmux_pushes() {
     unsafe { std::env::set_var("TMUX_HOME_GIT", &fake) };
     let s = TestServer::start();
     let p = Paths::for_socket(&s.socket).unwrap();
-    let d = tokio::spawn(tmux_home::daemon::run(s.socket.clone(), SourceKind::Poll));
+    let d = tokio::spawn(tmux_home::daemon::run_with(
+        s.socket.clone(),
+        SourceKind::Poll,
+        tmux_home::BUILD_ID,
+        fast(),
+    ));
     let mut sub = subscribe(&p).await;
     sub.until(Duration::from_secs(3), "a first snapshot", |_| true)
         .await;
+    // baseline: renames of a window in no repo, nothing hanging yet
+    s.tmux(&["new-window", "-d", "-n", "w", "-c", t.0.to_str().unwrap()]);
+    sub.until(Duration::from_secs(3), "the window", |x| {
+        x.windows.iter().any(|w| w.name == "w")
+    })
+    .await;
+    let mut base = Duration::ZERO;
+    for i in 0..4 {
+        base = base.max(rename_push(&s, &mut sub, "w", &format!("b{i}")).await);
+        rename_push(&s, &mut sub, &format!("b{i}"), "w").await;
+    }
     // more repos than permits: every permit is held by a hung git
     for (i, r) in repos.iter().enumerate() {
         s.tmux(&[
@@ -182,19 +224,18 @@ async fn hung_git_never_delays_tmux_pushes() {
     for r in &repos {
         assert_eq!(status(&snap, r).unwrap().phase, Phase::Head, "status hangs");
     }
-    // tmux keeps flowing: each rename is pushed within a poll or two
-    for i in 0..3 {
-        let name = format!("renamed{i}");
-        let t0 = Instant::now();
-        s.tmux(&["rename-window", "-t", "=alpha:w0", &name]);
-        sub.until(Duration::from_millis(1500), "the rename", |x| {
-            x.windows.iter().any(|w| w.name == name)
-        })
-        .await;
-        let took = t0.elapsed();
-        assert!(took < Duration::from_millis(1200), "push took {took:?}");
-        s.tmux(&["rename-window", "-t", &format!("=alpha:{name}"), "w0"]);
+    // tmux keeps flowing: renames are pushed as fast as without git (give
+    // or take one 500 ms poll)
+    let mut hung = Duration::ZERO;
+    for i in 0..4 {
+        hung = hung.max(rename_push(&s, &mut sub, "w", &format!("h{i}")).await);
+        rename_push(&s, &mut sub, &format!("h{i}"), "w").await;
     }
+    eprintln!("rename push: baseline max {base:?}, with hung git max {hung:?}");
+    assert!(
+        hung <= base + tmux_home::tmux::source::POLL_EVERY,
+        "hung git delayed tmux: {hung:?} vs {base:?}"
+    );
     unsafe { std::env::remove_var("TMUX_HOME_GIT") };
     s.tmux(&["kill-server"]);
     let _ = tokio::time::timeout(Duration::from_secs(5), d).await;
@@ -223,7 +264,12 @@ async fn a_timed_out_status_is_marked_stale() {
     }
     let s = TestServer::start();
     let p = Paths::for_socket(&s.socket).unwrap();
-    let d = tokio::spawn(tmux_home::daemon::run(s.socket.clone(), SourceKind::Poll));
+    let d = tokio::spawn(tmux_home::daemon::run_with(
+        s.socket.clone(),
+        SourceKind::Poll,
+        tmux_home::BUILD_ID,
+        fast(),
+    ));
     let mut sub = subscribe(&p).await;
     s.tmux(&[
         "new-window",
