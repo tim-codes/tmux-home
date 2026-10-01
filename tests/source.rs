@@ -12,34 +12,56 @@ async fn next_snap(
     tokio::time::timeout(within, rx.recv()).await.ok().flatten()
 }
 
+/// The first snapshot matching `pred` within `within` (the source sends
+/// every read, so unchanged ones can come first).
+async fn wait_snap(
+    rx: &mut tokio::sync::mpsc::Receiver<SourceEvent>,
+    within: Duration,
+    what: &str,
+    pred: impl Fn(&tmux_home::tmux::snapshot::Snapshot) -> bool,
+) -> tmux_home::tmux::snapshot::Snapshot {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SourceEvent::Snapshot(snap, _))) if pred(&snap) => return snap,
+            Ok(Some(SourceEvent::Snapshot(..))) => continue,
+            Ok(Some(SourceEvent::Gone)) | Ok(None) => panic!("source Gone"),
+            Err(_) => panic!("{what} not seen within {within:?}"),
+        }
+    }
+}
+
 async fn check_source(kind: SourceKind, max_latency: Duration) {
     let s = common::TestServer::start();
     // Settle: a freshly started pane's pane_current_command changes briefly
     // after start (macOS /bin/sh re-execs), which would otherwise change the
-    // snapshot hash and produce a spurious event right after the initial one.
+    // snapshot right after the initial one.
     s.wait_settled();
     let mut rx = start(kind, Tmux::new(s.socket.clone()));
-    let Some(SourceEvent::Snapshot(first)) = next_snap(&mut rx, Duration::from_secs(2)).await
+    let Some(SourceEvent::Snapshot(first, _)) = next_snap(&mut rx, Duration::from_secs(2)).await
     else {
         panic!("no initial")
     };
     assert_eq!(first.windows.len(), 1);
-    // no change -> no event
-    assert!(
-        next_snap(&mut rx, Duration::from_millis(700))
-            .await
-            .is_none()
-    );
+    // no change -> nothing new: the source sends every read (the daemon
+    // detects changes), and each one matches the first
+    let quiet = tokio::time::Instant::now() + Duration::from_millis(700);
+    while let Ok(ev) = tokio::time::timeout_at(quiet, rx.recv()).await {
+        let Some(SourceEvent::Snapshot(snap, _)) = ev else {
+            panic!("source ended")
+        };
+        assert_eq!(snap.sections(), first.sections(), "spurious change");
+    }
     s.tmux(&["new-window", "-d", "-t", "alpha", "-n", "fresh"]);
-    let Some(SourceEvent::Snapshot(snap)) = next_snap(&mut rx, max_latency).await else {
-        panic!("no change seen")
-    };
-    assert!(snap.windows.iter().any(|w| w.name == "fresh"));
+    wait_snap(&mut rx, max_latency, "the new window", |s| {
+        s.windows.iter().any(|w| w.name == "fresh")
+    })
+    .await;
     s.tmux(&["kill-server"]);
     loop {
         match next_snap(&mut rx, Duration::from_secs(3)).await {
             Some(SourceEvent::Gone) => break,
-            Some(SourceEvent::Snapshot(_)) => continue,
+            Some(SourceEvent::Snapshot(..)) => continue,
             None => panic!("source did not report Gone"),
         }
     }
@@ -98,17 +120,18 @@ async fn control_sees_other_sessions_and_renames() {
     // a window added to a session the control client is NOT attached to
     s.tmux(&["new-window", "-d", "-t", "beta", "-n", "elsewhere"]);
     s.wait_settled();
-    let Some(SourceEvent::Snapshot(snap)) = next_snap(&mut rx, Duration::from_millis(300)).await
-    else {
-        panic!("missed other-session window")
-    };
-    assert!(snap.windows.iter().any(|w| w.name == "elsewhere"));
+    wait_snap(
+        &mut rx,
+        Duration::from_millis(300),
+        "other-session window",
+        |s| s.windows.iter().any(|w| w.name == "elsewhere"),
+    )
+    .await;
     s.tmux(&["rename-window", "-t", "beta:elsewhere", "renamed"]);
-    let Some(SourceEvent::Snapshot(snap)) = next_snap(&mut rx, Duration::from_millis(300)).await
-    else {
-        panic!("missed rename")
-    };
-    assert!(snap.windows.iter().any(|w| w.name == "renamed"));
+    wait_snap(&mut rx, Duration::from_millis(300), "rename", |s| {
+        s.windows.iter().any(|w| w.name == "renamed")
+    })
+    .await;
 }
 
 /// Drains events for `within`, failing on `Gone`, and returns the last snapshot seen.
@@ -120,7 +143,7 @@ async fn last_snap_no_gone(
     let mut last = None;
     while let Ok(ev) = tokio::time::timeout_at(deadline, rx.recv()).await {
         match ev {
-            Some(SourceEvent::Snapshot(s)) => last = Some(s),
+            Some(SourceEvent::Snapshot(s, _)) => last = Some(s),
             Some(SourceEvent::Gone) | None => {
                 panic!("source reported Gone while the server is alive")
             }
@@ -150,7 +173,7 @@ async fn assert_sees_new_window_within(
     let deadline = tokio::time::Instant::now() + within;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(SourceEvent::Snapshot(snap))) => {
+            Ok(Some(SourceEvent::Snapshot(snap, _))) => {
                 if snap.windows.iter().any(|w| w.name == name) {
                     return;
                 }
@@ -200,7 +223,7 @@ async fn control_survives_being_detached() {
 async fn check_empty_server(kind: SourceKind, max_latency: Duration) {
     let s = common::TestServer::start_empty();
     let mut rx = start(kind, Tmux::new(s.socket.clone()));
-    let Some(SourceEvent::Snapshot(first)) = next_snap(&mut rx, Duration::from_secs(2)).await
+    let Some(SourceEvent::Snapshot(first, _)) = next_snap(&mut rx, Duration::from_secs(2)).await
     else {
         panic!("no initial snapshot from a server without sessions")
     };
@@ -209,12 +232,12 @@ async fn check_empty_server(kind: SourceKind, max_latency: Duration) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(SourceEvent::Snapshot(snap)))
+            Ok(Some(SourceEvent::Snapshot(snap, _)))
                 if snap.sessions.iter().any(|x| x.name == "late") =>
             {
                 break;
             }
-            Ok(Some(SourceEvent::Snapshot(_))) => continue,
+            Ok(Some(SourceEvent::Snapshot(..))) => continue,
             Ok(Some(SourceEvent::Gone)) | Ok(None) => panic!("source Gone on a live server"),
             Err(_) => panic!("new session not pushed"),
         }
@@ -231,7 +254,7 @@ async fn check_empty_server(kind: SourceKind, max_latency: Duration) {
     loop {
         match next_snap(&mut rx, Duration::from_secs(3)).await {
             Some(SourceEvent::Gone) => break,
-            Some(SourceEvent::Snapshot(_)) => continue,
+            Some(SourceEvent::Snapshot(..)) => continue,
             None => panic!("source did not report Gone"),
         }
     }

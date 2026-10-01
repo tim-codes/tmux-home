@@ -7,6 +7,11 @@ use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::{Duration, Instant};
+
+/// How long the selection keeps wanting a window that isn't in the list
+/// (`App::want`) before it settles on the row under the cursor.
+pub const WANT_FOR: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
@@ -241,6 +246,9 @@ pub struct App {
     pub sel: usize,
     /// Window ID of the selection, kept across updates.
     pub sel_wid: Option<String>,
+    /// Until when a `sel_wid` missing from the rows is still wanted (a
+    /// window the popup itself just made); see `want`.
+    want_until: Option<Instant>,
     pub mode: Mode,
     pub notice: Option<String>,
     pub preview_flip: bool,
@@ -264,6 +272,7 @@ impl App {
             filter: LineEdit::default(),
             sel: 0,
             sel_wid: None,
+            want_until: None,
             mode: Mode::List,
             notice: None,
             preview_flip: false,
@@ -281,6 +290,11 @@ impl App {
     /// its position if the window went); an open editor is left alone
     /// unless its window vanished.
     pub fn set_rows(&mut self, rows: Vec<Row>) {
+        self.set_rows_at(rows, Instant::now());
+    }
+
+    /// `set_rows` at time `now`.
+    pub fn set_rows_at(&mut self, rows: Vec<Row>, now: Instant) {
         self.location = rows
             .iter()
             .find(|r| r.current)
@@ -293,12 +307,16 @@ impl App {
                 self.sel = p;
                 self.clamp();
             }
-            // keep wanting that window: a snapshot read before a write (a
-            // window just made or reopened) can land after it, and the
-            // next one brings the window back. A closed window's ID is
-            // never reused, so it is never found again.
-            None if self.sel_wid.is_some() => self.clamp_pos(),
-            None => self.clamp(),
+            // a window the popup just made or reopened (`want`) can be
+            // missing from a snapshot read before the write: keep wanting
+            // it for a while
+            None if self.want_until.is_some_and(|t| now < t) => self.clamp_pos(),
+            // otherwise the window has gone (its ID is never reused): the
+            // selection becomes the row now under the cursor
+            None => {
+                self.want_until = None;
+                self.clamp();
+            }
         }
         let gone = |w: &String| !self.rows.iter().any(|r| &r.wid == w);
         let vanished = match &self.mode {
@@ -323,6 +341,19 @@ impl App {
         if let Some(p) = self.pos_of(wid) {
             self.set_sel(p);
         }
+    }
+
+    /// Select `wid`, a window the popup itself just created, even if the
+    /// rows don't show it yet; it is wanted for `WANT_FOR`.
+    pub fn want(&mut self, wid: &str) {
+        self.want_at(wid, Instant::now());
+    }
+
+    /// `want` at time `now`.
+    pub fn want_at(&mut self, wid: &str, now: Instant) {
+        self.select_wid(wid);
+        self.sel_wid = Some(wid.to_string());
+        self.want_until = Some(now + WANT_FOR);
     }
 
     fn pos_of(&self, wid: &str) -> Option<usize> {
@@ -924,12 +955,7 @@ mod tests {
         );
     }
 
-    /// A snapshot read before a write (here: one without the window the
-    /// popup just made and selected) lands after it; the selection comes
-    /// back to that window with the next snapshot.
-    #[test]
-    fn selection_survives_a_stale_snapshot() {
-        let mut a = app();
+    fn with_made() -> Snapshot {
         let mut made = snap();
         made.windows.push(Window {
             id: "@7".into(),
@@ -939,12 +965,78 @@ mod tests {
             automatic_rename: false,
             active: false,
         });
-        a.set_rows(build_rows(&made, Some("/dev/ttys1"), "/home/u"));
-        a.select_wid("@7");
-        a.set_rows(build_rows(&snap(), Some("/dev/ttys1"), "/home/u"));
+        made
+    }
+
+    /// A snapshot read before a write (here: one without the window the
+    /// popup just made and selected) lands after it; the selection comes
+    /// back to that window with the next snapshot.
+    #[test]
+    fn selection_survives_a_stale_snapshot() {
+        let t0 = Instant::now();
+        let mut a = app();
+        a.set_rows_at(build_rows(&with_made(), Some("/dev/ttys1"), "/home/u"), t0);
+        a.want_at("@7", t0);
+        a.set_rows_at(build_rows(&snap(), Some("/dev/ttys1"), "/home/u"), t0);
         assert_eq!(a.sel_wid.as_deref(), Some("@7"));
-        a.set_rows(build_rows(&made, Some("/dev/ttys1"), "/home/u"));
+        a.set_rows_at(build_rows(&with_made(), Some("/dev/ttys1"), "/home/u"), t0);
         assert_eq!(a.selected().unwrap().wid, "@7");
+    }
+
+    /// The wanting is bounded: once `WANT_FOR` has passed, a window still
+    /// missing is given up and the row under the cursor is selected.
+    #[test]
+    fn a_wanted_window_is_given_up_after_a_while() {
+        let t0 = Instant::now();
+        let mut a = app();
+        a.set_rows_at(build_rows(&with_made(), Some("/dev/ttys1"), "/home/u"), t0);
+        a.want_at("@7", t0);
+        let pos = a.sel;
+        let later = t0 + WANT_FOR;
+        a.set_rows_at(build_rows(&snap(), Some("/dev/ttys1"), "/home/u"), later);
+        let under = a.selected().unwrap().wid.clone();
+        assert_ne!(under, "@7");
+        assert_eq!(a.sel_wid.as_deref(), Some(under.as_str()));
+        assert_eq!(a.sel, pos.min(a.visible.len() - 1));
+        // and it is not taken back when the window shows up again
+        a.set_rows_at(
+            build_rows(&with_made(), Some("/dev/ttys1"), "/home/u"),
+            later,
+        );
+        assert_eq!(a.selected().unwrap().wid, under);
+    }
+
+    /// A selected window closed elsewhere isn't wanted: the selection moves
+    /// to the row now under the cursor and follows that row, instead of
+    /// staying pinned to a row position by a dead ID.
+    #[test]
+    fn a_vanished_window_hands_the_selection_to_the_row_under_the_cursor() {
+        let mut a = app();
+        a.select_wid("@0"); // alpha/editor, first row of alpha
+        let mut s = snap();
+        s.windows.retain(|w| w.id != "@0");
+        a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
+        let under = a.selected().unwrap().wid.clone();
+        assert_eq!(a.sel_wid.as_deref(), Some(under.as_str()));
+        // a window appears above it: the selection follows its row
+        s.windows.push(Window {
+            id: "@8".into(),
+            session_id: "$1".into(),
+            index: 0,
+            name: "new first".into(),
+            automatic_rename: false,
+            active: false,
+        });
+        s.windows
+            .iter_mut()
+            .filter(|w| w.session_id == "$1")
+            .for_each(|w| {
+                if w.id != "@8" {
+                    w.index += 1
+                }
+            });
+        a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
+        assert_eq!(a.selected().unwrap().wid, under);
     }
 
     #[test]

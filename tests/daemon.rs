@@ -25,7 +25,7 @@ async fn ask(p: &Paths, req: Request) -> Option<Reply> {
 }
 
 fn v() -> String {
-    tmux_home::VERSION.to_string()
+    tmux_home::BUILD_ID.to_string()
 }
 
 #[tokio::test]
@@ -125,6 +125,71 @@ async fn subscribe_starts_from_a_fresh_read() {
     let (fresh, _r, _w) = subscribe().await;
     assert_eq!(active(&fresh).as_deref(), Some("tick"));
 
+    s.tmux(&["kill-server"]);
+    let _ = tokio::time::timeout(Duration::from_secs(5), d).await;
+}
+
+/// `refresh` re-reads tmux at once (no waiting for the poll), replies with
+/// a new seq, and pushes the same snapshot to subscribers: nothing older
+/// reaches them after it.
+#[tokio::test]
+async fn refresh_reads_now_and_pushes_in_order() {
+    let _env = common::TestEnv::new();
+    let s = common::TestServer::start();
+    s.wait_settled();
+    let p = Paths::for_socket(&s.socket).unwrap();
+    let d = tokio::spawn(tmux_home::daemon::run(s.socket.clone(), SourceKind::Poll));
+    let (r, mut w) = connect(&p).await.into_split();
+    let mut r = BufReader::new(r);
+    write_msg(
+        &mut w,
+        &Request::Subscribe {
+            v: v(),
+            client: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let Some(Reply::Snapshot {
+        seq: first, epoch, ..
+    }) = read_msg(&mut r).await.unwrap()
+    else {
+        panic!()
+    };
+    s.tmux(&["rename-window", "-t", "alpha:0", "right-now"]);
+    let Some(Reply::Snapshot {
+        seq,
+        epoch: e2,
+        data,
+    }) = ask(&p, Request::Refresh { v: v() }).await
+    else {
+        panic!()
+    };
+    assert_eq!(e2, epoch, "same daemon");
+    assert!(seq > first);
+    assert!(data.windows.iter().any(|w| w.name == "right-now"));
+    // the subscriber's pushes, in order, end with that seq
+    loop {
+        let Some(Reply::Snapshot { seq: got, data, .. }) =
+            tokio::time::timeout(Duration::from_secs(2), read_msg(&mut r))
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert!(got <= seq, "pushed {got} past the refresh's {seq}");
+        if got == seq {
+            assert!(data.windows.iter().any(|w| w.name == "right-now"));
+            break;
+        }
+    }
+    // nothing changed since: a second refresh keeps the seq
+    let Some(Reply::Snapshot { seq: again, .. }) = ask(&p, Request::Refresh { v: v() }).await
+    else {
+        panic!()
+    };
+    assert_eq!(again, seq);
     s.tmux(&["kill-server"]);
     let _ = tokio::time::timeout(Duration::from_secs(5), d).await;
 }

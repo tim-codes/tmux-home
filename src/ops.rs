@@ -2,7 +2,10 @@
 //! bash version's safety rules), reopen, reorder, new window, preview.
 //! Every write targets IDs, never indexes or names.
 
-use crate::store::{ClosedWindow, Store};
+use crate::{
+    store::{ClosedWindow, Store},
+    tmux::Tmux,
+};
 use std::{path::PathBuf, process::Command};
 
 const US: char = '\x1f';
@@ -16,29 +19,18 @@ pub fn literal(s: &str) -> String {
 
 #[derive(Clone, Debug)]
 pub struct Tx {
-    pub socket: PathBuf,
+    pub tmux: Tmux,
 }
 
 impl Tx {
     pub fn new(socket: PathBuf) -> Tx {
-        Tx { socket }
+        Tx {
+            tmux: Tmux::new(socket),
+        }
     }
 
     pub fn run(&self, args: &[&str]) -> anyhow::Result<String> {
-        let out = Command::new("tmux")
-            .arg("-S")
-            .arg(&self.socket)
-            .args(args)
-            .env_remove("TMUX")
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "tmux {:?}: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        self.tmux.run(args)
     }
 
     fn line(&self, args: &[&str]) -> anyhow::Result<String> {
@@ -238,12 +230,15 @@ impl Tx {
                 self.run(&["switch-client", "-c", c, "-t", &other])?;
             }
         }
-        let snap = self.snapshot_window(wid).ok();
+        let snap = self.snapshot_window(wid);
         self.run(&["kill-window", "-t", wid])?;
-        if let Some(s) = snap {
-            store.push(s)?;
-        }
-        Ok(CloseOutcome::Closed)
+        // the window is gone now: a failure to save it for reopen is
+        // reported as such, never as a failed close
+        let saved = snap.and_then(|s| store.push(s));
+        Ok(match saved {
+            Ok(()) => CloseOutcome::Closed,
+            Err(e) => CloseOutcome::NotSaved(format!("{e:#}")),
+        })
     }
 
     pub fn snapshot_window(&self, wid: &str) -> anyhow::Result<ClosedWindow> {
@@ -456,6 +451,8 @@ pub enum ClosePlan {
 #[derive(Debug, PartialEq)]
 pub enum CloseOutcome {
     Closed,
+    /// Closed, but not pushed on the reopen stack (why).
+    NotSaved(String),
     Refused,
 }
 

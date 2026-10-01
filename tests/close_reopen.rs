@@ -306,6 +306,13 @@ fn reopen_with_missing_cwd_falls_back_to_home() {
         fmt(&s, &new, "#{window_index} #{window_name} #{window_panes}"),
         "7 gone-dir 2"
     );
+    let home = std::env::var("HOME").unwrap();
+    let paths = s.tmux(&["list-panes", "-t", &new, "-F", "#{pane_current_path}"]);
+    assert_eq!(
+        paths.lines().collect::<Vec<_>>(),
+        [home.as_str(), home.as_str()],
+        "each missing cwd falls back to $HOME"
+    );
 }
 
 /// The sidebar pane is not part of the shape: one pane comes back, with

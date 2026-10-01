@@ -1,13 +1,13 @@
 mod common;
 use tmux_home::tmux::{Tmux, snapshot::read_snapshot};
 
-#[tokio::test]
-async fn reads_sessions_windows_panes() {
+#[test]
+fn reads_sessions_windows_panes() {
     let s = common::TestServer::start();
     s.tmux(&["new-window", "-d", "-t", "alpha", "-n", "two"]);
     s.tmux(&["split-window", "-d", "-t", "alpha:two"]);
     s.tmux(&["new-session", "-d", "-s", "beta", "/bin/sh"]);
-    let (snap, _) = read_snapshot(&Tmux::new(s.socket.clone())).await.unwrap();
+    let snap = read_snapshot(&Tmux::new(s.socket.clone())).unwrap();
     let names: Vec<_> = snap.sessions.iter().map(|x| x.name.as_str()).collect();
     assert_eq!(names, ["alpha", "beta"]);
     assert_eq!(snap.windows.len(), 3);
@@ -20,8 +20,8 @@ async fn reads_sessions_windows_panes() {
     assert!(snap.panes.iter().all(|p| p.id.starts_with('%')));
 }
 
-#[tokio::test]
-async fn odd_names_round_trip() {
+#[test]
+fn odd_names_round_trip() {
     let s = common::TestServer::start();
     // tmux 3.7c's rename-window rejects embedded control characters (e.g. a
     // literal tab) outright with "invalid window name", so this exercises
@@ -29,13 +29,13 @@ async fn odd_names_round_trip() {
     // a colon (format-field-looking), a space, and non-ASCII text.
     let name = "a:b ç ✳ x";
     s.tmux(&["rename-window", "-t", "alpha:0", name]);
-    let (snap, _) = read_snapshot(&Tmux::new(s.socket.clone())).await.unwrap();
+    let snap = read_snapshot(&Tmux::new(s.socket.clone())).unwrap();
     assert_eq!(snap.windows[0].name, name);
     assert!(!snap.windows[0].automatic_rename);
 }
 
-#[tokio::test]
-async fn hash_changes_only_on_change() {
+#[test]
+fn hash_changes_only_on_change() {
     let s = common::TestServer::start();
     let t = Tmux::new(s.socket.clone());
     // Give the freshly spawned pane's shell a moment to settle: tmux briefly
@@ -43,24 +43,24 @@ async fn hash_changes_only_on_change() {
     // "bash") right after spawn, which is a real, tmux-reported state change
     // and not a bug in read_snapshot — just not what this test is about.
     s.wait_settled();
-    let (_, h1) = read_snapshot(&t).await.unwrap();
-    let (_, h2) = read_snapshot(&t).await.unwrap();
+    let h1 = read_snapshot(&t).unwrap().sections();
+    let h2 = read_snapshot(&t).unwrap().sections();
     assert_eq!(h1, h2);
     s.tmux(&["new-window", "-d", "-t", "alpha"]);
-    let (_, h3) = read_snapshot(&t).await.unwrap();
+    let h3 = read_snapshot(&t).unwrap().sections();
     assert_ne!(h1, h3);
 }
 
-#[tokio::test]
-async fn dead_server_is_an_error() {
+#[test]
+fn dead_server_is_an_error() {
     let s = common::TestServer::start();
     let t = Tmux::new(s.socket.clone());
     s.tmux(&["kill-server"]);
-    assert!(read_snapshot(&t).await.is_err());
+    assert!(read_snapshot(&t).is_err());
 }
 
-#[tokio::test]
-async fn newline_in_pane_path_round_trips() {
+#[test]
+fn newline_in_pane_path_round_trips() {
     let env = common::TestEnv::new();
     let s = common::TestServer::start();
     let dir = env.state.join("nl\ndir");
@@ -70,7 +70,7 @@ async fn newline_in_pane_path_round_trips() {
     let dir = dir.canonicalize().unwrap();
     s.tmux(&["new-window", "-d", "-n", "nl", "-c", dir.to_str().unwrap()]);
     s.wait_settled();
-    let (snap, _) = read_snapshot(&Tmux::new(s.socket.clone())).await.unwrap();
+    let snap = read_snapshot(&Tmux::new(s.socket.clone())).unwrap();
     let nl = snap.windows.iter().find(|w| w.name == "nl").unwrap();
     let pane = snap.panes.iter().find(|p| p.window_id == nl.id).unwrap();
     assert_eq!(pane.current_path, dir.to_str().unwrap());
@@ -86,9 +86,9 @@ fn unparseable_record_is_skipped() {
     assert!(snap.clients.is_empty());
 }
 
-#[tokio::test]
-async fn server_without_sessions_is_an_empty_snapshot() {
+#[test]
+fn server_without_sessions_is_an_empty_snapshot() {
     let s = common::TestServer::start_empty();
-    let (snap, _) = read_snapshot(&Tmux::new(s.socket.clone())).await.unwrap();
+    let snap = read_snapshot(&Tmux::new(s.socket.clone())).unwrap();
     assert_eq!(snap, tmux_home::tmux::snapshot::Snapshot::default());
 }

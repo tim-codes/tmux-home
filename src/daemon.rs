@@ -1,18 +1,18 @@
 use crate::{
-    VERSION,
+    BUILD_ID,
     ipc::{Reply, Request, read_msg, write_msg},
     paths::Paths,
     tmux::{
         Tmux,
-        snapshot::{Snapshot, read_snapshot},
+        snapshot::{Sections, Snapshot, read_snapshot_async},
         source::{self, SourceEvent, SourceKind},
     },
 };
 use std::{
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::PathBuf,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::BufReader,
@@ -21,7 +21,85 @@ use tokio::{
     sync::{Notify, watch},
 };
 
-type Latest = watch::Receiver<Option<(u64, Snapshot)>>;
+/// The daemon's published snapshot and its `seq`.
+type Published = Option<(u64, Snapshot)>;
+
+/// What the daemon does with one read of tmux (`Model::offer`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Offer {
+    /// The read started before one already offered: it is older than what
+    /// is published, so it is dropped (reads overlap: the source's poll and
+    /// a client's `refresh` run concurrently).
+    Stale,
+    /// Nothing tracked changed; the published snapshot (this seq) stands.
+    Unchanged(u64),
+    /// Publish it under this new seq.
+    Changed(u64),
+}
+
+/// Change detection and ordering for the reads the daemon publishes. Pure:
+/// it sees only each read's section hashes and start time.
+#[derive(Debug, Default)]
+pub struct Model {
+    seq: u64,
+    sections: Option<Sections>,
+    read_at: Option<Instant>,
+}
+
+impl Model {
+    pub fn offer(&mut self, sections: Sections, read_at: Instant) -> Offer {
+        if self.read_at.is_some_and(|t| read_at < t) {
+            return Offer::Stale;
+        }
+        self.read_at = Some(read_at);
+        if self.sections == Some(sections) {
+            return Offer::Unchanged(self.seq);
+        }
+        self.sections = Some(sections);
+        self.seq += 1;
+        Offer::Changed(self.seq)
+    }
+}
+
+/// State shared by the daemon's main loop and its connections.
+struct Shared {
+    epoch: u64,
+    version: String,
+    tmux: Tmux,
+    model: Mutex<Model>,
+    latest: watch::Sender<Published>,
+    restart: Notify,
+}
+
+impl Shared {
+    /// Offers a read that started at `at`; publishes it if it changed
+    /// something. The model and the watch are updated under one lock, so
+    /// subscribers see seqs in order.
+    fn offer(&self, snap: Snapshot, at: Instant) {
+        let mut m = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        if let Offer::Changed(seq) = m.offer(snap.sections(), at) {
+            self.latest.send_replace(Some((seq, snap)));
+        }
+    }
+
+    /// Reads tmux now and offers that read: afterwards the published
+    /// snapshot is at least as new as it.
+    async fn refresh(&self) -> anyhow::Result<()> {
+        let at = Instant::now();
+        let snap = read_snapshot_async(&self.tmux).await?;
+        self.offer(snap, at);
+        Ok(())
+    }
+}
+
+/// A name for this daemon instance, distinct from any earlier one's.
+fn new_epoch() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or_default();
+    nanos ^ (u64::from(std::process::id()) << 40)
+}
 
 /// Backoff after a transient `accept()` error, to avoid a hot loop under a
 /// persistent failure (e.g. the process is out of file descriptors).
@@ -39,16 +117,17 @@ const SUN_PATH_MAX: usize = 104;
 const SUN_PATH_MAX: usize = 108;
 
 pub async fn run(tmux_socket: PathBuf, kind: SourceKind) -> anyhow::Result<()> {
-    run_with_version(tmux_socket, kind, VERSION).await
+    run_with_version(tmux_socket, kind, BUILD_ID).await
 }
 
-/// `run`, answering as build `version` (tests: a daemon at a different
-/// version than its clients, to exercise the `Restart` handshake).
+/// `run`, answering as build `version` (tests: a daemon of a different
+/// build than its clients, to exercise the `Restart` handshake).
 pub async fn run_with_version(
     tmux_socket: PathBuf,
     kind: SourceKind,
-    version: &'static str,
+    version: impl Into<String>,
 ) -> anyhow::Result<()> {
+    let version = version.into();
     let paths = Paths::for_socket(&tmux_socket)?;
     let len = paths.sock.as_os_str().len();
     anyhow::ensure!(
@@ -77,11 +156,15 @@ pub async fn run_with_version(
     let _ = std::fs::remove_file(&paths.sock);
     let listener = UnixListener::bind(&paths.sock)?;
 
-    let (tx, latest) = watch::channel(None);
-    let reader = Tmux::new(tmux_socket.clone());
+    let shared = Arc::new(Shared {
+        epoch: new_epoch(),
+        version,
+        tmux: Tmux::new(tmux_socket.clone()),
+        model: Mutex::new(Model::default()),
+        latest: watch::channel(None).0,
+        restart: Notify::new(),
+    });
     let mut events = source::start(kind, Tmux::new(tmux_socket));
-    let restart = Arc::new(Notify::new());
-    let mut seq = 0u64;
     // tmux kills `run-shell -b` jobs on kill-server: on these signals, exit
     // through the normal cleanup below (remove the socket, release the lock).
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -91,17 +174,17 @@ pub async fn run_with_version(
     let result = loop {
         tokio::select! {
             ev = events.recv() => match ev {
-                Some(SourceEvent::Snapshot(s)) => { seq += 1; let _ = tx.send(Some((seq, s))); }
+                Some(SourceEvent::Snapshot(s, at)) => shared.offer(s, at),
                 Some(SourceEvent::Gone) | None => break Ok(()),
             },
             conn = listener.accept() => match conn {
-                Ok((stream, _)) => { tokio::spawn(serve(stream, latest.clone(), reader.clone(), restart.clone(), version)); }
+                Ok((stream, _)) => { tokio::spawn(serve(stream, shared.clone())); }
                 Err(e) => {
                     eprintln!("tmux-home: accept error: {e:#}");
                     tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
             },
-            _ = restart.notified() => break Ok(()),
+            _ = shared.restart.notified() => break Ok(()),
             _ = sigterm.recv() => break Ok(()),
             _ = sighup.recv() => break Ok(()),
             _ = sigint.recv() => break Ok(()),
@@ -112,13 +195,7 @@ pub async fn run_with_version(
     result
 }
 
-async fn serve(
-    stream: UnixStream,
-    mut latest: Latest,
-    reader: Tmux,
-    restart: Arc<Notify>,
-    version: &'static str,
-) {
+async fn serve(stream: UnixStream, shared: Arc<Shared>) {
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
     let Ok(Ok(Some(req))) =
@@ -126,42 +203,127 @@ async fn serve(
     else {
         return;
     };
-    if req.version() != version {
+    if req.version() != shared.version {
         let _ = write_msg(&mut w, &Reply::Restart).await;
-        restart.notify_one();
+        shared.restart.notify_one();
         return;
+    }
+    let mut latest = shared.latest.subscribe();
+    // A subscriber places its cursor from its first snapshot, and a
+    // `refresh` follows the client's own write: both get a read made now,
+    // not the source's last (up to a poll old).
+    if matches!(req, Request::Subscribe { .. } | Request::Refresh { .. }) {
+        let read = shared.refresh().await;
+        if let Some(err) = refresh_failed(&req, read) {
+            let _ = write_msg(&mut w, &err).await;
+            return;
+        }
     }
     // wait for the first snapshot if the source hasn't produced one yet
     if latest.wait_for(|s| s.is_some()).await.is_err() {
         return;
     }
-    let mut cur = latest.borrow_and_update().clone();
-    // a subscriber (the popup) places its cursor on the current window from
-    // its first snapshot: read it fresh, the source's may be up to a poll old
-    if let (Request::Subscribe { .. }, Some((seq, _))) = (&req, &cur)
-        && let Ok((fresh, _)) = read_snapshot(&reader).await
-    {
-        cur = Some((*seq, fresh));
-    }
-    if send(&mut w, cur).await.is_err() {
+    let cur = latest.borrow_and_update().clone();
+    if send(&mut w, shared.epoch, cur).await.is_err() {
         return;
     }
     if let Request::Subscribe { .. } = req {
         while latest.changed().await.is_ok() {
             let cur = latest.borrow_and_update().clone();
-            if send(&mut w, cur).await.is_err() {
+            if send(&mut w, shared.epoch, cur).await.is_err() {
                 return;
             }
         }
     }
 }
 
+/// What a failed fresh read means for `req`: a `refresh` must not be
+/// answered with the published snapshot (it may predate the client's
+/// write, and its seq would become the client's floor), so it gets an
+/// error and the client reads tmux itself. A subscription falls back to the
+/// published snapshot; newer ones follow.
+fn refresh_failed(req: &Request, read: anyhow::Result<()>) -> Option<Reply> {
+    let e = read.err()?;
+    eprintln!("tmux-home: refresh failed: {e:#}");
+    matches!(req, Request::Refresh { .. }).then(|| Reply::Error {
+        msg: format!("refresh failed: {e:#}"),
+    })
+}
+
 async fn send(
     w: &mut tokio::net::unix::OwnedWriteHalf,
-    cur: Option<(u64, Snapshot)>,
+    epoch: u64,
+    cur: Published,
 ) -> anyhow::Result<()> {
     let Some((seq, data)) = cur else {
         anyhow::bail!("no snapshot")
     };
-    write_msg(w, &Reply::Snapshot { seq, data }).await
+    write_msg(w, &Reply::Snapshot { epoch, seq, data }).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sections(tmux: u64) -> Sections {
+        Sections { tmux }
+    }
+
+    #[test]
+    fn a_failed_refresh_is_an_error_but_a_subscription_goes_on() {
+        let refresh = Request::Refresh { v: "x".into() };
+        let sub = Request::Subscribe {
+            v: "x".into(),
+            client: "t".into(),
+        };
+        assert!(refresh_failed(&refresh, Ok(())).is_none());
+        assert!(matches!(
+            refresh_failed(&refresh, Err(anyhow::anyhow!("tmux gone"))),
+            Some(Reply::Error { msg }) if msg.contains("tmux gone")
+        ));
+        assert!(refresh_failed(&sub, Err(anyhow::anyhow!("tmux gone"))).is_none());
+    }
+
+    #[test]
+    fn first_read_publishes_then_only_changes_do() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut m = Model::default();
+        assert_eq!(m.offer(sections(1), at(0)), Offer::Changed(1));
+        assert_eq!(m.offer(sections(1), at(10)), Offer::Unchanged(1));
+        assert_eq!(m.offer(sections(2), at(20)), Offer::Changed(2));
+        // back to an earlier state is still a change
+        assert_eq!(m.offer(sections(1), at(30)), Offer::Changed(3));
+    }
+
+    /// A read that started before an already-offered one finished after
+    /// it: publishing it would put older data over newer.
+    #[test]
+    fn a_read_overtaken_by_a_newer_one_is_dropped() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut m = Model::default();
+        assert_eq!(m.offer(sections(1), at(0)), Offer::Changed(1));
+        // the refresh (started at 20) lands before the poll (started at 10)
+        assert_eq!(m.offer(sections(2), at(20)), Offer::Changed(2));
+        assert_eq!(m.offer(sections(1), at(10)), Offer::Stale);
+        assert_eq!(m.offer(sections(2), at(20)), Offer::Unchanged(2));
+    }
+
+    /// Change detection sees only the tmux section's content.
+    #[test]
+    fn sections_hash_tmux_content() {
+        use crate::tmux::snapshot::Session;
+        let mut a = Snapshot::default();
+        assert_eq!(a.sections(), Snapshot::default().sections());
+        a.sessions.push(Session {
+            id: "$0".into(),
+            name: "x".into(),
+            attached: 0,
+        });
+        let b = a.clone();
+        assert_eq!(a.sections(), b.sections());
+        a.sessions[0].attached = 1;
+        assert_ne!(a.sections(), b.sections());
+    }
 }

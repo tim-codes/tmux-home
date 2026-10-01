@@ -106,3 +106,161 @@ fn missing_binary_shows_a_message() {
     drop(s);
     drop(env);
 }
+
+/// The tmux binary by absolute path, so a test can run the plugin with a
+/// PATH that has no cargo on it.
+fn tmux_path() -> String {
+    let out = Command::new("sh")
+        .args(["-c", "command -v tmux"])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// A copy of tmux-home.tmux in a fresh directory, so it has no
+/// `target/release/tmux-home` next to it.
+fn plugin_copy() -> tempfile::TempDir {
+    let d = tempfile::Builder::new()
+        .prefix("th-plugin-")
+        .tempdir()
+        .unwrap();
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tmux-home.tmux"),
+        d.path().join("tmux-home.tmux"),
+    )
+    .unwrap();
+    d
+}
+
+/// Runs the plugin copy in `dir` against `s` with `path` as PATH and no
+/// TMUX_HOME_BIN (so a missing binary is built).
+fn run_copy(s: &TestServer, dir: &std::path::Path, path: &str) {
+    let out = Command::new(dir.join("tmux-home.tmux"))
+        .env(
+            "TMUX_HOME_TMUX",
+            format!("{} -S {}", tmux_path(), s.socket.display()),
+        )
+        .env("PATH", path)
+        .env_remove("TMUX_HOME_BIN")
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "tmux-home.tmux: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A missing binary starts one background build; reloading the config while
+/// it runs starts no second one. Its output goes to target/build.log, which
+/// the key's message names; once it is done, a reload may build again.
+#[test]
+fn missing_binary_builds_once_across_reloads() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    let plugin = plugin_copy();
+    let stub = tempfile::tempdir().unwrap();
+    let count = stub.path().join("count");
+    let cargo = stub.path().join("cargo");
+    std::fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\necho run >>'{}'\necho stub build \"$@\"\nsleep 1\n",
+            count.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", stub.path().display());
+    let runs = || {
+        std::fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    run_copy(&s, plugin.path(), &path);
+    wait_until("the build started", || runs() == 1);
+    run_copy(&s, plugin.path(), &path);
+    run_copy(&s, plugin.path(), &path);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(runs(), 1, "reloads during a build start no other");
+    let b = binding(&s, ".").expect("prefix . bound");
+    let log = plugin.path().join("target/build.log");
+    assert!(b.contains(&log.display().to_string()), "{b}");
+    let lock = plugin.path().join("target/.building");
+    wait_until("the build finished", || !lock.exists());
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("stub build build --release"), "{text:?}");
+    run_copy(&s, plugin.path(), &path);
+    wait_until("a later reload builds again", || runs() == 2);
+    wait_until("that build finished", || !lock.exists());
+}
+
+/// A lock left by a dead build whose pid now belongs to another live
+/// process (here: this test) doesn't block builds: its start time differs.
+#[test]
+fn a_lock_with_a_reused_pid_is_taken_over() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    let plugin = plugin_copy();
+    let lock = plugin.path().join("target/.building");
+    std::fs::create_dir_all(&lock).unwrap();
+    std::fs::write(lock.join("pid"), std::process::id().to_string()).unwrap();
+    std::fs::write(lock.join("start"), "Thu Jan  1 00:00:00 1970").unwrap();
+    let stub = tempfile::tempdir().unwrap();
+    let count = stub.path().join("count");
+    let cargo = stub.path().join("cargo");
+    std::fs::write(
+        &cargo,
+        format!("#!/bin/sh\necho run >>'{}'\n", count.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    run_copy(
+        &s,
+        plugin.path(),
+        &format!("{}:/usr/bin:/bin", stub.path().display()),
+    );
+    wait_until("the build started", || count.exists());
+    wait_until("the build finished", || !lock.exists());
+}
+
+/// No cargo: no build is started and the key says how to build it.
+#[test]
+fn missing_cargo_says_so_and_builds_nothing() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    let plugin = plugin_copy();
+    run_copy(&s, plugin.path(), "/usr/bin:/bin");
+    // (the message is shell-quoted in the binding)
+    let b = binding(&s, ".").expect("prefix . bound").replace('\\', "");
+    assert!(b.contains("cargo is not on PATH"), "{b}");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!plugin.path().join("target").exists(), "no build started");
+}
+
+/// A `#` in the binary's path survives run-shell's format expansion: the
+/// daemon starts and the key opens the popup.
+#[test]
+fn hash_in_the_binary_path() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    let d = tempfile::Builder::new()
+        .prefix("th#plugin#")
+        .tempdir()
+        .unwrap();
+    let bin = d.path().join("tmux#home");
+    std::os::unix::fs::symlink(BIN, &bin).unwrap();
+    run_plugin(&s, bin.to_str().unwrap());
+    let sock = tmux_home::paths::Paths::for_socket(&s.socket).unwrap().sock;
+    wait_until("daemon socket", || {
+        std::os::unix::net::UnixStream::connect(&sock).is_ok()
+    });
+    let o = Outer::attach(&s, "alpha", 120, 30);
+    o.open_popup();
+    o.keys(&["Escape"]);
+    o.wait_gone("F1 help");
+}

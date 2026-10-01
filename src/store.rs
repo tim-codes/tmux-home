@@ -36,11 +36,28 @@ pub struct Store {
     dir: PathBuf,
     /// The bash version's stack (`<state root>/closed`), imported once.
     legacy: Option<PathBuf>,
+    /// Something the user should hear about (an unreadable stack was reset);
+    /// the caller shows it (`take_notice`): the popup can't print while it
+    /// owns the screen.
+    notice: std::sync::Mutex<Option<String>>,
 }
 
 impl Store {
     pub fn new(dir: PathBuf, legacy: Option<PathBuf>) -> Store {
-        Store { dir, legacy }
+        Store {
+            dir,
+            legacy,
+            notice: Default::default(),
+        }
+    }
+
+    /// The pending notice, if any (cleared).
+    pub fn take_notice(&self) -> Option<String> {
+        self.notice.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn set_notice(&self, n: String) {
+        *self.notice.lock().unwrap_or_else(|e| e.into_inner()) = Some(n);
     }
 
     /// The store for a tmux server's state dir, importing the bash stack from
@@ -83,9 +100,16 @@ impl Store {
             Ok(b) => match serde_json::from_slice::<ClosedFile>(&b) {
                 Ok(f) => Ok(f.closed),
                 // hand-edited, truncated or from an incompatible version:
-                // keep it for inspection and start an empty stack
+                // keep it for inspection and start an empty stack (even if
+                // it can't be moved aside: the next write replaces it)
                 Err(_) => {
-                    std::fs::rename(self.file(), self.dir.join("closed.json.corrupt"))?;
+                    let name = corrupt_name(std::time::SystemTime::now());
+                    self.set_notice(match std::fs::rename(self.file(), self.dir.join(&name)) {
+                        Ok(()) => format!("closed.json was unreadable: kept as {name}, reopen stack reset"),
+                        Err(e) => format!(
+                            "closed.json is unreadable and could not be moved aside ({e}): reopen stack reset"
+                        ),
+                    });
                     Ok(vec![])
                 }
             },
@@ -154,6 +178,19 @@ impl Store {
     pub fn is_empty(&self) -> anyhow::Result<bool> {
         Ok(self.len()? == 0)
     }
+}
+
+/// `closed.json.corrupt.<unix seconds>.<nanos>`: each unreadable file is
+/// kept, none overwrites an earlier one.
+fn corrupt_name(now: std::time::SystemTime) -> String {
+    let d = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "closed.json.corrupt.{}.{:09}",
+        d.as_secs(),
+        d.subsec_nanos()
+    )
 }
 
 /// `session index prev next auto active layout name path...`, US-separated.
