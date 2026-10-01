@@ -33,6 +33,8 @@ use std::{
 struct Feed {
     snap: Snapshot,
     live: bool,
+    /// When a direct read started (degraded mode only).
+    read_at: Option<Instant>,
 }
 
 const DEGRADED_EVERY: Duration = Duration::from_secs(1);
@@ -78,6 +80,7 @@ async fn feed_loop(socket: PathBuf, tx: mpsc::Sender<Feed>) {
                                 .send(Feed {
                                     snap: data,
                                     live: true,
+                                    read_at: None,
                                 })
                                 .is_err()
                             {
@@ -104,9 +107,17 @@ async fn feed_loop(socket: PathBuf, tx: mpsc::Sender<Feed>) {
             last_spawn = Some(Instant::now());
             let _ = crate::client::spawn_daemon(&socket);
         }
+        let read_at = Some(Instant::now());
         match read_snapshot(&tmux).await {
             Ok((snap, _)) => {
-                if tx.send(Feed { snap, live: false }).is_err() {
+                if tx
+                    .send(Feed {
+                        snap,
+                        live: false,
+                        read_at,
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -134,6 +145,9 @@ struct Runtime {
     live: bool,
     preview: (Option<String>, String),
     preview_at: Instant,
+    /// When the last direct read after our own write started: a degraded
+    /// feed read that started earlier predates the write and is dropped.
+    read_at: Option<Instant>,
 }
 
 impl Runtime {
@@ -143,7 +157,9 @@ impl Runtime {
 
     /// Re-read tmux right after a write so the list reflects it at once.
     fn refresh(&mut self, app: &mut App) {
+        let at = Instant::now();
         if let Ok((s, _)) = self.rt.block_on(read_snapshot(&self.tmux)) {
+            self.read_at = Some(at);
             let rows = self.rows(&s);
             app.set_rows(rows);
         }
@@ -261,6 +277,7 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
         live: false,
         preview: (None, String::new()),
         preview_at: Instant::now(),
+        read_at: None,
     };
     let mut app = App::new();
     // first picture: read tmux directly, so the cursor lands on the window
@@ -288,8 +305,11 @@ fn event_loop(
         while let Ok(f) = feed.try_recv() {
             latest = Some(f);
         }
-        if let Some(f) = latest {
+        if let Some(f) = &latest {
+            dirty |= rt.live != f.live;
             rt.live = f.live;
+        }
+        if let Some(f) = latest.filter(|f| f.read_at.is_none_or(|t| Some(t) >= rt.read_at)) {
             let rows = rt.rows(&f.snap);
             app.set_rows(rows);
             dirty = true;

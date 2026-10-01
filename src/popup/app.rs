@@ -288,10 +288,18 @@ impl App {
             .unwrap_or_default();
         self.rows = rows;
         self.refilter();
-        if let Some(p) = self.sel_wid.clone().and_then(|w| self.pos_of(&w)) {
-            self.sel = p;
+        match self.sel_wid.clone().and_then(|w| self.pos_of(&w)) {
+            Some(p) => {
+                self.sel = p;
+                self.clamp();
+            }
+            // keep wanting that window: a snapshot read before a write (a
+            // window just made or reopened) can land after it, and the
+            // next one brings the window back. A closed window's ID is
+            // never reused, so it is never found again.
+            None if self.sel_wid.is_some() => self.clamp_pos(),
+            None => self.clamp(),
         }
-        self.clamp();
         let gone = |w: &String| !self.rows.iter().any(|r| &r.wid == w);
         let vanished = match &self.mode {
             Mode::Rename { wid, .. } | Mode::Confirm { wid, .. } => gone(wid),
@@ -327,12 +335,16 @@ impl App {
     }
 
     fn clamp(&mut self) {
+        self.clamp_pos();
+        self.sel_wid = self.selected().map(|r| r.wid.clone());
+    }
+
+    fn clamp_pos(&mut self) {
         if self.visible.is_empty() {
             self.sel = 0;
         } else if self.sel >= self.visible.len() {
             self.sel = self.visible.len() - 1;
         }
-        self.sel_wid = self.selected().map(|r| r.wid.clone());
     }
 
     fn refilter(&mut self) {
@@ -752,6 +764,29 @@ mod tests {
         a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
         assert_eq!(a.mode, Mode::List);
         assert!(a.notice.is_some());
+    }
+
+    /// A snapshot read before a write (here: one without the window the
+    /// popup just made and selected) lands after it; the selection comes
+    /// back to that window with the next snapshot.
+    #[test]
+    fn selection_survives_a_stale_snapshot() {
+        let mut a = app();
+        let mut made = snap();
+        made.windows.push(Window {
+            id: "@7".into(),
+            session_id: "$0".into(),
+            index: 2,
+            name: "made".into(),
+            automatic_rename: false,
+            active: false,
+        });
+        a.set_rows(build_rows(&made, Some("/dev/ttys1"), "/home/u"));
+        a.select_wid("@7");
+        a.set_rows(build_rows(&snap(), Some("/dev/ttys1"), "/home/u"));
+        assert_eq!(a.sel_wid.as_deref(), Some("@7"));
+        a.set_rows(build_rows(&made, Some("/dev/ttys1"), "/home/u"));
+        assert_eq!(a.selected().unwrap().wid, "@7");
     }
 
     #[test]
