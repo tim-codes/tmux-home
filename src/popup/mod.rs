@@ -7,6 +7,7 @@ pub mod filter;
 pub mod fresh;
 pub mod git;
 pub mod preview;
+pub mod term;
 
 use crate::{
     client::{self, Answer},
@@ -19,10 +20,7 @@ use app::{Action, App, Mode, Row};
 use fresh::{Guard, Stamp};
 use ratatui::{
     Frame,
-    crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
-        execute,
-    },
+    crossterm::event::{self, Event, KeyEventKind},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -192,7 +190,6 @@ impl Runtime {
             Action::None | Action::Redraw => {}
             Action::Quit => return false,
             Action::Switch { sid, wid, pane } => {
-                let _ = execute!(std::io::stdout(), DisableMouseCapture);
                 ratatui::restore();
                 let _ = self.tx.switch_to(self.client.as_deref(), &sid, &wid);
                 if let Some(p) = pane {
@@ -318,11 +315,14 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     app.select_current();
 
     let mut term = ratatui::init();
+    // after ratatui's: a panic turns the mouse off, then ratatui restores
+    term::install_panic_hook();
     // the wheel scrolls the preview (tmux passes mouse events on to a
-    // popup whose program asks for them)
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // popup whose program asks for them); off again when the guard drops,
+    // whichever way the loop ends
+    let mouse = term::MouseGuard::on();
     let result = event_loop(&mut term, &mut app, &mut rt, &feed);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    drop(mouse);
     ratatui::restore();
     result
 }
@@ -371,6 +371,9 @@ fn event_loop(
             term.draw(|f| draw(f, app, rt.live, &rt.preview.1, now))?;
             drawn_at = now;
             dirty = false;
+            if term::test_panic("loop") {
+                panic!("TMUX_HOME_TEST_PANIC=loop");
+            }
         }
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {

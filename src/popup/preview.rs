@@ -22,8 +22,15 @@ const TAB: usize = 8;
 /// trimmed (the empty rows below a shell's prompt).
 pub fn parse(capture: &str) -> Vec<Line<'static>> {
     let clean = strip_osc(capture);
-    let mut lines = match std::panic::catch_unwind(|| clean.into_text()) {
-        Ok(Ok(t)) => t.lines,
+    // a parser panic is caught without a word (it would print over the TUI)
+    let parsed = super::term::quietly(|| {
+        if super::term::test_panic("parse") {
+            panic!("TMUX_HOME_TEST_PANIC=parse");
+        }
+        clean.into_text()
+    });
+    let mut lines = match parsed {
+        Some(Ok(t)) => t.lines,
         _ => strip_ansi(&clean)
             .lines()
             .map(|l| Line::raw(l.to_string()))

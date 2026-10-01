@@ -120,3 +120,94 @@ fn a_2000_line_capture_is_cheap() {
     assert!(lines >= 2000, "{lines}");
     assert!(best < 200_000, "2000-line capture+parse took {best}µs");
 }
+
+/// Runs the popup in a new window of `s` under `script`, which records
+/// everything it writes to its terminal into the returned file, with
+/// `TMUX_HOME_TEST_PANIC=<at>`. Returns the file and the window.
+fn recorded_popup(s: &TestServer, at: &str) -> (std::path::PathBuf, String) {
+    let out = std::env::temp_dir().join(format!("th-tty-{}-{}", std::process::id(), rand_suffix()));
+    let bin = env!("CARGO_BIN_EXE_tmux-home");
+    let sock = s.socket.display().to_string();
+    let popup = format!("'{bin}' popup --socket '{sock}'");
+    let script = if cfg!(target_os = "macos") {
+        format!("script -q '{}' {popup}", out.display())
+    } else {
+        format!("script -q -c \"{popup}\" '{}'", out.display())
+    };
+    s.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
+    let w = s.tmux(&[
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{window_id}",
+        "-t",
+        "alpha:",
+        "-e",
+        &format!("TMUX_HOME_TEST_PANIC={at}"),
+        &script,
+    ]);
+    (out, w.trim().to_string())
+}
+
+fn pane_dead(s: &TestServer, w: &str) -> bool {
+    fmt(s, w, "#{pane_dead}") == "1"
+}
+
+/// A panic in the event loop turns mouse reporting off first (then
+/// ratatui leaves the alternate screen and the panic is printed): the
+/// shell must not be left receiving mouse sequences.
+#[test]
+fn a_panic_turns_the_mouse_off() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    let (out, w) = recorded_popup(&s, "loop");
+    wait_until("the popup to panic and exit", || pane_dead(&s, &w));
+    let tty = String::from_utf8_lossy(&std::fs::read(&out).unwrap()).into_owned();
+    let _ = std::fs::remove_file(&out);
+    let on = tty
+        .find("\x1b[?1000h")
+        .unwrap_or_else(|| panic!("mouse never on: {tty:?}"));
+    let off = tty[on..].find("\x1b[?1000l").map(|i| i + on);
+    let off = off.unwrap_or_else(|| panic!("mouse never off after on: {tty:?}"));
+    assert!(tty[off..].contains("\x1b[?1006l"), "{tty:?}");
+    let leave = tty[on..]
+        .find("\x1b[?1049l")
+        .map(|i| i + on)
+        .expect("left the alt screen");
+    assert!(off < leave, "mouse off before ratatui's restore: {tty:?}");
+    assert!(
+        tty.contains("TMUX_HOME_TEST_PANIC=loop"),
+        "the panic is still reported: {tty:?}"
+    );
+}
+
+/// A preview parse that panics falls back to plain text without printing
+/// anything over the TUI; the popup keeps running.
+#[test]
+fn a_parse_panic_is_silent() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    s.tmux(&["send-keys", "-t", "alpha:0", "echo PREVIEW-TEXT", "Enter"]);
+    let (out, w) = recorded_popup(&s, "parse");
+    // a few one-second recaptures, each one panicking
+    let read = || String::from_utf8_lossy(&std::fs::read(&out).unwrap_or_default()).into_owned();
+    // (script writes its file as it exits: the screen is read from tmux)
+    wait_until("the preview's plain fallback", || {
+        s.tmux(&["capture-pane", "-p", "-t", &w])
+            .contains("│PREVIEW-TEXT")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(!pane_dead(&s, &w), "the popup kept running");
+    s.tmux(&["send-keys", "-t", &w, "Escape"]);
+    wait_until("the popup to exit", || pane_dead(&s, &w));
+    let tty = read();
+    let _ = std::fs::remove_file(&out);
+    assert!(!tty.contains("panicked"), "{tty:?}");
+    assert!(!tty.contains("TMUX_HOME_TEST_PANIC"), "{tty:?}");
+    let on = tty.find("\x1b[?1000h").expect("mouse on");
+    assert!(
+        tty[on..].contains("\x1b[?1000l"),
+        "mouse off on Esc: {tty:?}"
+    );
+}
