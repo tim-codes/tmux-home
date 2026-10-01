@@ -70,6 +70,8 @@ impl Conn {
 }
 
 /// The daemon's first answer to a request.
+// a one-shot return value, matched at once: boxing the snapshot buys nothing
+#[allow(clippy::large_enum_variant)]
 pub enum Answer {
     Snapshot {
         epoch: u64,

@@ -67,10 +67,10 @@ pub fn remove(entry: &str) -> Result<bool> {
 
 /// Expand a leading `~` to $HOME.
 fn expand(entry: &str) -> String {
-    if let Some(rest) = entry.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}/{}", home.to_string_lossy(), rest);
-        }
+    if let Some(rest) = entry.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return format!("{}/{}", home.to_string_lossy(), rest);
     }
     entry.to_string()
 }

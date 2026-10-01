@@ -118,10 +118,7 @@ pub fn default_branch(
             return Some(b.to_string());
         }
     }
-    let primary = remotes
-        .iter()
-        .find(|r| *r == "origin")
-        .or(remotes.first());
+    let primary = remotes.iter().find(|r| *r == "origin").or(remotes.first());
     if let Some(r) = primary {
         let head = format!("refs/remotes/{r}/HEAD");
         let prefix = format!("refs/remotes/{r}/");
@@ -158,7 +155,10 @@ pub fn parse_config(out: &str) -> (HashMap<String, String>, Vec<String>) {
     let mut remotes = Vec::new();
     for rec in out.split('\0').filter(|r| !r.is_empty()) {
         let (k, v) = rec.split_once('\n').unwrap_or((rec, ""));
-        if let Some(r) = k.strip_prefix("remote.").and_then(|r| r.strip_suffix(".url")) {
+        if let Some(r) = k
+            .strip_prefix("remote.")
+            .and_then(|r| r.strip_suffix(".url"))
+        {
             if !remotes.iter().any(|x| x == r) {
                 remotes.push(r.to_string());
             }
@@ -176,7 +176,9 @@ async fn integrated(git: &Git, dir: &std::path::Path, b: &str, t: &str) -> Resul
     if b == t {
         return Ok(true);
     }
-    let (st, _) = git.output(dir, &["merge-base", "--is-ancestor", b, t]).await?;
+    let (st, _) = git
+        .output(dir, &["merge-base", "--is-ancestor", b, t])
+        .await?;
     if st.success() {
         return Ok(true);
     }
@@ -193,7 +195,11 @@ async fn integrated(git: &Git, dir: &std::path::Path, b: &str, t: &str) -> Resul
     let trees = git
         .run(
             dir,
-            &["rev-parse", &format!("{b}^{{tree}}"), &format!("{t}^{{tree}}")],
+            &[
+                "rev-parse",
+                &format!("{b}^{{tree}}"),
+                &format!("{t}^{{tree}}"),
+            ],
         )
         .await?;
     let t: Vec<&str> = trees.lines().collect();
@@ -209,7 +215,13 @@ impl RefsMemo {
         let out = git
             .run(
                 dir,
-                &["for-each-ref", PROBE_FMT, "refs/heads", "refs/remotes", "refs/stash"],
+                &[
+                    "for-each-ref",
+                    PROBE_FMT,
+                    "refs/heads",
+                    "refs/remotes",
+                    "refs/stash",
+                ],
             )
             .await?;
         let mut h = DefaultHasher::new();
@@ -390,7 +402,10 @@ mod tests {
         let (cfg, remotes) = parse_config(
             "init.defaultbranch\ntrunk\0remote.origin.url\ngit@x:y\0remote.up.url\nz\0",
         );
-        assert_eq!(cfg.get("init.defaultbranch").map(String::as_str), Some("trunk"));
+        assert_eq!(
+            cfg.get("init.defaultbranch").map(String::as_str),
+            Some("trunk")
+        );
         assert_eq!(remotes, ["origin", "up"]);
     }
 
@@ -412,7 +427,11 @@ mod tests {
         assert_eq!(default_branch(&cfg, &[], &rows).as_deref(), Some("master"));
         // <remote>/HEAD beats inference
         let mut with_head = rows.clone();
-        with_head.push(row("refs/remotes/origin/HEAD", "a", "refs/remotes/origin/dev"));
+        with_head.push(row(
+            "refs/remotes/origin/HEAD",
+            "a",
+            "refs/remotes/origin/dev",
+        ));
         let origin = ["origin".to_string()];
         assert_eq!(
             default_branch(&none, &origin, &with_head).as_deref(),
@@ -427,7 +446,10 @@ mod tests {
         // the only branch
         let one = vec![row("refs/heads/solo", "a", "")];
         assert_eq!(default_branch(&none, &[], &one).as_deref(), Some("solo"));
-        assert_eq!(default_branch(&none, &[], &rows[..1]).as_deref(), Some("dev"));
+        assert_eq!(
+            default_branch(&none, &[], &rows[..1]).as_deref(),
+            Some("dev")
+        );
     }
 
     #[test]
@@ -441,7 +463,10 @@ mod tests {
         };
         assert!(b(1, None, false, false).stray());
         assert!(b(1, Some("origin/x"), true, false).stray());
-        assert!(!b(1, Some("origin/x"), false, false).stray(), "⇡, not stray");
+        assert!(
+            !b(1, Some("origin/x"), false, false).stray(),
+            "⇡, not stray"
+        );
         assert!(!b(0, None, false, false).stray(), "nothing unpushed");
         assert!(!b(3, None, false, true).stray(), "integrated");
     }

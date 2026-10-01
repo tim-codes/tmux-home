@@ -589,7 +589,8 @@ prunable gitdir file points to non-existent location
 
     #[test]
     fn parse_worktrees_bare_main() {
-        let w = parse_worktrees("worktree /r.git\nbare\n\nworktree /wt\nHEAD a\nbranch refs/heads/x\n");
+        let w =
+            parse_worktrees("worktree /r.git\nbare\n\nworktree /wt\nHEAD a\nbranch refs/heads/x\n");
         assert!(w[0].bare && w[0].is_main);
         assert!(!w[1].bare);
     }

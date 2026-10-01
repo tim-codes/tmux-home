@@ -28,7 +28,11 @@ use tokio::sync::Semaphore;
 
 /// Environment variables the scrub keeps: they pick the user's config
 /// files, never the repository.
-const KEEP_ENV: &[&str] = &["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"];
+const KEEP_ENV: &[&str] = &[
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+];
 
 /// Default per-call timeout for badge work (spec §6).
 pub const BADGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -150,10 +154,17 @@ impl Git {
     /// 1, for commands whose exit code is the answer (`merge-base
     /// --is-ancestor`, `diff --quiet`, `config --get-regexp`); any other
     /// exit is an error carrying stderr.
-    pub async fn output(&self, dir: &Path, args: &[&str]) -> Result<(ExitStatus, String), GitError> {
+    pub async fn output(
+        &self,
+        dir: &Path,
+        args: &[&str],
+    ) -> Result<(ExitStatus, String), GitError> {
         let out = self.raw(dir, args).await?;
         match out.status.code() {
-            Some(0) | Some(1) => Ok((out.status, String::from_utf8_lossy(&out.stdout).into_owned())),
+            Some(0) | Some(1) => Ok((
+                out.status,
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )),
             _ => Err(failed(&out)),
         }
     }

@@ -36,8 +36,14 @@ pub fn clip(s: &str, n: usize) -> String {
 }
 
 /// The status cell of an agent window's row, in place of command + path:
-/// `● running    12m  claude ×2  (wt) feat/x  plan  <reason or prompt>`.
-pub fn row_cell(a: &WindowAgents, now: u64) -> Vec<Span<'static>> {
+/// `● running    12m  claude ×2  feat/x (wt) +!  plan  <reason or prompt>`.
+/// `badge` is the git badge of the lead agent's repo (`popup::git`); without
+/// one, a worktree the agent reported shows as `(wt) <branch>`.
+pub fn row_cell(
+    a: &WindowAgents,
+    now: u64,
+    badge: Option<Vec<Span<'static>>>,
+) -> Vec<Span<'static>> {
     let lead = a.lead();
     let st = &lead.state;
     let mut v = Vec::new();
@@ -47,6 +53,7 @@ pub fn row_cell(a: &WindowAgents, now: u64) -> Vec<Span<'static>> {
             dim(),
         ));
         v.push(Span::styled(format!("  {}", st.kind.name()), dim()));
+        v.extend(badge.unwrap_or_default());
         return v;
     }
     let s = st.status;
@@ -63,8 +70,10 @@ pub fn row_cell(a: &WindowAgents, now: u64) -> Vec<Span<'static>> {
         String::new()
     };
     v.push(Span::raw(format!("  {}{count}", st.kind.name())));
-    if let Some(wt) = &st.worktree {
-        v.push(Span::styled(format!("  (wt) {}", wt.branch), dim()));
+    match (badge, &st.worktree) {
+        (Some(b), _) => v.extend(b),
+        (None, Some(wt)) => v.push(Span::styled(format!("  (wt) {}", wt.branch), dim())),
+        (None, None) => {}
     }
     if st.permission_mode.as_deref() == Some("plan") {
         v.push(Span::styled("  plan", Style::default().fg(Color::Cyan)));

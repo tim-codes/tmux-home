@@ -3,6 +3,7 @@
 
 use super::filter::Query;
 use crate::agent::{Tally, WindowAgents};
+use crate::git::badge::RepoStatus;
 use crate::tmux::snapshot::Snapshot;
 use nucleo_matcher::{
     Config, Matcher, Utf32Str,
@@ -33,6 +34,9 @@ pub struct Row {
     pub current: bool,
     /// The window's agents (SPEC §7), if any pane has agent state.
     pub agents: Option<WindowAgents>,
+    /// Git status (root, status) of the repo the row's pane — the lead
+    /// agent's pane in an agent window — is in, when the daemon knows it.
+    pub git: Option<(String, RepoStatus)>,
     /// A copy of a window that needs you, pinned in the NEEDS YOU group
     /// above the sessions.
     pub pinned: bool,
@@ -96,9 +100,21 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                 .as_ref()
                 .map(|a| a.lead().state.kind.name().to_string())
                 .unwrap_or_default();
+            // the badge's repo: where the lead agent works, else the row pane
+            let git_cwd = agents
+                .as_ref()
+                .and_then(|a| panes.iter().find(|p| p.id == a.lead().pane))
+                .map(|p| p.current_path.as_str())
+                .unwrap_or(&cwd);
+            let git = s
+                .git
+                .paths
+                .get(git_cwd)
+                .and_then(|root| Some((root.clone(), s.git.repos.get(root)?.clone())));
+            let branch = git.as_ref().map(|(_, g)| g.branch.as_str()).unwrap_or("");
             let hay = format!(
-                "{} {} {} {} {} {}",
-                sess.name, w.index, w.name, cmd, path, kind
+                "{} {} {} {} {} {} {}",
+                sess.name, w.index, w.name, cmd, path, kind, branch
             );
             let prompts = agents
                 .iter()
@@ -119,6 +135,7 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                 path,
                 current: Some(&sess.id) == csid.as_ref() && w.active,
                 agents,
+                git,
                 pinned: false,
                 key: w.id.clone(),
                 hay,
@@ -312,6 +329,8 @@ pub struct App {
     pub preview_flip: bool,
     /// " <session> ▸ <index>" of the invoking client.
     pub location: String,
+    /// `$HOME`, for shortening paths in the preview's cards.
+    pub home: String,
     /// Live agents by status (header).
     pub tally: Tally,
     pub page: usize,
@@ -337,6 +356,7 @@ impl App {
             notice: None,
             preview_flip: false,
             location: String::new(),
+            home: String::new(),
             tally: Tally::default(),
             page: 10,
             matcher: Matcher::new(Config::DEFAULT),
@@ -748,6 +768,14 @@ impl App {
     }
 }
 
+/// The F1 page: keys, then the git badge legend.
+pub fn help() -> String {
+    format!(
+        "{HELP}\n\n{}\n\npress any key to return",
+        crate::git::badge::LEGEND
+    )
+}
+
 pub const HELP: &str = "tmux-home — keys
 
   type            filter windows (session, name, command, path, agent
@@ -770,9 +798,7 @@ pub const HELP: &str = "tmux-home — keys
   M-↑ M-↓         move the window up / down within its session
   M-n             new window after the selection (inline name)
   ^o              toggle the preview
-  F1  ^/          this help
-
-press any key to return";
+  F1  ^/          this help";
 
 #[cfg(test)]
 mod tests {

@@ -541,10 +541,14 @@ mod tests {
 
     #[test]
     fn targets_are_row_panes_and_agent_panes() {
-        let mut s = Snapshot::default();
-        s.windows = vec![win("@1", true), win("@2", false)];
+        let mut s = Snapshot {
+            windows: vec![win("@1", true), win("@2", false)],
+            ..Snapshot::default()
+        };
         let mut agent = pane("%3", "@1", false, "/agent");
-        agent.agent_opts.insert("@home_status".into(), "running".into());
+        agent
+            .agent_opts
+            .insert("@home_status".into(), "running".into());
         let mut side = pane("%4", "@2", true, "/sidebar");
         side.role = "sidebar".into();
         s.panes = vec![

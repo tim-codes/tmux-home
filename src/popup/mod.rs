@@ -5,6 +5,7 @@ pub mod agents;
 pub mod app;
 pub mod filter;
 pub mod fresh;
+pub mod git;
 
 use crate::{
     client::{self, Answer},
@@ -13,7 +14,7 @@ use crate::{
     store::Store,
     tmux::snapshot::{Snapshot, read_snapshot},
 };
-use app::{Action, App, HELP, Mode, Row};
+use app::{Action, App, Mode, Row};
 use fresh::{Guard, Stamp};
 use ratatui::{
     Frame,
@@ -271,6 +272,7 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
         guard: Guard::default(),
     };
     let mut app = App::new();
+    app.home = rt.home.clone();
     // first picture: read tmux directly, so the cursor lands on the window
     // the client shows now; no floor, since nothing was written (the feed's
     // first snapshot is a fresh read too)
@@ -375,7 +377,7 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str, now: u64) {
     let bg = Block::default().style(Style::default().bg(Color::Reset));
     f.render_widget(bg, area);
     if app.mode == Mode::Help {
-        f.render_widget(Paragraph::new(HELP), area);
+        f.render_widget(Paragraph::new(app::help()), area);
         return;
     }
     let v = Layout::default()
@@ -453,11 +455,18 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str, now: u64) {
             .border_style(dim);
         let mut inner = block.inner(p);
         f.render_widget(block, p);
-        // an agent window: the agent card above the pane's last lines
+        // an agent window: the agent card, then the git card (a window in
+        // a repo), above the pane's last lines
+        let mut cards = Vec::new();
         if let Some(a) = app.selected().and_then(|r| r.agents.as_ref()) {
-            let card = agents::card(a, now, inner.width as usize);
-            let h = (card.len() as u16).min(inner.height);
-            f.render_widget(Paragraph::new(card), Rect { height: h, ..inner });
+            cards.extend(agents::card(a, now, inner.width as usize));
+        }
+        if let Some((root, g)) = app.selected().and_then(|r| r.git.as_ref()) {
+            cards.extend(git::card(g, root, inner.width as usize, &app.home));
+        }
+        if !cards.is_empty() {
+            let h = (cards.len() as u16).min(inner.height);
+            f.render_widget(Paragraph::new(cards), Rect { height: h, ..inner });
             inner.y += h;
             inner.height -= h;
         }
@@ -563,9 +572,13 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, now: u64) {
                 },
             ),
         ];
+        let badge = r.git.as_ref().map(|(_, g)| git::badge_spans(g));
         match &r.agents {
-            Some(a) => spans.extend(agents::row_cell(a, now)),
-            None => spans.push(Span::styled(format!("  {:<10}  {}", r.cmd, r.path), dim)),
+            Some(a) => spans.extend(agents::row_cell(a, now, badge)),
+            None => {
+                spans.push(Span::styled(format!("  {:<10}  {}", r.cmd, r.path), dim));
+                spans.extend(badge.unwrap_or_default());
+            }
         }
         if selected {
             for s in spans.iter_mut().skip(1) {
@@ -675,6 +688,18 @@ mod tests {
     /// running agents in one window (`@1`), a stale one (`@2`) and a plain
     /// shell (`@3`); the client is on `@3`.
     fn agent_app() -> App {
+        app_of(&agent_snap())
+    }
+
+    fn app_of(s: &Snapshot) -> App {
+        let mut a = App::new();
+        a.home = "/home/u".into();
+        a.set_rows(app::build_rows(s, Some("c"), "/home/u"));
+        a.select_current();
+        a
+    }
+
+    fn agent_snap() -> Snapshot {
         use crate::agent::tests::pane;
         let mut s = Snapshot::default();
         s.sessions.push(Session {
@@ -734,10 +759,151 @@ mod tests {
             tty: "c".into(),
             session_id: "$0".into(),
         });
-        let mut a = App::new();
-        a.set_rows(app::build_rows(&s, Some("c"), ""));
-        a.select_current();
-        a
+        s
+    }
+
+    /// The agent fixture with git: the waiting agent (`@0`) works in a
+    /// linked worktree, the plain shell (`@3`) sits in a dirty repo's
+    /// subdirectory, and the stale window's repo (`@2`) timed out.
+    fn git_snap() -> Snapshot {
+        use crate::git::badge::{Phase, RepoStatus};
+        use crate::git::repo::Operation;
+        let mut s = agent_snap();
+        for (pid, path) in [
+            ("%0", "/home/u/dev/app.fix-x"),
+            ("%2", "/home/u/dev/old"),
+            ("%3", "/home/u/dev/app/src"),
+        ] {
+            s.panes
+                .iter_mut()
+                .find(|p| p.id == pid)
+                .unwrap()
+                .current_path = path.into();
+        }
+        let g = &mut s.git;
+        g.paths.insert(
+            "/home/u/dev/app.fix-x".into(),
+            "/home/u/dev/app.fix-x".into(),
+        );
+        g.paths
+            .insert("/home/u/dev/app/src".into(), "/home/u/dev/app".into());
+        g.paths
+            .insert("/home/u/dev/old".into(), "/home/u/dev/old".into());
+        g.repos.insert(
+            "/home/u/dev/app".into(),
+            RepoStatus {
+                branch: "main".into(),
+                phase: Phase::Refs,
+                upstream: Some("origin/main".into()),
+                ahead: 2,
+                behind: 1,
+                staged: 1,
+                modified: 3,
+                untracked: 1,
+                stashes: 1,
+                stray: 2,
+                stray_names: vec!["feat/a".into(), "spike".into()],
+                operation: Some(Operation::Rebase),
+                default_branch: Some("main".into()),
+                has_remote: true,
+                worktrees: 1,
+                ..RepoStatus::default()
+            },
+        );
+        g.repos.insert(
+            "/home/u/dev/app.fix-x".into(),
+            RepoStatus {
+                branch: "fix/x".into(),
+                linked: true,
+                main_root: Some("/home/u/dev/app".into()),
+                phase: Phase::Refs,
+                upstream: Some("origin/fix/x".into()),
+                modified: 1,
+                has_remote: true,
+                ..RepoStatus::default()
+            },
+        );
+        g.repos.insert(
+            "/home/u/dev/old".into(),
+            RepoStatus {
+                branch: "legacy".into(),
+                phase: Phase::Status,
+                stale: true,
+                ..RepoStatus::default()
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn git_badges_on_rows_and_the_card() {
+        let mut a = app_of(&git_snap());
+        let s = screen(&mut a, 200, 50);
+        let line = |s: &str, pat: &str| {
+            s.lines()
+                .find(|l| l.contains(pat))
+                .unwrap_or_else(|| panic!("no {pat:?} in\n{s}"))
+                .to_string()
+        };
+        // a plain row: command, path, then the badge
+        assert!(
+            line(&s, " shell ").contains("fish        ~/d/a/src  main +!? ⇡2 ⇣1 $1 ⚠2 ↻ "),
+            "{s}"
+        );
+        // an agent row shows the lead agent's worktree badge, in place of
+        // the hook's `(wt) <branch>`, pinned copy and session row alike
+        assert_eq!(s.matches("claude  fix/x (wt) ! |  plan").count(), 2, "{s}");
+        assert!(!s.contains("(wt) fix/x"), "{s}");
+        // a stale status ends in ~
+        assert!(line(&s, " old ").contains("claude  legacy ~ "), "{s}");
+        // the card of the selected (current) window
+        for want in [
+            "git        main → origin/main  ⇡2 ahead ⇣1 behind",
+            "changes    1 staged · 3 modified · 1 untracked",
+            "state      ↻ rebase in progress",
+            "stash      $1",
+            "stray      ⚠2 feat/a, spike",
+            "worktree   ~/d/app (+1 linked)",
+            "default    main",
+        ] {
+            assert!(s.contains(want), "no {want:?} in\n{s}");
+        }
+        // the agent window: agent card, then its worktree's git card
+        a.select_wid("@0");
+        let s = screen(&mut a, 200, 50);
+        let agent = s.find("◐ waiting  ·  claude").expect(&s);
+        let git = s
+            .find("git        fix/x → origin/fix/x  in sync")
+            .expect(&s);
+        assert!(agent < git, "{s}");
+        assert!(s.contains("~/d/app.fix-x (linked; main ~/d/app)"), "{s}");
+        // a stale repo's card says so
+        a.select_wid("@2");
+        let s = screen(&mut a, 200, 50);
+        assert!(s.contains("~ stale: the last check timed out"), "{s}");
+        // filtering matches the branch
+        let mut a = app_of(&git_snap());
+        for c in "legacy".chars() {
+            a.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(a.visible.len(), 1);
+        assert_eq!(a.rows[a.visible[0]].name, "old");
+    }
+
+    #[test]
+    fn help_has_the_badge_legend() {
+        let mut a = app();
+        a.key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        let s = screen(&mut a, 100, 50);
+        for want in [
+            "^t              reopen",
+            "git badge",
+            "⚠n stray branches",
+            "~ stale",
+            "press any key",
+        ] {
+            assert!(s.contains(want), "no {want:?} in\n{s}");
+        }
     }
 
     #[test]

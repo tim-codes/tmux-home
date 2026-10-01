@@ -143,7 +143,11 @@ impl RepoStatus {
             v.push(("(wt)".into(), Part::Worktree));
         }
         let mut flags = String::new();
-        for (n, c) in [(self.staged, '+'), (self.modified, '!'), (self.untracked, '?')] {
+        for (n, c) in [
+            (self.staged, '+'),
+            (self.modified, '!'),
+            (self.untracked, '?'),
+        ] {
             if n > 0 {
                 flags.push(c);
             }
