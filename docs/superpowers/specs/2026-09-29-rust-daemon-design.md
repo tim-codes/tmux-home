@@ -110,6 +110,8 @@ report other sessions' window events. R0 measures this; if control mode
 can't be made invisible and complete, `TmuxSource::Poll` (500 ms, change
 detection by hash) becomes the default and nothing above the trait changes.
 
+*R0 decision (2026-10-01): `Poll` is the default* — the control client counts in `session_attached` (read by `tmux ls` and tmux-agent-sidebar), fires `client-attached` hooks and is briefly the default client, and no attach mode hides it; `--source control` remains (`docs/superpowers/notes/r0-control-mode.md`).
+
 **Model and push.** The daemon keeps the current `Snapshot`, recomputes
 derived fields on each change, debounces 30 ms, and pushes the **whole
 snapshot** to subscribers (tens of windows — a few KB; no diffing until

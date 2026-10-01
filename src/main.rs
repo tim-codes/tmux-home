@@ -13,7 +13,7 @@ enum Cmd {
     Daemon {
         #[arg(long)]
         socket: std::path::PathBuf,
-        #[arg(long, value_enum, default_value = "control")]
+        #[arg(long, value_enum, default_value = "poll")]
         source: tmux_home::tmux::source::SourceKind,
     },
     /// Print the current snapshot as JSON.
