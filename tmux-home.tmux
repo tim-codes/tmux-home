@@ -29,3 +29,10 @@ popup+=" -e TMUX_HOME_CLIENT=#{q:client_name} $(printf '%q' "$HOME_BIN")"
 for key in $keys; do
 	t bind-key "$key" run-shell -b "$popup"
 done
+
+# Phase 2 daemon: start one for this server if the Rust binary is built.
+# A second start is a no-op (lock), and it exits with the server.
+RUST_BIN="$CURRENT_DIR/target/release/tmux-home"
+if [[ -x $RUST_BIN ]]; then
+	t run-shell -b "$(printf '%q' "$RUST_BIN") daemon --socket #{q:socket_path}"
+fi
