@@ -41,7 +41,7 @@ use std::{
 };
 use tokio::{
     sync::{Semaphore, mpsc},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 
 /// Git processes the daemon runs at once (spec §6 "Concurrency").
@@ -64,9 +64,16 @@ pub struct Config {
 }
 
 impl Default for Config {
+    /// The spec's values; `TMUX_HOME_GIT_TIMEOUT_MS` overrides the per-call
+    /// timeout (tests, slow disks).
     fn default() -> Self {
+        let timeout = std::env::var("TMUX_HOME_GIT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(BADGE_TIMEOUT);
         Config {
-            timeout: BADGE_TIMEOUT,
+            timeout,
             permits: PERMITS,
             publish_every: PUBLISH_EVERY,
             min_interval: MIN_INTERVAL,
@@ -153,6 +160,8 @@ struct Task {
     shared: Arc<Shared>,
     git: Git,
     tx: mpsc::UnboundedSender<Msg>,
+    /// Running refreshes; dropped (their git children killed) with the task.
+    workers: JoinSet<()>,
     targets: Targets,
     cwds: HashMap<String, Resolved>,
     repos: HashMap<PathBuf, Tracked>,
@@ -178,6 +187,7 @@ async fn run(shared: Arc<Shared>, cfg: Config) {
         shared,
         git,
         tx,
+        workers: JoinSet::new(),
         targets: Targets::default(),
         cwds: HashMap::new(),
         repos: HashMap::new(),
@@ -332,7 +342,7 @@ impl Task {
         tr.in_flight = true;
         tr.rerun = false;
         tr.started = Some(Instant::now());
-        tokio::spawn(refresh(
+        self.workers.spawn(refresh(
             self.git.clone(),
             tr.paths.clone(),
             tr.status.clone(),
@@ -367,6 +377,7 @@ impl Task {
     }
 
     async fn tick(&mut self) {
+        while self.workers.try_join_next().is_some() {}
         let now = Instant::now();
         if now.duration_since(self.stamped) >= STAMP_EVERY {
             self.stamped = now;
