@@ -6,18 +6,22 @@
 //! alive. The popup (and `ops`) only ever see `AgentState`, `PaneAgent`,
 //! `WindowAgents` and `Tally`; they never read an option by name.
 //!
-//! Today the only source is tmux-agent-sidebar's `@pane_*` options
-//! (`sidebar`). Pass 5 adds tmux-home's own hooks writing `@home_*`: one more
-//! module implementing `AgentSource`, put first in `SOURCES`; `OPTIONS`
-//! picks up its names. Nothing in the UI changes.
+//! Two sources, in order: tmux-home's own `@home_*` options (`home`,
+//! written by `tmux-home hook`, through an `adapter::AgentAdapter` such as
+//! `claude`), then tmux-agent-sidebar's `@pane_*` options (`sidebar`) as
+//! the fallback for panes tmux-home's hooks haven't seen. `OPTIONS` is the
+//! union of their names. Nothing in the UI knows which source answered.
 
+pub mod adapter;
+pub mod claude;
+pub mod home;
 pub mod sidebar;
 
 use crate::tmux::snapshot::Pane;
 use std::sync::LazyLock;
 
 /// Sources in priority order: the first that recognises a pane wins.
-pub const SOURCES: &[&dyn AgentSource] = &[&sidebar::Sidebar];
+pub const SOURCES: &[&dyn AgentSource] = &[&home::Home, &sidebar::Sidebar];
 
 /// Every pane option any source reads, each once, in source order; the
 /// snapshot fetches these.
@@ -45,6 +49,38 @@ pub trait AgentSource: Sync {
     /// moved on (back at its shell prompt, or running something else).
     fn looks_alive(&self, pane: &Pane, state: &AgentState) -> bool {
         state.kind.looks_alive(&pane.current_command)
+    }
+
+    /// Unix seconds this source is known to have last written the pane's
+    /// options, if it can tell; for choosing between sources.
+    fn updated(&self, _pane: &Pane) -> Option<u64> {
+        None
+    }
+}
+
+/// A later source must be this many seconds newer to win on time alone:
+/// both sets of hooks fire on the same events, a second or so apart.
+pub const NEWER_BY: u64 = 2;
+
+/// A source whose session ID disagrees with a later source's, and that
+/// hasn't written for this long, has stopped hearing from the agent.
+pub const SESSION_GRACE: u64 = 30;
+
+/// Whether `later`'s reading of a pane should replace `best`'s (from an
+/// earlier source): it is clearly newer, or `best` disagrees on the
+/// session and has gone quiet. `now` is Unix seconds.
+pub fn later_wins(
+    best: (&AgentState, Option<u64>),
+    later: (&AgentState, Option<u64>),
+    now: u64,
+) -> bool {
+    let best_t = best.1.unwrap_or(0);
+    if later.1.is_some_and(|t| t > best_t + NEWER_BY) {
+        return true;
+    }
+    match (&best.0.session_id, &later.0.session_id) {
+        (Some(a), Some(b)) if a != b => now.saturating_sub(best_t) > SESSION_GRACE,
+        _ => false,
     }
 }
 
@@ -231,20 +267,35 @@ impl PaneAgent {
     }
 }
 
-/// The agent of `pane`, from the first source that has one. Sidebar panes
+/// The agent of `pane`, from the freshest source that has one. Sidebar panes
 /// (`@pane_role=sidebar`) are views, never agents.
 pub fn pane_agent(pane: &Pane) -> Option<PaneAgent> {
+    pane_agent_at(pane, now())
+}
+
+/// `pane_agent` at time `now`: the first source with state for the pane,
+/// unless a later one's is fresher (`later_wins`).
+pub fn pane_agent_at(pane: &Pane, now: u64) -> Option<PaneAgent> {
     if pane.role == "sidebar" {
         return None;
     }
-    SOURCES.iter().find_map(|src| {
-        let state = src.read(pane)?;
-        let stale = !src.looks_alive(pane, &state);
-        Some(PaneAgent {
-            pane: pane.id.clone(),
-            state,
-            stale,
-        })
+    let mut best: Option<(&dyn AgentSource, AgentState, Option<u64>)> = None;
+    for &src in SOURCES {
+        let Some(state) = src.read(pane) else {
+            continue;
+        };
+        let t = src.updated(pane);
+        best = match best {
+            Some((b, bs, bt)) if !later_wins((&bs, bt), (&state, t), now) => Some((b, bs, bt)),
+            _ => Some((src, state, t)),
+        };
+    }
+    let (src, state, _) = best?;
+    let stale = !src.looks_alive(pane, &state);
+    Some(PaneAgent {
+        pane: pane.id.clone(),
+        state,
+        stale,
     })
 }
 
@@ -551,9 +602,10 @@ pub(crate) mod tests {
 
     #[test]
     fn options_are_every_sources_names_once() {
-        for o in sidebar::OPTIONS {
+        for o in sidebar::OPTIONS.iter().chain(home::OPTIONS) {
             assert!(OPTIONS.contains(o), "{o}");
         }
+        assert_eq!(OPTIONS[0], "@home_agent", "home's names come first");
         let mut v = OPTIONS.clone();
         v.sort();
         v.dedup();

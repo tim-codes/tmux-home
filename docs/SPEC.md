@@ -163,8 +163,38 @@ window) and the filter is kept.
 
 ## 7. Agent awareness
 
-State comes from the pane options the tmux-agent-sidebar hooks publish
-(event-driven, sub-second). tmux-home adds no hooks of its own.
+State comes from pane options that agent hooks publish (event-driven,
+sub-second): tmux-home's own (`tmux-home hook claude <Event>`, writing
+`@home_*`, pass 5a) and tmux-agent-sidebar's (`@pane_*`), per pane in that
+order.
+
+> **Pass 5a.** `tmux-home hook claude <Event>` handles SessionStart,
+> UserPromptSubmit, Stop, StopFailure, Notification, PermissionDenied,
+> SessionEnd, SubagentStart and SubagentStop (not PostToolUse or Task*),
+> ported from the sidebar's handlers through an `AgentAdapter`
+> (`src/agent/adapter.rs`, `claude.rs`). It writes `@home_agent`,
+> `@home_status`, `@home_attention`, `@home_wait_reason`,
+> `@home_run_started`, `@home_prompt` / `_prompt_source`,
+> `@home_subagents`, `@home_bg_cmd`, `@home_permission_mode`,
+> `@home_worktree_name` / `_branch`, `@home_session_id`, `@home_updated`, with the
+> sidebar's value vocabulary, so the table below applies with `@home_`
+> for `@pane_` (and `@home_run_started` for `@pane_started_at`). The
+> `HomeSource` reads them first and wins, unless the sidebar's are
+> clearly newer (`@home_updated`, stamped on every write, against the
+> sidebar's `@pane_started_at`) or name another session after `@home_*`
+> has been quiet 30 s; a pane without them falls back to the sidebar's. Differences from the
+> sidebar, from Claude Code 2.1.284's payloads: no activity log, cwd or
+> desktop notifications; no TaskCompleted, so a running agent never gets
+> attention; only `permission_prompt`, `elicitation_dialog`,
+> `elicitation_url_dialog` and `agent_needs_input` notifications wait
+> (the rest are metadata); PermissionDenied (auto mode) records
+> `permission_denied:<reason>` with attention but leaves the status, as
+> the model carries on; background work comes from Stop's
+> `background_tasks` (or the sidebar's `@pane_bg_cmd`); subagent events are
+> recognised by their payload's `agent_id`, not the subagent list, so
+> SessionEnd (main context only) always clears, and SessionStart
+> `startup`/`clear` drops the list; UserPromptSubmit records the prompt
+> only for `source` `user`/`sdk` (or none).
 
 > **Until pass 5** (implemented in pass 4), this state comes only from
 > tmux-agent-sidebar's `@pane_*` options, read in the same `list-panes` call

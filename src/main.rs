@@ -40,6 +40,17 @@ enum Cmd {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
     },
+    /// An agent's hook: reads the event JSON on stdin and records it in the
+    /// pane's `@home_*` options (pane from $TMUX_PANE). Always exits 0,
+    /// silently. Events (claude): SessionStart, UserPromptSubmit, Stop,
+    /// StopFailure, Notification, PermissionDenied, SessionEnd,
+    /// SubagentStart, SubagentStop.
+    Hook {
+        /// `claude`.
+        agent: String,
+        /// The event name, as the agent calls it (`Stop`).
+        event: String,
+    },
     /// R0 spike: measure control-mode side effects on a server and print a report.
     SpikeControl {
         #[arg(long)]
@@ -48,6 +59,11 @@ enum Cmd {
 }
 
 fn main() -> anyhow::Result<()> {
+    // The hook bypasses clap: it must exit 0 whatever its arguments are.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("hook") {
+        std::process::exit(tmux_home::hook::main(&args[1..]));
+    }
     let cli = Cli::parse();
     let cmd = match cli.cmd {
         Cmd::Popup { socket } => return tmux_home::popup::run(socket),
@@ -63,7 +79,11 @@ fn main() -> anyhow::Result<()> {
     match cmd {
         Cmd::Daemon { socket, source } => rt.block_on(tmux_home::daemon::run(socket, source)),
         Cmd::SpikeControl { socket } => rt.block_on(tmux_home::tmux::source::spike_control(socket)),
-        Cmd::Popup { .. } | Cmd::Status { .. } | Cmd::Reopen { .. } | Cmd::Query { .. } => {
+        Cmd::Popup { .. }
+        | Cmd::Status { .. }
+        | Cmd::Reopen { .. }
+        | Cmd::Query { .. }
+        | Cmd::Hook { .. } => {
             unreachable!()
         }
     }
