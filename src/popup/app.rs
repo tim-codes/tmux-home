@@ -9,7 +9,9 @@ use nucleo_matcher::{
     Config, Matcher, Utf32Str,
     pattern::{CaseMatching, Normalization, Pattern},
 };
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use std::time::{Duration, Instant};
 
 /// How long the selection keeps wanting a window that isn't in the list
@@ -334,8 +336,20 @@ pub struct App {
     /// Live agents by status (header).
     pub tally: Tally,
     pub page: usize,
+    /// Preview scroll: lines above the bottom (0 = the latest output).
+    /// Back to 0 whenever the selection changes.
+    pub preview_scroll: usize,
+    /// Rows of pane text the preview showed at the last draw (0: hidden).
+    pub preview_rows: usize,
+    /// The list's screen rows at the last draw: (y, position in
+    /// `visible`) for each window row, and the list's x range.
+    pub list_hits: Vec<(u16, usize)>,
+    pub list_x: std::ops::Range<u16>,
     matcher: Matcher,
 }
+
+/// Lines the preview moves per mouse-wheel notch.
+pub const WHEEL_LINES: usize = 3;
 
 impl Default for App {
     fn default() -> Self {
@@ -359,6 +373,10 @@ impl App {
             home: String::new(),
             tally: Tally::default(),
             page: 10,
+            preview_scroll: 0,
+            preview_rows: 0,
+            list_hits: vec![],
+            list_x: 0..0,
             matcher: Matcher::new(Config::DEFAULT),
         }
     }
@@ -468,7 +486,41 @@ impl App {
 
     fn clamp(&mut self) {
         self.clamp_pos();
-        self.sel_wid = self.selected().map(|r| r.key.clone());
+        let key = self.selected().map(|r| r.key.clone());
+        if key != self.sel_wid {
+            // a new selection's preview starts at its latest output
+            self.preview_scroll = 0;
+        }
+        self.sel_wid = key;
+    }
+
+    /// Scrolls the preview `d` lines back (up) or forward (down); nothing
+    /// when the preview is hidden. The top is clamped at the next draw.
+    pub fn scroll_preview(&mut self, d: isize) {
+        if self.preview_rows == 0 {
+            return;
+        }
+        self.preview_scroll = self.preview_scroll.saturating_add_signed(d);
+    }
+
+    /// A mouse event: the wheel scrolls the preview wherever the pointer
+    /// is (never the list); a left click on a window row selects it (list
+    /// mode only). Nothing else does anything.
+    pub fn mouse(&mut self, m: MouseEvent) -> Action {
+        match m.kind {
+            MouseEventKind::ScrollUp => self.scroll_preview(WHEEL_LINES as isize),
+            MouseEventKind::ScrollDown => self.scroll_preview(-(WHEEL_LINES as isize)),
+            MouseEventKind::Down(MouseButton::Left)
+                if self.mode == Mode::List && self.list_x.contains(&m.column) =>
+            {
+                match self.list_hits.iter().find(|(y, _)| *y == m.row) {
+                    Some(&(_, pos)) => self.set_sel(pos),
+                    None => return Action::None,
+                }
+            }
+            _ => return Action::None,
+        }
+        Action::Redraw
     }
 
     fn clamp_pos(&mut self) {
@@ -658,7 +710,14 @@ impl App {
 
     fn list_key(&mut self, k: KeyEvent, ctrl: bool, alt: bool) -> Action {
         let sel = self.selected().cloned();
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        let half = (self.preview_rows / 2).max(1) as isize;
         match k.code {
+            // the preview scrolls on Shift; the list never does
+            KeyCode::Up if shift && !alt && !ctrl => self.scroll_preview(1),
+            KeyCode::Down if shift && !alt && !ctrl => self.scroll_preview(-1),
+            KeyCode::PageUp if shift => self.scroll_preview(half),
+            KeyCode::PageDown if shift => self.scroll_preview(-half),
             KeyCode::Up if alt => return self.swap_action(-1),
             KeyCode::Down if alt => return self.swap_action(1),
             KeyCode::Up => self.move_by(-1),
@@ -783,6 +842,9 @@ pub const HELP: &str = "tmux-home — keys
                   @attn @agent @running @waiting @idle @error s:<session>
   ↑ ↓  ^p ^n  ^k ^j   move selection
   PgUp PgDn       page
+  S-↑ S-↓         scroll the preview a line (the mouse wheel: 3 lines)
+  S-PgUp S-PgDn   scroll the preview half a page; moving the selection
+                  returns it to the latest output
   ← →  Home End   edit the filter
   ⏎               switch to the selected window and close
   ^g              jump to the next window that needs you (NEEDS YOU)

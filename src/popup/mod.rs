@@ -6,6 +6,7 @@ pub mod app;
 pub mod filter;
 pub mod fresh;
 pub mod git;
+pub mod preview;
 
 use crate::{
     client::{self, Answer},
@@ -18,7 +19,10 @@ use app::{Action, App, Mode, Row};
 use fresh::{Guard, Stamp};
 use ratatui::{
     Frame,
-    crossterm::event::{self, Event, KeyEventKind},
+    crossterm::{
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
+        execute,
+    },
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -38,6 +42,11 @@ struct Feed {
 
 const DEGRADED_EVERY: Duration = Duration::from_secs(1);
 const PREVIEW_EVERY: Duration = Duration::from_millis(1000);
+/// A new selection's pane is captured once it has been selected this long:
+/// holding ↓ through the list doesn't capture every pane passed.
+const PREVIEW_SETTLE: Duration = Duration::from_millis(60);
+/// Lines of history the preview captures (`@home-preview-history`).
+const PREVIEW_HISTORY: usize = 2000;
 /// Budget for the daemon's first reply to a subscription (a fresh read).
 const SUBSCRIBE_BUDGET: Duration = Duration::from_millis(400);
 /// Budget for a `refresh` after a write; past it the popup reads tmux itself.
@@ -107,8 +116,13 @@ struct Runtime {
     store: Store,
     home: String,
     live: bool,
-    preview: (Option<String>, String),
+    /// The previewed pane and its parsed capture.
+    preview: (Option<String>, Vec<Line<'static>>),
     preview_at: Instant,
+    /// The pane the selection wants previewed, and since when.
+    preview_want: (Option<String>, Instant),
+    /// Lines of scrollback to capture.
+    history: usize,
     /// Set by `refresh` after our own write: older snapshots are held back.
     guard: Guard<Snapshot>,
 }
@@ -145,16 +159,30 @@ impl Runtime {
         }
     }
 
-    fn update_preview(&mut self, app: &App, force: bool) {
+    /// Re-captures the selected pane: a second after the last capture, or
+    /// once a new selection has settled (`PREVIEW_SETTLE`; the first
+    /// capture is at once).
+    fn update_preview(&mut self, app: &mut App) {
         let pane = app.selected().and_then(|r| r.preview_pane());
-        if !force && pane == self.preview.0 && self.preview_at.elapsed() < PREVIEW_EVERY {
-            return;
+        if pane != self.preview_want.0 {
+            self.preview_want = (pane.clone(), Instant::now());
         }
-        let text = pane
-            .as_deref()
-            .map(|p| self.tx.capture(p))
-            .unwrap_or_else(|| "(no pane)".into());
-        self.preview = (pane, text);
+        if pane == self.preview.0 {
+            if self.preview_at.elapsed() < PREVIEW_EVERY {
+                return;
+            }
+        } else if self.preview.0.is_some() && self.preview_want.1.elapsed() < PREVIEW_SETTLE {
+            return;
+        } else {
+            // another pane (an agent window's lead can change too): from
+            // its latest output
+            app.preview_scroll = 0;
+        }
+        let lines = match pane.as_deref() {
+            Some(p) => preview::parse(&self.tx.capture_styled(p, self.history)),
+            None => vec![Line::raw("(no pane)")],
+        };
+        self.preview = (pane, lines);
         self.preview_at = Instant::now();
     }
 
@@ -164,6 +192,7 @@ impl Runtime {
             Action::None | Action::Redraw => {}
             Action::Quit => return false,
             Action::Switch { sid, wid, pane } => {
+                let _ = execute!(std::io::stdout(), DisableMouseCapture);
                 ratatui::restore();
                 let _ = self.tx.switch_to(self.client.as_deref(), &sid, &wid);
                 if let Some(p) = pane {
@@ -261,14 +290,21 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     let client = tx.home_client();
     let store = Store::for_socket(&socket)?;
     let feed = spawn_feed(socket.clone());
+    let history = tx
+        .run(&["show-options", "-gqv", "@home-preview-history"])
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(PREVIEW_HISTORY);
     let mut rt = Runtime {
         tx,
         client,
         store,
         home: std::env::var("HOME").unwrap_or_default(),
         live: false,
-        preview: (None, String::new()),
+        preview: (None, Vec::new()),
         preview_at: Instant::now(),
+        preview_want: (None, Instant::now()),
+        history,
         guard: Guard::default(),
     };
     let mut app = App::new();
@@ -282,7 +318,11 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     app.select_current();
 
     let mut term = ratatui::init();
+    // the wheel scrolls the preview (tmux passes mouse events on to a
+    // popup whose program asks for them)
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let result = event_loop(&mut term, &mut app, &mut rt, &feed);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -318,7 +358,7 @@ fn event_loop(
             dirty = true;
         }
         let before = rt.preview_at;
-        rt.update_preview(app, false);
+        rt.update_preview(app);
         if rt.preview_at != before {
             dirty = true;
         }
@@ -339,9 +379,10 @@ fn event_loop(
                     if !rt.act(app, a) {
                         return Ok(());
                     }
-                    rt.update_preview(app, false);
+                    rt.update_preview(app);
                     dirty = true;
                 }
+                Event::Mouse(m) => dirty |= app.mouse(m) != Action::None,
                 Event::Resize(..) => dirty = true,
                 _ => {}
             }
@@ -371,11 +412,13 @@ fn preview_rect(area: Rect, flip: bool) -> (Rect, Option<Rect>, Direction) {
 }
 
 /// Draws the popup; `live` is false in degraded mode, `preview` is the
-/// selected pane's captured text, `now` Unix seconds (run times).
-fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str, now: u64) {
+/// selected pane's parsed capture, `now` Unix seconds (run times).
+fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &[Line<'static>], now: u64) {
     let area = f.area();
     let bg = Block::default().style(Style::default().bg(Color::Reset));
     f.render_widget(bg, area);
+    app.preview_rows = 0;
+    app.list_hits.clear();
     if app.mode == Mode::Help {
         f.render_widget(Paragraph::new(app::help()), area);
         return;
@@ -470,10 +513,28 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str, now: u64) {
             inner.y += h;
             inner.height -= h;
         }
-        let lines: Vec<&str> = preview.lines().collect();
-        let skip = lines.len().saturating_sub(inner.height as usize);
-        let body: Vec<Line> = lines[skip..].iter().map(|l| Line::raw(*l)).collect();
-        f.render_widget(Paragraph::new(body), inner);
+        // the pane's lines, clipped at the edge (see `preview`), scrolled
+        // `preview_scroll` lines back; the offset is clamped at the top
+        let (offset, body) = preview::window(preview, inner.height as usize, app.preview_scroll);
+        app.preview_scroll = offset;
+        app.preview_rows = inner.height as usize;
+        f.render_widget(Paragraph::new(body.to_vec()), inner);
+        if offset > 0 && inner.height > 0 && inner.width > 0 {
+            let tag = format!(" ↑{offset} ");
+            let w = (tag.chars().count() as u16).min(inner.width);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    tag,
+                    Style::default().add_modifier(Modifier::REVERSED),
+                )),
+                Rect {
+                    x: inner.right() - w,
+                    width: w,
+                    height: 1,
+                    ..inner
+                },
+            );
+        }
     }
 
     f.render_widget(Paragraph::new(Span::styled(app.footer(), dim)), v[3]);
@@ -514,6 +575,8 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, now: u64) {
         .position(|it| matches!(it, Item::Row(p) if *p == app.sel))
         .unwrap_or(0);
     let top = sel_line.saturating_sub(h.saturating_sub(1));
+    app.list_x = area.x..area.right();
+    let mut hits = Vec::new();
     let mut lines = Vec::new();
     // the session name is emphasised on the first row of each group
     // (counting rows above the viewport), dimmed on the rest
@@ -536,6 +599,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, now: u64) {
         if n < top || lines.len() >= h {
             continue;
         }
+        hits.push((area.y + lines.len() as u16, pos));
         let selected = pos == app.sel;
         let sname: String = r.session.chars().take(sw).collect();
         let sstyle = if first {
@@ -597,6 +661,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, now: u64) {
         }
         lines.push(Line::from(spans));
     }
+    app.list_hits = hits;
     if app.visible.is_empty() {
         lines.push(Line::styled("  (no matches)", dim));
     }
@@ -677,8 +742,8 @@ mod tests {
 
     fn screen(a: &mut App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, a, true, "line one\nline two", NOW))
-            .unwrap();
+        let p = preview::parse("line one\nline two");
+        t.draw(|f| draw(f, a, true, &p, NOW)).unwrap();
         let buf = t.backend().buffer().clone();
         (0..h)
             .map(|y| {
@@ -1052,7 +1117,7 @@ mod tests {
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         let underlined = |a: &mut App| -> Vec<u16> {
             let mut t = Terminal::new(TestBackend::new(120, 20)).unwrap();
-            t.draw(|f| draw(f, a, true, "", NOW)).unwrap();
+            t.draw(|f| draw(f, a, true, &[], NOW)).unwrap();
             let buf = t.backend().buffer().clone();
             (0..20)
                 .filter(|&y| (0..120).any(|x| buf[(x, y)].modifier.contains(Modifier::UNDERLINED)))
@@ -1141,6 +1206,190 @@ mod tests {
             );
             screen(&mut a, w, h);
         }
+    }
+
+    fn wheel(
+        kind: ratatui::crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> ratatui::crossterm::event::MouseEvent {
+        ratatui::crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// The preview in colour: SGR colours and attributes reach the cells.
+    #[test]
+    fn the_preview_renders_colours() {
+        let mut a = app();
+        let p =
+            preview::parse("\x1b[31mred\x1b[0m \x1b[1;44mbold on blue\x1b[0m \x1b[7mrev\x1b[0m");
+        let mut t = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        t.draw(|f| draw(f, &mut a, true, &p, NOW)).unwrap();
+        let buf = t.backend().buffer().clone();
+        // the side preview starts at x=101 (after its border), its text at
+        // the top (y=2, under the header and the prompt line)
+        let row: String = (101..130)
+            .map(|x| buf[(x, 2)].symbol().to_string())
+            .collect();
+        assert!(row.starts_with("red bold on blue rev"), "{row:?}");
+        assert_eq!(buf[(101, 2)].fg, Color::Red);
+        assert_eq!(buf[(105, 2)].bg, Color::Blue);
+        assert!(buf[(105, 2)].modifier.contains(Modifier::BOLD));
+        assert!(buf[(118, 2)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(104, 2)].bg, Color::Reset, "reset between spans");
+    }
+
+    /// Long lines are clipped at the edge, not wrapped; wide characters
+    /// and tabs keep the columns.
+    #[test]
+    fn preview_lines_are_clipped_not_wrapped() {
+        let mut a = app();
+        let long = format!("宽\tx{}END", "-".repeat(200));
+        let p = preview::parse(&format!("{long}\nlast"));
+        let mut t = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        t.draw(|f| draw(f, &mut a, true, &p, NOW)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let line = |y: u16| -> String {
+            (101..200)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        };
+        assert_eq!(line(3), format!("last{}", " ".repeat(95)), "not wrapped");
+        let l = line(2);
+        assert!(l.starts_with("宽"), "{l:?}");
+        assert_eq!(buf[(109, 2)].symbol(), "x", "the tab reaches column 8");
+        assert!(!l.contains("END"));
+        assert_eq!(buf[(199, 2)].symbol(), "-", "clipped at the right edge");
+    }
+
+    /// The wheel scrolls the preview, wherever the pointer is, and never
+    /// the list; moving the selection brings the preview back to the end.
+    #[test]
+    fn the_wheel_scrolls_only_the_preview() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind as K};
+        let text: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
+        let p = preview::parse(&text.join("\n"));
+        let mut a = app();
+        let draw_at = |a: &mut App| {
+            let mut t = Terminal::new(TestBackend::new(200, 50)).unwrap();
+            t.draw(|f| draw(f, a, true, &p, NOW)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..50)
+                .map(|y| {
+                    (101..200)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let s = draw_at(&mut a);
+        assert!(s[48].starts_with("line 100"), "{:?}", s[48]);
+        let sel = a.sel;
+        // over the list (x=10) and over the preview (x=150) alike
+        for x in [10, 150] {
+            assert_eq!(a.mouse(wheel(K::ScrollUp, x, 5)), Action::Redraw);
+        }
+        assert_eq!((a.sel, a.preview_scroll), (sel, 6));
+        let s = draw_at(&mut a);
+        assert!(s[48].starts_with("line 94"), "{:?}", s[48]);
+        assert!(s[2].ends_with(" ↑6 "), "the offset shows: {:?}", s[2]);
+        a.mouse(wheel(K::ScrollDown, 150, 5));
+        assert_eq!((a.sel, a.preview_scroll), (sel, 3));
+        // past the top: clamped at the next draw
+        for _ in 0..100 {
+            a.mouse(wheel(K::ScrollUp, 150, 5));
+        }
+        let s = draw_at(&mut a);
+        assert!(s[2].starts_with("line 1 "), "{:?}", s[2]);
+        assert_eq!(a.preview_scroll, 100 - 47);
+        a.mouse(wheel(K::ScrollDown, 150, 5));
+        assert_eq!(a.preview_scroll, 100 - 47 - 3, "down moves at once");
+        // keys: S-↑/S-↓ a line, S-PgUp/S-PgDn half a page, list unmoved
+        let shift = |c| KeyEvent::new(c, KeyModifiers::SHIFT);
+        a.preview_scroll = 0;
+        a.key(shift(KeyCode::Up));
+        a.key(shift(KeyCode::Up));
+        a.key(shift(KeyCode::Down));
+        assert_eq!((a.sel, a.preview_scroll), (sel, 1));
+        a.key(shift(KeyCode::PageUp));
+        assert_eq!((a.sel, a.preview_scroll), (sel, 1 + 47 / 2));
+        a.key(shift(KeyCode::PageDown));
+        assert_eq!((a.sel, a.preview_scroll), (sel, 1));
+        // a selection change resets the scroll; so does coming back
+        a.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_ne!(a.sel, sel);
+        assert_eq!(a.preview_scroll, 0);
+        a.mouse(wheel(K::ScrollUp, 150, 5));
+        a.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!((a.sel, a.preview_scroll), (sel, 0));
+        // a snapshot that keeps the selection keeps the scroll
+        a.mouse(wheel(K::ScrollUp, 150, 5));
+        let rows = a.rows.clone();
+        a.set_rows(rows);
+        assert_eq!(a.preview_scroll, 3);
+        // a left click on a row selects it; on the preview, nothing
+        draw_at(&mut a);
+        assert_eq!(
+            a.mouse(wheel(K::Down(MouseButton::Left), 150, 3)),
+            Action::None
+        );
+        assert_eq!(a.sel, sel);
+        a.mouse(wheel(K::Down(MouseButton::Left), 10, 3));
+        assert_eq!(
+            a.selected().unwrap().name,
+            "a much longer window name than fits"
+        );
+        assert_eq!(a.preview_scroll, 0);
+        // the rest of the mouse does nothing
+        for k in [
+            K::Down(MouseButton::Right),
+            K::Moved,
+            K::Up(MouseButton::Left),
+        ] {
+            assert_eq!(a.mouse(wheel(k, 10, 2)), Action::None);
+        }
+    }
+
+    /// With the preview hidden the wheel does nothing.
+    #[test]
+    fn no_preview_no_scroll() {
+        use ratatui::crossterm::event::MouseEventKind as K;
+        let mut a = app();
+        screen(&mut a, 120, 20); // small: hidden
+        assert_eq!(a.preview_rows, 0);
+        a.mouse(wheel(K::ScrollUp, 10, 5));
+        a.key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(a.preview_scroll, 0);
+        a.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        screen(&mut a, 120, 20);
+        assert!(a.preview_rows > 0);
+    }
+
+    /// The editors ignore the preview keys, and Shift-arrows in the list
+    /// don't reach the filter.
+    #[test]
+    fn preview_keys_leave_the_editors_alone() {
+        let mut a = app();
+        screen(&mut a, 200, 50);
+        a.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        for c in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            a.key(KeyEvent::new(c, KeyModifiers::SHIFT));
+        }
+        assert!(matches!(&a.mode, Mode::Rename { edit, .. } if edit.as_string() == "editor"));
+        assert_eq!(a.preview_scroll, 0);
+        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        a.key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert!(a.filter.is_empty());
+        assert_eq!(a.preview_scroll, 1);
     }
 
     /// PgDn moves by at least one row whatever the list height.
