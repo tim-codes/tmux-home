@@ -1,0 +1,478 @@
+//! The git layer against real temp repos: stray's tests carried over
+//! (`file_diff`), and one or more per spec §6 item. Every repo is a
+//! throwaway under the temp dir; no user config is read (`git_env`).
+mod common;
+use common::*;
+use std::path::Path;
+use std::time::{Duration, Instant};
+use tmux_home::git::{
+    self,
+    badge::{Phase, RepoStatus},
+    exec::{Git, GitError},
+    refs::RefsMemo,
+    repo::{self, Operation},
+    scan,
+    status::{self, file_diff},
+};
+
+fn paths(dir: &Path) -> repo::RepoPaths {
+    repo::resolve(dir).expect("a repo")
+}
+
+async fn full(dir: &Path) -> RepoStatus {
+    git::full_status(&Git::default(), &paths(dir), &mut RefsMemo::default()).await
+}
+
+// ---- file_diff (carried over from stray) ---------------------------------
+
+#[tokio::test]
+async fn file_diff_modified_tracked_file_combines_staged_and_unstaged() {
+    git_env();
+    let t = TempDir::new("modified");
+    let root = t.repo("r");
+    write(&root, "file.txt", "a\n");
+    commit_all(&root, "file");
+    // Stage one change...
+    write(&root, "file.txt", "a\nb\n");
+    git_at(&root, &["add", "file.txt"]);
+    // ...then leave a further change unstaged.
+    write(&root, "file.txt", "a\nb\nc\n");
+    let diff = file_diff(&Git::default(), &root, "MM", "file.txt").await;
+    assert!(diff.contains("+b"), "staged change:\n{diff}");
+    assert!(diff.contains("+c"), "unstaged change:\n{diff}");
+}
+
+#[tokio::test]
+async fn file_diff_untracked_file_shows_all_added_against_dev_null() {
+    git_env();
+    let t = TempDir::new("untracked");
+    let root = t.repo("r");
+    write(&root, "new.txt", "hello\nworld\n");
+    let diff = file_diff(&Git::default(), &root, "??", "new.txt").await;
+    assert!(diff.contains("/dev/null"), "diff:\n{diff}");
+    assert!(diff.contains("+hello"), "diff:\n{diff}");
+    assert!(diff.contains("+world"), "diff:\n{diff}");
+}
+
+#[tokio::test]
+async fn file_diff_rename_uses_new_path_from_arrow_notation() {
+    git_env();
+    let t = TempDir::new("rename");
+    let root = t.repo("r");
+    write(&root, "old.txt", "hello\n");
+    commit_all(&root, "old");
+    git_at(&root, &["mv", "old.txt", "new.txt"]);
+    let diff = file_diff(&Git::default(), &root, "R.", "old.txt -> new.txt").await;
+    assert!(diff.contains("new.txt"), "diff:\n{diff}");
+    assert!(diff.contains("+hello"), "diff:\n{diff}");
+}
+
+// ---- stray's collect / scan, over the async layer --------------------------
+
+#[tokio::test]
+async fn scan_finds_and_collects_repos_and_worktrees() {
+    git_env();
+    let t = TempDir::new("scan");
+    let a = t.repo("a");
+    let _b = t.repo("nested/b");
+    write(&a, "dirty.txt", "x\n");
+    git_at(&a, &["worktree", "add", "-q", "../a-wt", "-b", "wt"]);
+    let git = Git {
+        no_fsmonitor: true,
+        ..Git::with_timeout(tmux_home::git::exec::SCAN_TIMEOUT)
+    };
+    let repos = scan::inventory(&git, &t.0, 8).await;
+    let names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
+    // the worktree is listed under its main repo, not on its own
+    assert_eq!(names, ["a", "nested/b"], "{repos:#?}");
+    let a = &repos[0];
+    assert_eq!(a.status.untracked, 1);
+    assert_eq!(a.worktrees.len(), 2);
+    assert!(!a.has_remote && a.no_remote());
+    assert_eq!(a.branches.len(), 2);
+}
+
+// ---- item 1: scrubbed env, read-only, timeout ------------------------------
+
+#[tokio::test]
+async fn every_call_is_scrubbed_and_read_only() {
+    git_env();
+    let t = TempDir::new("scrub");
+    let root = t.repo("r");
+    let log = t.0.join("env.log");
+    let fake = fake_git(
+        &t.0,
+        &format!("{{ env; echo ARGS \"$@\"; }} > '{}'", log.display()),
+    );
+    // SAFETY: single-threaded tests
+    unsafe {
+        std::env::set_var("GIT_DIR", "/nonexistent/.git");
+        std::env::set_var("GIT_WORK_TREE", "/nonexistent");
+        std::env::set_var("GIT_INDEX_FILE", "/nonexistent/index");
+        std::env::set_var("TMUX_HOME_GIT", &fake);
+    }
+    let _ = Git::default().run(&root, &["status"]).await;
+    let seen = std::fs::read_to_string(&log).unwrap();
+    for gone in ["GIT_DIR=", "GIT_WORK_TREE=", "GIT_INDEX_FILE="] {
+        assert!(!seen.contains(gone), "{gone} leaked:\n{seen}");
+    }
+    for kept in [
+        "GIT_OPTIONAL_LOCKS=0",
+        "LC_ALL=C",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "ARGS --no-optional-locks",
+        "log.showSignature=false",
+    ] {
+        assert!(seen.contains(kept), "{kept} missing:\n{seen}");
+    }
+    // with the real git, the inherited GIT_DIR doesn't redirect the query
+    unsafe { std::env::remove_var("TMUX_HOME_GIT") };
+    write(&root, "u.txt", "x");
+    let st = full(&root).await;
+    assert_eq!((st.branch.as_str(), st.untracked), ("main", 1), "{st:?}");
+    unsafe {
+        std::env::remove_var("GIT_DIR");
+        std::env::remove_var("GIT_WORK_TREE");
+        std::env::remove_var("GIT_INDEX_FILE");
+    }
+}
+
+#[tokio::test]
+async fn status_never_rewrites_the_index() {
+    git_env();
+    let t = TempDir::new("ro");
+    let root = t.repo("r");
+    // a stat-dirty file: a status with optional locks would refresh the index
+    std::thread::sleep(Duration::from_millis(20));
+    write(&root, "README", "hello\n");
+    let index = root.join(".git/index");
+    let before = std::fs::metadata(&index).unwrap().modified().unwrap();
+    let st = full(&root).await;
+    assert!(!st.dirty(), "{st:?}");
+    let after = std::fs::metadata(&index).unwrap().modified().unwrap();
+    assert_eq!(before, after, "the index was written");
+    assert!(!root.join(".git/index.lock").exists());
+}
+
+#[tokio::test]
+async fn a_hung_git_times_out_and_is_killed() {
+    git_env();
+    let t = TempDir::new("hang");
+    let pid = t.0.join("pid");
+    let fake = fake_git(
+        &t.0,
+        &format!("echo $$ > '{}'; exec sleep 30", pid.display()),
+    );
+    unsafe { std::env::set_var("TMUX_HOME_GIT", &fake) };
+    let t0 = Instant::now();
+    let r = Git::with_timeout(Duration::from_millis(300))
+        .run(&t.0, &["status"])
+        .await;
+    unsafe { std::env::remove_var("TMUX_HOME_GIT") };
+    assert_eq!(r, Err(GitError::Timeout));
+    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    let pid = std::fs::read_to_string(&pid).unwrap();
+    // killed: gone, or a zombie until tokio's reaper collects it
+    wait_until("the hung git to be killed", || {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        stat.trim().is_empty() || stat.trim().starts_with('Z')
+    });
+}
+
+#[tokio::test]
+async fn the_semaphore_bounds_concurrent_gits() {
+    git_env();
+    let t = TempDir::new("gate");
+    let fake = fake_git(&t.0, "sleep 0.3");
+    unsafe { std::env::set_var("TMUX_HOME_GIT", &fake) };
+    let git = Git {
+        gate: Some(std::sync::Arc::new(tokio::sync::Semaphore::new(2))),
+        ..Git::default()
+    };
+    let t0 = Instant::now();
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let (g, d) = (git.clone(), t.0.clone());
+        set.spawn(async move { g.run(&d, &["x"]).await });
+    }
+    set.join_all().await;
+    unsafe { std::env::remove_var("TMUX_HOME_GIT") };
+    // 4 calls of 0.3 s, 2 at a time: two rounds
+    assert!(
+        t0.elapsed() >= Duration::from_millis(550),
+        "{:?}",
+        t0.elapsed()
+    );
+}
+
+// ---- item 2: untracked files always counted --------------------------------
+
+#[tokio::test]
+async fn untracked_counted_despite_show_untracked_no() {
+    git_env();
+    let t = TempDir::new("untr");
+    let root = t.repo("r");
+    git_at(&root, &["config", "status.showUntrackedFiles", "no"]);
+    write(&root, "new.txt", "x");
+    let st = full(&root).await;
+    assert_eq!(st.untracked, 1, "{st:?}");
+    assert_eq!(st.badge_text(), "main ?");
+}
+
+// ---- item 3: unpushed commits, one fork per branch -------------------------
+
+#[tokio::test]
+async fn unpushed_counts_and_keeps_twenty() {
+    git_env();
+    let t = TempDir::new("unp");
+    let root = t.repo("r");
+    with_origin(&root);
+    git_at(&root, &["switch", "-q", "-c", "work"]);
+    for i in 0..25 {
+        write(&root, "f", &i.to_string());
+        commit_all(&root, &format!("c{i}"));
+    }
+    let (n, capped, commits) = status::unpushed(&Git::default(), &root, "refs/heads/work", true)
+        .await
+        .unwrap();
+    assert_eq!((n, capped, commits.len()), (25, false, 20));
+    assert!(commits[0].ends_with(" c24"), "newest first: {commits:?}");
+    // nothing unpushed on main
+    let (n, ..) = status::unpushed(&Git::default(), &root, "refs/heads/main", true)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+// ---- item 4: the refs memo -------------------------------------------------
+
+#[tokio::test]
+async fn refs_memo_probes_once_when_nothing_changed() {
+    git_env();
+    let t = TempDir::new("memo");
+    let root = t.repo("r");
+    with_origin(&root);
+    for b in ["a", "b", "c"] {
+        git_at(&root, &["switch", "-q", "-c", b, "main"]);
+        write(&root, b, b);
+        commit_all(&root, b);
+    }
+    git_at(&root, &["switch", "-q", "main"]);
+    let (git, p) = (Git::default(), paths(&root));
+    let mut memo = RefsMemo::default();
+    assert!(memo.refresh(&git, &p).await.unwrap());
+    let first = memo.last_forks;
+    // probe + config + worktree list + 3 × log + integration checks
+    assert!(first >= 6, "{first}");
+    assert_eq!(memo.fields.stray().len(), 3);
+    // unchanged: the probe alone
+    assert!(!memo.refresh(&git, &p).await.unwrap());
+    assert_eq!(memo.last_forks, 1);
+    // one branch moves: only it is recomputed
+    git_at(&root, &["switch", "-q", "a"]);
+    write(&root, "a2", "x");
+    commit_all(&root, "a2");
+    assert!(memo.refresh(&git, &p).await.unwrap());
+    assert!(
+        memo.last_forks < first,
+        "{} forks, first {first}",
+        memo.last_forks
+    );
+    assert_eq!(
+        memo.fields.branch("a").map(|b| b.unpushed),
+        Some(2),
+        "{:?}",
+        memo.fields
+    );
+    // a push changes the remotes: recomputed, a is no longer stray
+    git_at(&root, &["push", "-q", "-u", "origin", "a"]);
+    assert!(memo.refresh(&git, &p).await.unwrap());
+    let mut stray = memo.fields.stray();
+    stray.sort();
+    assert_eq!(stray, ["b", "c"]);
+}
+
+// ---- item 5: operation in progress, conflicts ------------------------------
+
+#[tokio::test]
+async fn merge_conflict_shows_conflicts_and_the_operation() {
+    git_env();
+    let t = TempDir::new("conflict");
+    let root = t.repo("r");
+    git_at(&root, &["switch", "-q", "-c", "other"]);
+    write(&root, "README", "theirs\n");
+    commit_all(&root, "theirs");
+    git_at(&root, &["switch", "-q", "main"]);
+    write(&root, "README", "ours\n");
+    commit_all(&root, "ours");
+    let out = std::process::Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "merge", "other"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the merge conflicts");
+    let st = full(&root).await;
+    assert_eq!(st.operation, Some(Operation::Merge));
+    assert_eq!(st.conflicts, 1);
+    assert_eq!(st.badge_text(), "main ✘ ↻");
+}
+
+#[tokio::test]
+async fn stashes_from_the_reflog() {
+    git_env();
+    let t = TempDir::new("stash");
+    let root = t.repo("r");
+    for i in 0..2 {
+        write(&root, "README", &format!("change {i}\n"));
+        git_at(&root, &["stash", "-q"]);
+    }
+    assert_eq!(repo::stash_count(&root.join(".git")), 2);
+    git_at(&root, &["stash", "drop", "-q", "stash@{1}"]);
+    let st = full(&root).await;
+    assert_eq!(st.stashes, 1);
+    assert_eq!(st.badge_text(), "main $1");
+}
+
+// ---- item 6: worktrees -----------------------------------------------------
+
+#[tokio::test]
+async fn linked_worktree_flags() {
+    git_env();
+    let t = TempDir::new("wt");
+    let root = t.repo("app");
+    git_at(
+        &root,
+        &["worktree", "add", "-q", "../app.feat-x", "-b", "feat/x"],
+    );
+    git_at(
+        &root,
+        &["worktree", "add", "-q", "../elsewhere", "-b", "fix"],
+    );
+    git_at(&root, &["worktree", "add", "-q", "--detach", "../app.det"]);
+    git_at(&root, &["worktree", "lock", "../app.feat-x"]);
+    let wt = t.0.join("app.feat-x");
+    let st = full(&wt).await;
+    assert!(st.linked && st.locked && !st.mismatch, "{st:?}");
+    assert_eq!(st.main_root.as_deref(), root.to_str());
+    assert_eq!(st.badge_text(), "feat/x (wt) ⊞");
+    let st = full(&t.0.join("elsewhere")).await;
+    assert!(st.mismatch, "not named after its branch: {st:?}");
+    assert_eq!(st.badge_text(), "fix (wt) ⚑");
+    let st = full(&t.0.join("app.det")).await;
+    assert!(st.detached, "{st:?}");
+    assert!(st.badge_text().ends_with(" (wt) ⊘"), "{}", st.badge_text());
+    // the main worktree counts its linked ones
+    let st = full(&root).await;
+    assert_eq!((st.linked, st.worktrees), (false, 3));
+    assert_eq!(st.badge_text(), "main");
+    // a worktree whose directory is gone is prunable (seen from the main)
+    std::fs::remove_dir_all(t.0.join("elsewhere")).unwrap();
+    let mut memo = RefsMemo::default();
+    memo.refresh(&Git::default(), &paths(&root)).await.unwrap();
+    let gone = memo
+        .fields
+        .worktrees
+        .iter()
+        .find(|w| w.branch.as_deref() == Some("fix"))
+        .unwrap();
+    assert!(gone.missing);
+}
+
+// ---- item 7: default branch, read-only --------------------------------------
+
+#[tokio::test]
+async fn default_branch_from_config_remote_head_or_inference() {
+    git_env();
+    let t = TempDir::new("default");
+    let root = t.repo("r");
+    git_at(&root, &["switch", "-q", "-c", "dev"]);
+    // local inference: main
+    assert_eq!(full(&root).await.default_branch.as_deref(), Some("main"));
+    // origin/HEAD wins
+    with_origin(&root);
+    git_at(&root, &["push", "-q", "origin", "dev"]);
+    git_at(&root, &["remote", "set-head", "origin", "dev"]);
+    assert_eq!(full(&root).await.default_branch.as_deref(), Some("dev"));
+    // worktrunk's setting wins over both
+    git_at(&root, &["config", "worktrunk.default-branch", "release"]);
+    assert_eq!(full(&root).await.default_branch.as_deref(), Some("release"));
+    // nothing written back
+    git_at(&root, &["config", "--unset", "worktrunk.default-branch"]);
+    full(&root).await;
+    let cfg = std::fs::read_to_string(root.join(".git/config")).unwrap();
+    assert!(!cfg.contains("worktrunk"), "{cfg}");
+}
+
+// ---- item 8: stray branches and integration --------------------------------
+
+#[tokio::test]
+async fn stray_branches_exclude_integrated_ones() {
+    git_env();
+    let t = TempDir::new("stray");
+    let root = t.repo("r");
+    with_origin(&root);
+    // merged into local main (main not pushed yet): integrated, ancestor
+    git_at(&root, &["switch", "-q", "-c", "merged"]);
+    write(&root, "m", "m");
+    commit_all(&root, "m");
+    git_at(&root, &["switch", "-q", "main"]);
+    git_at(&root, &["merge", "-q", "--ff-only", "merged"]);
+    // squash-merged: main's tree equals the branch's
+    git_at(&root, &["switch", "-q", "-c", "squashed"]);
+    write(&root, "s", "s");
+    commit_all(&root, "s1");
+    write(&root, "s", "s2");
+    commit_all(&root, "s2");
+    git_at(&root, &["switch", "-q", "main"]);
+    git_at(&root, &["merge", "-q", "--squash", "squashed"]);
+    git_at(&root, &["commit", "-q", "-m", "squash"]);
+    git_at(&root, &["push", "-q", "origin", "main"]);
+    // real stray work
+    git_at(&root, &["switch", "-q", "-c", "spike"]);
+    write(&root, "x", "x");
+    commit_all(&root, "spike");
+    // pushed, then its upstream deleted: gone, still stray
+    git_at(&root, &["switch", "-q", "-c", "old", "main"]);
+    write(&root, "o", "o");
+    commit_all(&root, "old");
+    git_at(&root, &["push", "-q", "-u", "origin", "old"]);
+    write(&root, "o", "o2");
+    commit_all(&root, "old2");
+    git_at(&root, &["push", "-q", "origin", "--delete", "old"]);
+    git_at(&root, &["switch", "-q", "main"]);
+    let st = full(&root).await;
+    let mut names = st.stray_names.clone();
+    names.sort();
+    assert_eq!(names, ["old", "spike"], "{st:?}");
+    assert_eq!(st.badge_text(), "main | ⚠2");
+}
+
+// ---- fast-first stages -------------------------------------------------------
+
+#[tokio::test]
+async fn stages_fill_the_status_in_order() {
+    git_env();
+    let t = TempDir::new("stages");
+    let root = t.repo("r");
+    with_origin(&root);
+    write(&root, "README", "edit\n");
+    let p = paths(&root);
+    let mut st = RepoStatus::default();
+    git::apply_head(&mut st, &p);
+    assert_eq!((st.branch.as_str(), st.phase), ("main", Phase::Head));
+    assert_eq!(st.badge_text(), "main", "no sync claim before status");
+    let s = git::read_status(&Git::default(), &p).await.unwrap();
+    git::apply_status(&mut st, &s);
+    assert_eq!(st.phase, Phase::Status);
+    assert_eq!(st.badge_text(), "main ! |");
+    let mut memo = RefsMemo::default();
+    memo.refresh(&Git::default(), &p).await.unwrap();
+    git::apply_refs(&mut st, &memo.fields, &p);
+    assert_eq!(st.phase, Phase::Refs);
+    assert_eq!(st.default_branch.as_deref(), Some("main"));
+    assert!(st.has_remote);
+}
