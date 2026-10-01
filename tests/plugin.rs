@@ -198,6 +198,36 @@ fn missing_binary_builds_once_across_reloads() {
     wait_until("that build finished", || !lock.exists());
 }
 
+/// A lock left by a dead build whose pid now belongs to another live
+/// process (here: this test) doesn't block builds: its start time differs.
+#[test]
+fn a_lock_with_a_reused_pid_is_taken_over() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    let plugin = plugin_copy();
+    let lock = plugin.path().join("target/.building");
+    std::fs::create_dir_all(&lock).unwrap();
+    std::fs::write(lock.join("pid"), std::process::id().to_string()).unwrap();
+    std::fs::write(lock.join("start"), "Thu Jan  1 00:00:00 1970").unwrap();
+    let stub = tempfile::tempdir().unwrap();
+    let count = stub.path().join("count");
+    let cargo = stub.path().join("cargo");
+    std::fs::write(
+        &cargo,
+        format!("#!/bin/sh\necho run >>'{}'\n", count.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    run_copy(
+        &s,
+        plugin.path(),
+        &format!("{}:/usr/bin:/bin", stub.path().display()),
+    );
+    wait_until("the build started", || count.exists());
+    wait_until("the build finished", || !lock.exists());
+}
+
 /// No cargo: no build is started and the key says how to build it.
 #[test]
 fn missing_cargo_says_so_and_builds_nothing() {

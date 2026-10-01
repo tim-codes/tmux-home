@@ -40,8 +40,8 @@ q() {
 # A missing binary is built in the background unless TMUX_HOME_BIN names it
 # (tests) or there is no cargo. BUILD_LOCK is held (a directory, created
 # atomically) while a build runs, so reloading the config meanwhile doesn't
-# start another; it records the build's pid, and a lock whose build died
-# (e.g. killed with the server) is taken over.
+# start another; it records the build's pid and start time, and a lock whose
+# build died (e.g. killed with the server) is taken over.
 BUILD_LOG="$CURRENT_DIR/target/build.log"
 BUILD_LOCK="$CURRENT_DIR/target/.building"
 cargo=
@@ -83,17 +83,19 @@ elif [[ -n $cargo ]]; then
 	# First load without a build (spec section 10): build in the background.
 	mkdir -p "$CURRENT_DIR/target"
 	if ! mkdir "$BUILD_LOCK" 2>/dev/null; then
-		# held: by a live build, or by one just starting (no pid yet) unless
-		# that start is over a minute old (its job never ran)
+		# Held by a live build: its pid runs and started when the build's did
+		# (a pid alone can be reused). Or by one just starting (no start time
+		# yet) unless that start is over a minute old (its job never ran).
 		pid=$(cat "$BUILD_LOCK/pid" 2>/dev/null || true)
-		if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
+		start=$(cat "$BUILD_LOCK/start" 2>/dev/null || true)
+		if [[ -n $pid && -n $start && $(ps -o lstart= -p "$pid" 2>/dev/null) == "$start" ]]; then
 			exit 0
-		elif [[ -z $pid && -z $(find "$BUILD_LOCK" -maxdepth 0 -mmin +1) ]]; then
+		elif [[ -z $start && -z $(find "$BUILD_LOCK" -maxdepth 0 -mmin +1) ]]; then
 			exit 0
 		fi
 		rm -rf "$BUILD_LOCK"
 		mkdir "$BUILD_LOCK" 2>/dev/null || exit 0
 	fi
 	lock_q=$(q "$BUILD_LOCK")
-	t run-shell -b "echo \$\$ >$lock_q/pid; cd $(q "$CURRENT_DIR") && $(q "$cargo") build --release >$(q "$BUILD_LOG") 2>&1; rm -rf $lock_q"
+	t run-shell -b "echo \$\$ >$lock_q/pid; ps -o lstart= -p \$\$ >$lock_q/start; cd $(q "$CURRENT_DIR") && $(q "$cargo") build --release >$(q "$BUILD_LOG") 2>&1; rm -rf $lock_q"
 fi
