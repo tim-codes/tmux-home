@@ -7,6 +7,13 @@ use std::{path::PathBuf, process::Command};
 
 const US: char = '\x1f';
 
+/// tmux format-expands names and paths given to `rename-window`,
+/// `new-window -n/-c`, `new-session -s/-c` and `split-window -c` (so `#(…)`
+/// would even run a shell command); doubling `#` makes them literal.
+pub fn literal(s: &str) -> String {
+    s.replace('#', "##")
+}
+
 #[derive(Clone, Debug)]
 pub struct Tx {
     pub socket: PathBuf,
@@ -80,12 +87,13 @@ impl Tx {
     }
 
     pub fn rename(&self, wid: &str, name: &str) -> anyhow::Result<()> {
-        self.run(&["rename-window", "-t", wid, "--", name])?;
+        self.run(&["rename-window", "-t", wid, "--", &literal(name)])?;
         Ok(())
     }
 
     pub fn reset_name(&self, wid: &str) -> anyhow::Result<()> {
-        self.run(&["set-option", "-w", "-t", wid, "-u", "automatic-rename"])?;
+        // `on`, not unset: unset inherits the global value, which may be off
+        self.run(&["set-option", "-w", "-t", wid, "automatic-rename", "on"])?;
         Ok(())
     }
 
@@ -106,6 +114,7 @@ impl Tx {
 
     /// New window after `after`, in `cwd`; returns its ID.
     pub fn new_window_after(&self, after: &str, cwd: &str, name: &str) -> anyhow::Result<String> {
+        let (cwd, name) = (literal(cwd), literal(name));
         let mut args = vec![
             "new-window",
             "-a",
@@ -117,10 +126,10 @@ impl Tx {
             after,
         ];
         if !cwd.is_empty() {
-            args.extend(["-c", cwd]);
+            args.extend(["-c", cwd.as_str()]);
         }
         if !name.is_empty() {
-            args.extend(["-n", name]);
+            args.extend(["-n", name.as_str()]);
         }
         self.line(&args)
     }
@@ -296,20 +305,37 @@ impl Tx {
     /// neighbour, else at the end; recreating its session if gone.
     /// `Ok(None)` when the stack is empty.
     pub fn reopen(&self, store: &Store) -> anyhow::Result<Option<String>> {
+        self.reopen_with(store, Tx::finish)
+    }
+
+    /// `reopen` with the steps after the window's creation (`finish`)
+    /// replaceable, so tests can make them fail.
+    #[doc(hidden)]
+    pub fn reopen_with(
+        &self,
+        store: &Store,
+        finish: impl FnOnce(&Tx, &str, &ClosedWindow) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<String>> {
         let Some(e) = store.pop()? else {
             return Ok(None);
         };
-        match self.rebuild(&e) {
-            Ok(w) => Ok(Some(w)),
+        // only a failed create puts the entry back: once the window exists,
+        // un-popping would make the next reopen create a duplicate
+        let new = match self.create(&e) {
+            Ok(w) => w,
             Err(err) => {
                 let _ = store.unpop(e);
-                Err(err)
+                return Err(err);
             }
-        }
+        };
+        // the rest is best-effort: the window is already back
+        let _ = finish(self, &new, &e);
+        Ok(Some(new))
     }
 
-    fn rebuild(&self, e: &ClosedWindow) -> anyhow::Result<String> {
-        let first = e.paths.first().cloned().unwrap_or_else(|| "/".into());
+    /// Create the window (and its session if gone); returns its ID.
+    fn create(&self, e: &ClosedWindow) -> anyhow::Result<String> {
+        let first = literal(e.paths.first().map_or("/", String::as_str));
         let fmt = ["-P", "-F", "#{window_id}", "-c", first.as_str()];
         let new_in = |extra: &[&str]| -> anyhow::Result<String> {
             let mut a = vec!["new-window", "-d"];
@@ -341,7 +367,8 @@ impl Tx {
         } else {
             let mut a = vec!["new-session", "-d"];
             a.extend(fmt);
-            a.extend(["-s", e.session.as_str()]);
+            let sname = literal(&e.session);
+            a.extend(["-s", sname.as_str()]);
             // size it like the layout it is about to get
             let size = e.layout.split(',').nth(1).unwrap_or("").to_string();
             let wh: Vec<&str> = size.split('x').collect();
@@ -359,6 +386,12 @@ impl Tx {
             ]);
             new
         };
+        Ok(new)
+    }
+
+    /// Panes, layout, name and active pane of a freshly created window.
+    fn finish(&self, new: &str, e: &ClosedWindow) -> anyhow::Result<()> {
+        let new = new.to_string();
         // split the LAST pane each time so pane order matches the paths;
         // retile as we go so small windows keep room for the next split
         let mut pane = self.display(&new, "#{pane_id}")?;
@@ -372,7 +405,7 @@ impl Tx {
                 "-t",
                 &pane,
                 "-c",
-                p,
+                &literal(p),
             ]) {
                 Ok(id) => pane = id,
                 Err(_) => break,
@@ -391,7 +424,7 @@ impl Tx {
         if let Some(p) = panes.lines().nth(e.active) {
             let _ = self.run(&["select-pane", "-t", p]);
         }
-        Ok(new)
+        Ok(())
     }
 }
 
