@@ -41,6 +41,24 @@ pub fn badge_spans(g: &RepoStatus) -> Vec<Span<'static>> {
         .collect()
 }
 
+/// The badge spans that fit in `room` columns: whole pieces, dropped from
+/// the right (the branch goes last), never part of one.
+pub fn fit_badge(mut spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
+    while spans.iter().map(Span::width).sum::<usize>() > room {
+        spans.pop();
+    }
+    spans
+}
+
+/// `s` in at most `n` columns: cut with `…`, or nothing when `n` is 0.
+pub fn clip_to(s: &str, n: usize) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        super::agents::clip(s, n)
+    }
+}
+
 fn plural(n: u32, one: &str) -> String {
     format!("{n} {one}")
 }

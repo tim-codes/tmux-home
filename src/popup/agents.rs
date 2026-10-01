@@ -38,12 +38,19 @@ pub fn clip(s: &str, n: usize) -> String {
 /// The status cell of an agent window's row, in place of command + path:
 /// `● running    12m  claude ×2  feat/x (wt) +!  plan  <reason or prompt>`.
 /// `badge` is the git badge of the lead agent's repo (`popup::git`); without
-/// one, a worktree the agent reported shows as `(wt) <branch>`.
+/// one, a worktree the agent reported shows as `(wt) <branch>`. The cell
+/// has `room` columns: the badge keeps whole pieces that fit after status,
+/// time and kind; what follows (mode, reason, prompt) is clipped by the row.
 pub fn row_cell(
     a: &WindowAgents,
     now: u64,
     badge: Option<Vec<Span<'static>>>,
+    room: usize,
 ) -> Vec<Span<'static>> {
+    let used = |v: &Vec<Span<'static>>| v.iter().map(Span::width).sum::<usize>();
+    let fit = |b: Option<Vec<Span<'static>>>, v: &Vec<Span<'static>>| {
+        b.map(|b| super::git::fit_badge(b, room.saturating_sub(used(v))))
+    };
     let lead = a.lead();
     let st = &lead.state;
     let mut v = Vec::new();
@@ -53,7 +60,7 @@ pub fn row_cell(
             dim(),
         ));
         v.push(Span::styled(format!("  {}", st.kind.name()), dim()));
-        v.extend(badge.unwrap_or_default());
+        v.extend(fit(badge, &v).unwrap_or_default());
         return v;
     }
     let s = st.status;
@@ -70,7 +77,7 @@ pub fn row_cell(
         String::new()
     };
     v.push(Span::raw(format!("  {}{count}", st.kind.name())));
-    match (badge, &st.worktree) {
+    match (fit(badge, &v), &st.worktree) {
         (Some(b), _) => v.extend(b),
         (None, Some(wt)) => v.push(Span::styled(format!("  (wt) {}", wt.branch), dim())),
         (None, None) => {}

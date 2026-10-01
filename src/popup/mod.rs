@@ -573,11 +573,21 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, now: u64) {
             ),
         ];
         let badge = r.git.as_ref().map(|(_, g)| git::badge_spans(g));
+        let used: usize = spans.iter().map(Span::width).sum();
+        let room = width.saturating_sub(used);
         match &r.agents {
-            Some(a) => spans.extend(agents::row_cell(a, now, badge)),
+            Some(a) => spans.extend(agents::row_cell(a, now, badge, room)),
             None => {
-                spans.push(Span::styled(format!("  {:<10}  {}", r.cmd, r.path), dim));
-                spans.extend(badge.unwrap_or_default());
+                // the path gives way to the badge first, then the badge
+                // drops whole pieces
+                let cmd = format!("  {:<10}  ", r.cmd);
+                let badge = badge.unwrap_or_default();
+                let bw: usize = badge.iter().map(Span::width).sum();
+                let room = room.saturating_sub(Span::raw(cmd.as_str()).width());
+                let path = git::clip_to(&r.path, room.saturating_sub(bw));
+                let pw = Span::raw(path.as_str()).width();
+                spans.push(Span::styled(format!("{cmd}{path}"), dim));
+                spans.extend(git::fit_badge(badge, room.saturating_sub(pw)));
             }
         }
         if selected {
@@ -888,6 +898,66 @@ mod tests {
         }
         assert_eq!(a.visible.len(), 1);
         assert_eq!(a.rows[a.visible[0]].name, "old");
+    }
+
+    /// Narrow terminals: the path gives way first, then whole badge pieces
+    /// from the right — never part of one (`⚠12` must not become `⚠1`).
+    #[test]
+    fn badges_are_clipped_by_whole_pieces() {
+        let mut snap = git_snap();
+        snap.git.repos.get_mut("/home/u/dev/app").unwrap().stray = 12;
+        let shell_pieces = ["main", "+!?", "⇡2", "⇣1", "$1", "⚠12", "↻"];
+        let agent_pieces = ["fix/x", "(wt)", "!", "|"];
+        for w in [80u16, 76, 72, 68, 64, 60, 56, 52, 48, 44] {
+            let mut a = app_of(&snap);
+            let s = screen(&mut a, w, 50);
+            let row = |pat: &str| {
+                s.lines()
+                    .find(|l| l.contains(pat))
+                    .unwrap_or_else(|| panic!("{w}: no {pat:?} in\n{s}"))
+                    .to_string()
+            };
+            let shell = row(" shell ");
+            // after the command: the (clipped, maybe gone) path, the badge
+            let tail: Vec<&str> = shell
+                .split_whitespace()
+                .skip_while(|t| *t != "fish")
+                .skip(1)
+                .skip_while(|t| t.starts_with('~') || t.starts_with('…'))
+                .collect();
+            assert!(
+                tail.iter().all(|t| shell_pieces.contains(t)),
+                "{w}: partial piece in {shell:?}"
+            );
+            assert_eq!(
+                tail[..],
+                shell_pieces[..tail.len()],
+                "{w}: pieces dropped from the right: {shell:?}"
+            );
+            assert!(shell.chars().count() <= w as usize);
+            if w >= 80 {
+                assert!(shell.ends_with("main +!? ⇡2 ⇣1 $1 ⚠12 ↻"), "{w}: {shell:?}");
+                assert!(shell.contains('…'), "{w}: the path was clipped: {shell:?}");
+            }
+            // agent rows: the badge after the kind, whole pieces only
+            for l in s
+                .lines()
+                .filter(|l| l.contains(" fix ") && l.contains("claude"))
+            {
+                let tail: Vec<&str> = l
+                    .split_whitespace()
+                    .skip_while(|t| *t != "claude")
+                    .skip(1)
+                    // up to the mode / reason, which the row may cut
+                    .take_while(|t| !"plan".starts_with(t) && !"permission".starts_with(t))
+                    .collect();
+                assert_eq!(
+                    tail[..],
+                    agent_pieces[..tail.len()],
+                    "{w}: agent badge {l:?}"
+                );
+            }
+        }
     }
 
     #[test]
