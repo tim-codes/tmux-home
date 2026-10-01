@@ -44,16 +44,31 @@ cargo build --release
 ```
 
 If the plugin loads before it is built, it starts that build in the
-background. Until the build finishes, the key shows a one-line
-`tmux-home: not built yet …` message instead of the popup. A build that
-finishes later is picked up on the next key press, with no reload. Rebuild
-after pulling an update.
+background, writing its output to `target/build.log`. Only one build runs at
+a time: reloading the config while it runs starts no other. Until the build
+finishes, the key shows a one-line `tmux-home: not built yet …` message
+naming that log instead of the popup; without `cargo` on `PATH` no build is
+started and the message says so. A build that finishes later is picked up on
+the next key press, with no reload. Rebuild after pulling an update.
 
 Loading the plugin also starts the daemon, one per tmux server; it exits
 with the server. The popup subscribes to it for live updates. If the daemon
 is down, the popup reads tmux itself (the header shows `(direct)`) and starts
-a new daemon in the background. `tmux-home status` prints `●` when the
-daemon answers and `○` when it doesn't, for a status line.
+a new daemon in the background. The daemon's errors go to
+`<state root>/<server key>/daemon.log` (see below), moved to `daemon.log.1`
+once it reaches 1 MB.
+
+Each client tells the daemon its build (the version plus the git commit, and
+a hash of the sources when the tree is dirty or there is no git), so after a
+rebuild — even at the same version — the old daemon exits on the first
+request and the client starts the new one.
+
+`tmux-home status` prints `●` when the daemon answers and `○` when it
+doesn't, for a status line. It never starts a daemon that is simply down,
+so after the server's daemon dies the chip shows `○` until something (the
+popup, `tmux-home query`) starts a new one. After a rebuild, the old
+daemon's `Restart` reply makes `status` itself start the new build's daemon:
+the chip shows `○` once, then `●` from its next refresh.
 
 ## Keys
 
@@ -78,7 +93,11 @@ daemon answers and `○` when it doesn't, for a status line.
 (bash, zsh, fish, sh, …; sidebar panes don't count). Otherwise it asks
 inline, for example `close "api"? running: nvim, node (y/N)`, and only `y`
 closes; any other key, `⏎` or `Esc` cancels and keeps the filter. A job
-stopped with `^z` counts as running (`vim (stopped)`). The session's last
+stopped with `^z` counts as running (`vim (stopped)`). A job running in the
+background (`make &`) does not: the pane sits at its prompt, so `^x` closes it
+without asking and the job dies with the window. (Shells and prompt helpers
+keep their own background processes on the terminal, so tmux-home can't tell
+your jobs from theirs reliably.) The session's last
 window always asks (`session "x" will end`); if that is the session you are
 in, tmux-home first moves you to another session so the popup isn't
 detached. The last window on the server is never closed.
@@ -91,7 +110,7 @@ is gone. The popup stays open with the cursor on it. The stack lives in
 `<state root>/<server key>/closed.json`, where the state root is
 `${XDG_STATE_HOME:-~/.local/state}/tmux-home` (override with
 `TMUX_HOME_STATE_DIR`). A `closed.json` that can't be read is renamed to
-`closed.json.corrupt` and the stack starts empty.
+`closed.json.corrupt.<timestamp>` and the stack starts empty.
 
 ## Tests
 
