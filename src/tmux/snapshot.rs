@@ -1,6 +1,6 @@
 use super::Tmux;
 use serde::{Deserialize, Serialize};
-use std::hash::{Hash, Hasher};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Snapshot {
@@ -10,14 +10,41 @@ pub struct Snapshot {
     pub clients: Vec<Client>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+/// One change-detection hash per snapshot section. The daemon pushes a
+/// snapshot only when one of these differs from the last pushed one, so a
+/// section whose data changes on every read (an agent's elapsed time, a git
+/// `checked_at`) must hash only its stable fields, or the daemon would push
+/// on every poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sections {
+    /// Sessions, windows, panes and clients.
+    pub tmux: u64,
+}
+
+impl Snapshot {
+    pub fn sections(&self) -> Sections {
+        // Exhaustive on purpose: a field added to `Snapshot` fails to compile
+        // here until it is given a section hash (or explicitly ignored).
+        let Snapshot {
+            sessions,
+            windows,
+            panes,
+            clients,
+        } = self;
+        let mut h = DefaultHasher::new();
+        (sessions, windows, panes, clients).hash(&mut h);
+        Sections { tmux: h.finish() }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
 pub struct Session {
     pub id: String,
     pub name: String,
     pub attached: u32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
 pub struct Window {
     pub id: String,
     pub session_id: String,
@@ -27,7 +54,7 @@ pub struct Window {
     pub active: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
 pub struct Pane {
     pub id: String,
     pub window_id: String,
@@ -42,7 +69,7 @@ pub struct Pane {
     pub role: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
 pub struct Client {
     pub name: String,
     pub tty: String,
@@ -62,44 +89,43 @@ const REC_END: &str = "\x1e\n";
 const PANE_FMT: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{@pane_role}\x1f#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
 const CLIENT_FMT: &str = "#{client_name}\x1f#{client_tty}\x1f#{session_id}\x1f#{client_flags}\x1e";
 
-/// Reads a full snapshot of the tmux server and a hash of its contents.
-///
-/// The hash is computed over the *parsed* `Snapshot`, not the raw tmux output:
-/// `list-clients` output includes tmux-home's own control-mode client, which
-/// `parse` filters out. Hashing the raw output would therefore report changes
-/// that no user-visible state actually underwent.
+/// Reads a full snapshot of the tmux server (synchronously; the daemon
+/// uses `read_snapshot_async`).
 ///
 /// A server with no sessions is alive and yields an *empty* snapshot: tmux
 /// answers `list-panes -a`/`list-clients` there with "no current target",
 /// and that is exactly the state the server is in while tmux.conf (and so
 /// TPM's run of tmux-home.tmux) executes. An error is returned only when the
 /// server itself can't be reached (`list-sessions` fails too).
-pub async fn read_snapshot(t: &Tmux) -> anyhow::Result<(Snapshot, u64)> {
-    let snapshot = match read_parsed(t).await {
-        Ok(s) => s,
-        Err(e) => match session_count(t).await {
-            Err(_) => return Err(e), // server unreachable
-            Ok(0) => Snapshot::default(),
+pub fn read_snapshot(t: &Tmux) -> anyhow::Result<Snapshot> {
+    match read_parsed(t) {
+        Ok(s) => Ok(s),
+        Err(e) => match session_count(t) {
+            Err(_) => Err(e), // server unreachable
+            Ok(0) => Ok(Snapshot::default()),
             // a session appeared between the two reads: read once more
-            Ok(_) => read_parsed(t).await?,
+            Ok(_) => read_parsed(t),
         },
-    };
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_vec(&snapshot)?.hash(&mut h);
-    Ok((snapshot, h.finish()))
+    }
 }
 
-async fn read_parsed(t: &Tmux) -> anyhow::Result<Snapshot> {
-    let panes = t.run(&["list-panes", "-a", "-F", PANE_FMT]).await?;
-    let clients = t.run(&["list-clients", "-F", CLIENT_FMT]).await?;
+/// `read_snapshot` off the async executor.
+pub async fn read_snapshot_async(t: &Tmux) -> anyhow::Result<Snapshot> {
+    let t = t.clone();
+    tokio::task::spawn_blocking(move || read_snapshot(&t)).await?
+}
+
+fn read_parsed(t: &Tmux) -> anyhow::Result<Snapshot> {
+    let panes = t.run(&["list-panes", "-a", "-F", PANE_FMT])?;
+    let clients = t.run(&["list-clients", "-F", CLIENT_FMT])?;
     Ok(parse(&panes, &clients))
 }
 
 /// Number of sessions on the server; an error means the server is
 /// unreachable (unlike `has-session`/`list-panes`, `list-sessions` succeeds
 /// on a live server with no sessions).
-pub async fn session_count(t: &Tmux) -> anyhow::Result<usize> {
-    let out = t.run(&["list-sessions", "-F", "#{session_id}"]).await?;
+pub fn session_count(t: &Tmux) -> anyhow::Result<usize> {
+    let out = t.run(&["list-sessions", "-F", "#{session_id}"])?;
     Ok(out.lines().filter(|l| !l.is_empty()).count())
 }
 

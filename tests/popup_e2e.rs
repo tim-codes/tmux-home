@@ -213,7 +213,7 @@ fn cursor_opens_on_the_window_selected_just_before() {
         let Ok(mut c) = UnixStream::connect(&paths.sock) else {
             return false;
         };
-        let q = format!("{{\"op\":\"query\",\"v\":\"{}\"}}\n", tmux_home::VERSION);
+        let q = format!("{{\"op\":\"query\",\"v\":\"{}\"}}\n", tmux_home::BUILD_ID);
         let mut line = String::new();
         c.write_all(q.as_bytes()).is_ok()
             && BufReader::new(c).read_line(&mut line).is_ok()

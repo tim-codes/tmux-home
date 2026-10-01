@@ -2,12 +2,27 @@ mod common;
 
 use std::time::Duration;
 use tmux_home::{
-    VERSION,
-    ipc::{Reply, Request, read_msg, write_msg},
+    BUILD_ID, VERSION,
+    client::{Answer, ask},
+    ipc::Request,
 };
 
-#[tokio::test]
-async fn degraded_then_daemon() {
+/// `client::snapshot` until it is served by a daemon, for up to ~5 s.
+fn wait_daemon_serving(s: &common::TestServer) -> bool {
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if tmux_home::client::snapshot(&s.socket, Duration::from_millis(150))
+            .unwrap()
+            .1
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn degraded_then_daemon() {
     // SAFETY: tests that touch process env run single-threaded per process
     // (RUST_TEST_THREADS=1 in .cargo/config.toml), same pattern as TestEnv.
     unsafe {
@@ -16,24 +31,11 @@ async fn degraded_then_daemon() {
     let _env = common::TestEnv::new();
     let s = common::TestServer::start();
     // no daemon yet: direct read, and a daemon gets started in the background
-    let (snap, from_daemon) = tmux_home::client::snapshot(&s.socket, Duration::from_millis(150))
-        .await
-        .unwrap();
+    let (snap, from_daemon) =
+        tmux_home::client::snapshot(&s.socket, Duration::from_millis(150)).unwrap();
     assert_eq!(snap.windows.len(), 1);
     assert!(!from_daemon);
-    let mut ok = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if tmux_home::client::snapshot(&s.socket, Duration::from_millis(150))
-            .await
-            .unwrap()
-            .1
-        {
-            ok = true;
-            break;
-        }
-    }
-    assert!(ok, "background daemon never came up");
+    assert!(wait_daemon_serving(&s), "background daemon never came up");
     s.tmux(&["kill-server"]); // daemon exits with it (covered in daemon tests)
 }
 
@@ -56,53 +58,60 @@ fn query_cli_prints_json() {
     s.tmux(&["kill-server"]);
 }
 
-/// Exercises the client's `Reply::Restart` arm against a daemon that is up
-/// and answering: an in-process daemon built at a *different* version
-/// replies `Restart` to this client's `VERSION`, removes its socket and
-/// exits. `client::snapshot` must wait for that socket to go before spawning
-/// the replacement (or the replacement's `try_lock` can lose to the old
-/// flock and exit silently), return degraded data, and a real daemon must be
-/// serving within ~5 s.
-#[tokio::test]
-async fn restart_reply_spawns_replacement_daemon() {
+/// A daemon of another *build* of the same package version (a rebuild):
+/// starts in-process answering as that build, and waits until it serves.
+fn old_build_daemon(
+    s: &common::TestServer,
+) -> (
+    tokio::runtime::Runtime,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let old = format!("{VERSION}+g000000000000");
+    assert_ne!(BUILD_ID, old);
+    assert!(BUILD_ID.starts_with(&format!("{VERSION}+")));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = rt.spawn(tmux_home::daemon::run_with_version(
+        s.socket.clone(),
+        tmux_home::tmux::source::SourceKind::Poll,
+        old.clone(),
+    ));
+    // Wait until it is up and serving (a request as *its* build gets a
+    // snapshot, not a Restart), so the client certainly reaches it rather
+    // than falling into the no-daemon arm.
+    let req = Request::Query { v: old };
+    let mut up = false;
+    for _ in 0..100 {
+        if let Answer::Snapshot { .. } = ask(&s.socket, &req, Duration::from_millis(500)) {
+            up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(up, "old-build daemon never came up");
+    (rt, d)
+}
+
+/// Pass 3 exit test: a rebuild at the same package version replaces the
+/// running daemon. The old build's daemon replies `Restart` to this build's
+/// ID, removes its socket and exits; `client::snapshot` waits for that
+/// socket to go before spawning the replacement (or the replacement's
+/// `try_lock` can lose to the old flock and exit silently), returns
+/// degraded data, and the new build's daemon is serving within ~5 s.
+#[test]
+fn rebuild_at_the_same_version_replaces_the_daemon() {
     // SAFETY: see degraded_then_daemon above.
     unsafe {
         std::env::set_var("TMUX_HOME_BIN", env!("CARGO_BIN_EXE_tmux-home"));
     }
     let _env = common::TestEnv::new();
     let s = common::TestServer::start();
-    const OLD: &str = "0.0.0-old";
-    assert_ne!(VERSION, OLD);
-    let old = tokio::spawn(tmux_home::daemon::run_with_version(
-        s.socket.clone(),
-        tmux_home::tmux::source::SourceKind::Poll,
-        OLD,
-    ));
-
-    // Wait until the old daemon is up and serving (a request at *its*
-    // version gets a snapshot, not a Restart), so the client below
-    // certainly reaches it rather than falling into the no-daemon arm.
-    let paths = tmux_home::paths::Paths::for_socket(&s.socket).unwrap();
-    let mut up = false;
-    for _ in 0..100 {
-        if let Ok(stream) = tokio::net::UnixStream::connect(&paths.sock).await {
-            let (r, mut w) = stream.into_split();
-            write_msg(&mut w, &Request::Query { v: OLD.into() })
-                .await
-                .unwrap();
-            let mut r = tokio::io::BufReader::new(r);
-            if let Ok(Some(Reply::Snapshot { .. })) = read_msg::<_, Reply>(&mut r).await {
-                up = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(up, "old-version daemon never came up");
-
-    let (snap, from_daemon) = tmux_home::client::snapshot(&s.socket, Duration::from_millis(500))
-        .await
-        .unwrap();
+    let (rt, old) = old_build_daemon(&s);
+    let (snap, from_daemon) =
+        tmux_home::client::snapshot(&s.socket, Duration::from_millis(500)).unwrap();
     assert!(
         !from_daemon,
         "a Restart reply must fall back to a direct read"
@@ -110,41 +119,51 @@ async fn restart_reply_spawns_replacement_daemon() {
     assert_eq!(snap.windows.len(), 1);
     // The old daemon only exits on Restart (or its server going, which it
     // hasn't): its having exited shows the Restart arm ran.
-    tokio::time::timeout(Duration::from_secs(2), old)
-        .await
+    rt.block_on(async { tokio::time::timeout(Duration::from_secs(2), old).await })
         .expect("old daemon should exit after replying Restart")
         .unwrap()
         .unwrap();
+    assert!(wait_daemon_serving(&s), "new build's daemon never came up");
+    s.tmux(&["kill-server"]);
+}
 
-    let mut ok = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if tmux_home::client::snapshot(&s.socket, Duration::from_millis(150))
-            .await
-            .unwrap()
-            .1
-        {
-            ok = true;
-            break;
-        }
-    }
-    assert!(ok, "replacement daemon never came up after Restart");
+/// `status` shows ○ for a daemon of an old build, and respawns the current
+/// build's daemon there and then, so the chip is ● again on its next run.
+#[test]
+fn status_respawns_a_daemon_after_a_restart() {
+    let _env = common::TestEnv::new();
+    let s = common::TestServer::start();
+    let (rt, old) = old_build_daemon(&s);
+    let status = || {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_tmux-home"))
+            .args(["status", "--socket"])
+            .arg(&s.socket)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    assert_eq!(status(), "○");
+    rt.block_on(async { tokio::time::timeout(Duration::from_secs(2), old).await })
+        .expect("old daemon should exit after replying Restart")
+        .unwrap()
+        .unwrap();
+    common::wait_until("status ● again", || status() == "●");
     s.tmux(&["kill-server"]);
 }
 
 /// Starting the daemon is best-effort: a client whose daemon can't be
 /// spawned still gets its degraded direct read.
-#[tokio::test]
-async fn spawn_failure_does_not_abort_degraded_read() {
+#[test]
+fn spawn_failure_does_not_abort_degraded_read() {
     // SAFETY: see degraded_then_daemon above.
     unsafe {
         std::env::set_var("TMUX_HOME_BIN", "/nonexistent/tmux-home");
     }
     let _env = common::TestEnv::new();
     let s = common::TestServer::start();
-    let (snap, from_daemon) = tmux_home::client::snapshot(&s.socket, Duration::from_millis(150))
-        .await
-        .unwrap();
+    let (snap, from_daemon) =
+        tmux_home::client::snapshot(&s.socket, Duration::from_millis(150)).unwrap();
     assert!(!from_daemon);
     assert_eq!(snap.windows.len(), 1);
     s.tmux(&["kill-server"]);
@@ -153,8 +172,8 @@ async fn spawn_failure_does_not_abort_degraded_read() {
 /// The spawned daemon's stderr goes to `<state_dir>/daemon.log`, so its
 /// errors aren't lost. A daemon pointed at a dead server logs why its
 /// source ended.
-#[tokio::test]
-async fn spawned_daemon_logs_to_state_dir() {
+#[test]
+fn spawned_daemon_logs_to_state_dir() {
     // SAFETY: see degraded_then_daemon above.
     unsafe {
         std::env::set_var("TMUX_HOME_BIN", env!("CARGO_BIN_EXE_tmux-home"));
@@ -167,7 +186,7 @@ async fn spawned_daemon_logs_to_state_dir() {
     let log = p.state_dir.join("daemon.log");
     let mut text = String::new();
     for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::thread::sleep(Duration::from_millis(100));
         text = std::fs::read_to_string(&log).unwrap_or_default();
         if text.contains("source ended") {
             break;

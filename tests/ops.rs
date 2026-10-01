@@ -43,13 +43,13 @@ impl Drop for HashDir {
     }
 }
 
-fn store() -> (Store, PathBuf) {
-    let dir = std::env::temp_dir().join(format!(
-        "th-ops-store-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    (Store::new(dir.join("srv"), None), dir)
+/// A store in a temp dir that is removed even if the test panics.
+fn store() -> (Store, tempfile::TempDir) {
+    let dir = tempfile::Builder::new()
+        .prefix("th-ops-store-")
+        .tempdir()
+        .unwrap();
+    (Store::new(dir.path().join("srv"), None), dir)
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn reopen_restores_hash_name_session_and_cwds() {
     let s = TestServer::start();
     let tx = Tx::new(s.socket.clone());
     let d = HashDir::new();
-    let (store, sdir) = store();
+    let (store, _sdir) = store();
     // session "s#1#", window "w#1#": the doubled `#` is tmux's own escape
     let dd = d.s().replace('#', "##");
     s.tmux(&[
@@ -110,7 +110,6 @@ fn reopen_restores_hash_name_session_and_cwds() {
     assert_eq!(show(&s, &new, "#{window_name}"), "w#1#");
     let starts = s.tmux(&["list-panes", "-t", &new, "-F", "#{pane_start_path}"]);
     assert_eq!(starts.lines().collect::<Vec<_>>(), vec![d.s(), d.s()]);
-    let _ = std::fs::remove_dir_all(sdir);
 }
 
 #[test]
@@ -133,7 +132,7 @@ fn reset_name_reenables_automatic_rename_when_global_is_off() {
 fn reopen_failing_after_create_keeps_the_stack_popped() {
     let s = TestServer::start();
     let tx = Tx::new(s.socket.clone());
-    let (store, sdir) = store();
+    let (store, _sdir) = store();
     s.tmux(&[
         "new-window",
         "-d",
@@ -160,7 +159,6 @@ fn reopen_failing_after_create_keeps_the_stack_popped() {
     // the next ^t must not create a duplicate
     assert_eq!(tx.reopen(&store).unwrap(), None);
     assert_eq!(count(), "2");
-    let _ = std::fs::remove_dir_all(sdir);
 }
 
 #[test]
@@ -253,6 +251,85 @@ fn busy_reports_a_stopped_job() {
     }
 }
 
+/// Starts `cmd` in pane `target`'s shell and waits until it is the pane's
+/// foreground command.
+fn run_in(s: &TestServer, target: &str, cmd: &str, shows_as: &str) {
+    s.tmux(&["send-keys", "-t", target, cmd, "Enter"]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while show(s, target, "#{pane_current_command}") != shows_as {
+        assert!(Instant::now() < deadline, "{cmd} never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A job running in the background (`sleep 100 &`) leaves the pane at its
+/// prompt and is not stopped: it is not reported (a documented limit, see
+/// the README), and in particular never as "(stopped)".
+#[test]
+fn busy_does_not_report_a_running_background_job() {
+    let s = TestServer::start();
+    s.wait_settled();
+    let w = wid(&s, "alpha:");
+    s.tmux(&["send-keys", "-t", &w, "sleep 100 &", "Enter"]);
+    let tty = show(&s, &w, "#{pane_tty}");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-t", tty.trim_start_matches("/dev/")])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&ps.stdout).contains("sleep") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "background sleep never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let tx = Tx::new(s.socket.clone());
+    assert_eq!(tx.busy_commands(&w), Vec::<String>::new());
+    // with a second window, ^x closes it without asking
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    assert_eq!(tx.close_plan(&w).unwrap(), tmux_home::ops::ClosePlan::Now);
+}
+
+/// A job stopped in one window's pane doesn't make another window busy.
+#[test]
+fn a_stopped_job_counts_only_for_its_own_pane() {
+    let s = TestServer::start();
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "other"]);
+    s.wait_settled();
+    let (quiet, busy) = (wid(&s, "alpha:0"), wid(&s, "alpha:other"));
+    run_in(&s, &busy, "sleep 1000", "sleep");
+    s.tmux(&["send-keys", "-t", &busy, "C-z"]);
+    let tx = Tx::new(s.socket.clone());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while tx.busy_commands(&busy) != ["sleep (stopped)"] {
+        assert!(Instant::now() < deadline, "stopped job not reported");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(tx.busy_commands(&quiet), Vec::<String>::new());
+}
+
+/// Once the window is killed, failing to save it for reopen is not a
+/// failed close.
+#[test]
+fn close_reports_an_unsaved_window_as_closed() {
+    let s = TestServer::start();
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "gone"]);
+    let w = wid(&s, "alpha:gone");
+    let dir = tempfile::tempdir().unwrap();
+    // the store's directory can't be created: a file is in the way
+    let blocker = dir.path().join("srv");
+    std::fs::write(&blocker, b"").unwrap();
+    let store = Store::new(blocker.join("state"), None);
+    let tx = Tx::new(s.socket.clone());
+    let got = tx.close_window(&w, None, &store).unwrap();
+    assert!(
+        matches!(got, tmux_home::ops::CloseOutcome::NotSaved(_)),
+        "{got:?}"
+    );
+    assert!(!s.tmux(&["list-windows", "-F", "#W"]).contains("gone"));
+}
+
 #[test]
 fn rename_by_id_keeps_odd_characters() {
     let s = TestServer::start();
@@ -306,13 +383,7 @@ fn capture_shows_the_main_pane_not_the_sidebar() {
         "Enter",
     ]);
     let t = tmux_home::tmux::Tmux::new(s.socket.clone());
-    let snap = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(tmux_home::tmux::snapshot::read_snapshot(&t))
-        .unwrap()
-        .0;
+    let snap = tmux_home::tmux::snapshot::read_snapshot(&t).unwrap();
     let logs = wid(&s, "alpha:logs");
     let rows = tmux_home::popup::app::build_rows(&snap, None, "");
     let row = rows.iter().find(|r| r.wid == logs).unwrap();

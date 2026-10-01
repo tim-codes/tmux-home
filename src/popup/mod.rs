@@ -2,19 +2,17 @@
 //! `display-popup -E -B -w 100% -h 100%`.
 
 pub mod app;
+pub mod fresh;
 
 use crate::{
-    VERSION,
-    ipc::{Reply, Request, read_msg, write_msg},
+    client::{self, Answer},
+    ipc::Reply,
     ops::{CloseOutcome, Tx},
-    paths::Paths,
     store::Store,
-    tmux::{
-        Tmux,
-        snapshot::{Snapshot, read_snapshot},
-    },
+    tmux::snapshot::{Snapshot, read_snapshot},
 };
 use app::{Action, App, HELP, Mode, Row};
+use fresh::{Floor, Stamp};
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyEventKind},
@@ -24,7 +22,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -32,122 +30,84 @@ use std::{
 /// Snapshots from the daemon (live) or direct reads (degraded).
 struct Feed {
     snap: Snapshot,
-    live: bool,
-    /// When a direct read started (degraded mode only).
-    read_at: Option<Instant>,
+    stamp: Stamp,
 }
 
 const DEGRADED_EVERY: Duration = Duration::from_secs(1);
 const PREVIEW_EVERY: Duration = Duration::from_millis(1000);
+/// Budget for the daemon's first reply to a subscription (a fresh read).
+const SUBSCRIBE_BUDGET: Duration = Duration::from_millis(150);
+/// Budget for a `refresh` after a write; past it the popup reads tmux itself.
+const REFRESH_BUDGET: Duration = Duration::from_millis(300);
+/// While degraded, a daemon is (re)started at most this often (at once
+/// after a `Restart`).
+const RESPAWN_EVERY: Duration = Duration::from_secs(5);
 
+/// The feed thread: plain blocking I/O, no async runtime. It subscribes to
+/// the daemon and forwards its pushes; when there is no daemon it uses the
+/// shared degraded path (`client::revive`, then a direct read) every second.
 fn spawn_feed(socket: PathBuf) -> mpsc::Receiver<Feed> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(feed_loop(socket, tx));
-    });
+    std::thread::spawn(move || feed_loop(socket, tx));
     rx
 }
 
-async fn feed_loop(socket: PathBuf, tx: mpsc::Sender<Feed>) {
-    let Ok(paths) = Paths::for_socket(&socket) else {
-        return;
-    };
-    let tmux = Tmux::new(socket.clone());
+fn feed_loop(socket: PathBuf, tx: mpsc::Sender<Feed>) {
+    let tmux = crate::tmux::Tmux::new(socket.clone());
     let mut last_spawn: Option<Instant> = None;
     loop {
         // live: subscribe until the daemon goes away
-        if let Ok(Ok(s)) = tokio::time::timeout(
-            Duration::from_millis(150),
-            tokio::net::UnixStream::connect(&paths.sock),
-        )
-        .await
+        let since = Instant::now();
+        let restart = match client::ask(&socket, &client::subscribe_req("popup"), SUBSCRIBE_BUDGET)
         {
-            let (r, mut w) = s.into_split();
-            let mut r = tokio::io::BufReader::new(r);
-            let req = Request::Subscribe {
-                v: VERSION.into(),
-                client: "popup".into(),
-            };
-            if write_msg(&mut w, &req).await.is_ok() {
-                loop {
-                    match read_msg::<_, Reply>(&mut r).await {
-                        Ok(Some(Reply::Snapshot { data, .. })) => {
-                            if tx
-                                .send(Feed {
-                                    snap: data,
-                                    live: true,
-                                    read_at: None,
-                                })
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Ok(Some(Reply::Restart)) => {
-                            // the old daemon removes its socket, then exits
-                            for _ in 0..50 {
-                                if !paths.sock.exists() {
-                                    break;
-                                }
-                                tokio::time::sleep(Duration::from_millis(20)).await;
-                            }
-                            break;
-                        }
-                        _ => break,
+            Answer::Snapshot {
+                epoch,
+                seq,
+                data,
+                mut conn,
+            } => {
+                let mut next = Some((seq, data));
+                while let Some((seq, snap)) = next.take() {
+                    let stamp = Stamp::Live { epoch, seq, since };
+                    if tx.send(Feed { snap, stamp }).is_err() {
+                        return;
+                    }
+                    if let Ok(Some(Reply::Snapshot { seq, data, .. })) = conn.recv() {
+                        next = Some((seq, data));
                     }
                 }
+                false
             }
-        }
+            Answer::Restart => true,
+            Answer::Down => false,
+        };
         // degraded: (re)start a daemon now and then, read directly meanwhile
-        if last_spawn.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
+        if restart || last_spawn.is_none_or(|t| t.elapsed() > RESPAWN_EVERY) {
             last_spawn = Some(Instant::now());
-            let _ = crate::client::spawn_daemon(&socket);
+            client::revive(&socket, restart);
         }
-        let read_at = Some(Instant::now());
-        match read_snapshot(&tmux).await {
-            Ok((snap, _)) => {
-                if tx
-                    .send(Feed {
-                        snap,
-                        live: false,
-                        read_at,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            Err(_) => return, // server gone
+        let at = Instant::now();
+        let Ok(snap) = read_snapshot(&tmux) else {
+            return; // server gone
+        };
+        let stamp = Stamp::Direct { at };
+        if tx.send(Feed { snap, stamp }).is_err() {
+            return;
         }
-        tokio::time::sleep(DEGRADED_EVERY).await;
+        std::thread::sleep(DEGRADED_EVERY);
     }
-}
-
-pub fn socket_from_env(explicit: Option<PathBuf>) -> Option<PathBuf> {
-    explicit.or_else(|| {
-        let t = std::env::var("TMUX").ok()?;
-        let s = t.split(',').next()?.to_string();
-        (!s.is_empty()).then(|| PathBuf::from(s))
-    })
 }
 
 struct Runtime {
     tx: Tx,
-    tmux: Tmux,
-    rt: tokio::runtime::Runtime,
     client: Option<String>,
     store: Store,
     home: String,
     live: bool,
     preview: (Option<String>, String),
     preview_at: Instant,
-    /// When the last direct read after our own write started: a degraded
-    /// feed read that started earlier predates the write and is dropped.
-    read_at: Option<Instant>,
+    /// Set by `refresh` after our own write: older snapshots are dropped.
+    floor: Option<Floor>,
 }
 
 impl Runtime {
@@ -155,11 +115,28 @@ impl Runtime {
         app::build_rows(s, self.client.as_deref(), &self.home)
     }
 
-    /// Re-read tmux right after a write so the list reflects it at once.
-    fn refresh(&mut self, app: &mut App) {
+    /// A read of tmux made now: through the daemon's `refresh` when live
+    /// (so its subscribers see it too), else directly.
+    fn read_now(&self) -> Option<(Snapshot, Stamp)> {
+        if self.live {
+            let since = Instant::now();
+            if let Answer::Snapshot {
+                epoch, seq, data, ..
+            } = client::ask(&self.tx.tmux.socket, &client::refresh_req(), REFRESH_BUDGET)
+            {
+                return Some((data, Stamp::Live { epoch, seq, since }));
+            }
+        }
         let at = Instant::now();
-        if let Ok((s, _)) = self.rt.block_on(read_snapshot(&self.tmux)) {
-            self.read_at = Some(at);
+        let snap = read_snapshot(&self.tx.tmux).ok()?;
+        Some((snap, Stamp::Direct { at }))
+    }
+
+    /// Re-read tmux right after a write so the list reflects it at once;
+    /// from then on, snapshots older than this read are ignored.
+    fn refresh(&mut self, app: &mut App) {
+        if let Some((s, stamp)) = self.read_now() {
+            self.floor = Some(Floor::of(stamp));
             let rows = self.rows(&s);
             app.set_rows(rows);
         }
@@ -218,6 +195,9 @@ impl Runtime {
                         app.notice = Some(" can't close the last window on the server".into())
                     }
                     Ok(CloseOutcome::Closed) => {}
+                    Ok(CloseOutcome::NotSaved(e)) => {
+                        app.notice = Some(format!(" closed, but ^t can't reopen it: {e}"))
+                    }
                     Err(e) => app.notice = Some(format!(" close failed: {e}")),
                 }
                 app.sel_wid = None;
@@ -229,7 +209,7 @@ impl Runtime {
                     app.notice = None;
                     app.clear_filter();
                     self.refresh(app);
-                    app.select_wid(&wid);
+                    app.want(&wid);
                 }
                 Ok(None) => app.notice = Some(" nothing to reopen".into()),
                 Err(e) => app.notice = Some(format!(" reopen failed: {e}")),
@@ -248,7 +228,7 @@ impl Runtime {
                         if !app.visible.iter().any(|&i| app.rows[i].wid == wid) {
                             app.clear_filter();
                         }
-                        app.select_wid(&wid);
+                        app.want(&wid);
                     }
                     Err(e) => app.notice = Some(format!(" new window failed: {e}")),
                 }
@@ -259,7 +239,7 @@ impl Runtime {
 }
 
 pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
-    let socket = socket_from_env(socket)
+    let socket = client::current_socket(socket)
         .ok_or_else(|| anyhow::anyhow!("not inside tmux and no --socket"))?;
     let tx = Tx::new(socket.clone());
     let client = tx.home_client();
@@ -267,23 +247,21 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     let feed = spawn_feed(socket.clone());
     let mut rt = Runtime {
         tx,
-        tmux: Tmux::new(socket.clone()),
-        rt: tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?,
         client,
         store,
         home: std::env::var("HOME").unwrap_or_default(),
         live: false,
         preview: (None, String::new()),
         preview_at: Instant::now(),
-        read_at: None,
+        floor: None,
     };
     let mut app = App::new();
     // first picture: read tmux directly, so the cursor lands on the window
-    // the client shows now (the daemon's snapshot can be a poll behind);
-    // the feed only brings updates after this
-    rt.refresh(&mut app);
+    // the client shows now; no floor, since nothing was written (the feed's
+    // first snapshot is a fresh read too)
+    if let Ok(s) = read_snapshot(&rt.tx.tmux) {
+        app.set_rows(rt.rows(&s));
+    }
     app.select_current();
 
     let mut term = ratatui::init();
@@ -306,10 +284,12 @@ fn event_loop(
             latest = Some(f);
         }
         if let Some(f) = &latest {
-            dirty |= rt.live != f.live;
-            rt.live = f.live;
+            let live = matches!(f.stamp, Stamp::Live { .. });
+            dirty |= rt.live != live;
+            rt.live = live;
         }
-        if let Some(f) = latest.filter(|f| f.read_at.is_none_or(|t| Some(t) >= rt.read_at)) {
+        let now = Instant::now();
+        if let Some(f) = latest.filter(|f| fresh::accept(rt.floor.as_ref(), &f.stamp, now)) {
             let rows = rt.rows(&f.snap);
             app.set_rows(rows);
             dirty = true;
@@ -525,7 +505,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// `tmux-home reopen`: prints the new window ID; exit 4 on an empty stack.
 pub fn reopen_cli(socket: Option<PathBuf>) -> anyhow::Result<i32> {
-    let socket = socket_from_env(socket)
+    let socket = client::current_socket(socket)
         .ok_or_else(|| anyhow::anyhow!("not inside tmux and no --socket"))?;
     let store = Store::for_socket(&socket)?;
     match Tx::new(socket).reopen(&store)? {
@@ -535,41 +515,6 @@ pub fn reopen_cli(socket: Option<PathBuf>) -> anyhow::Result<i32> {
         }
         None => Ok(4),
     }
-}
-
-/// `tmux-home status`: `●` if the daemon answers within 100 ms, else `○`;
-/// nothing outside tmux. Never starts a daemon.
-pub fn status(socket: Option<PathBuf>) -> anyhow::Result<()> {
-    let Some(socket) = socket_from_env(socket) else {
-        return Ok(());
-    };
-    let up = daemon_up(&socket);
-    println!("{}", if up { "●" } else { "○" });
-    Ok(())
-}
-
-fn daemon_up(socket: &Path) -> bool {
-    let Ok(p) = Paths::for_socket(socket) else {
-        return false;
-    };
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return false;
-    };
-    rt.block_on(async {
-        let ask = async {
-            let s = tokio::net::UnixStream::connect(&p.sock).await?;
-            let (r, mut w) = s.into_split();
-            write_msg(&mut w, &Request::Query { v: VERSION.into() }).await?;
-            read_msg::<_, Reply>(&mut tokio::io::BufReader::new(r)).await
-        };
-        matches!(
-            tokio::time::timeout(Duration::from_millis(100), ask).await,
-            Ok(Ok(Some(Reply::Snapshot { .. })))
-        )
-    })
 }
 
 #[cfg(test)]

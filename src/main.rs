@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "tmux-home", version)]
+#[command(name = "tmux-home", version = tmux_home::BUILD_ID)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -51,7 +51,8 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cmd = match cli.cmd {
         Cmd::Popup { socket } => return tmux_home::popup::run(socket),
-        Cmd::Status { socket } => return tmux_home::popup::status(socket),
+        Cmd::Status { socket } => return tmux_home::client::status(socket),
+        Cmd::Query { socket, json: _ } => return tmux_home::client::query(socket),
         Cmd::Reopen { socket } => {
             let code = tmux_home::popup::reopen_cli(socket)?;
             std::process::exit(code);
@@ -61,8 +62,9 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     match cmd {
         Cmd::Daemon { socket, source } => rt.block_on(tmux_home::daemon::run(socket, source)),
-        Cmd::Query { socket, json: _ } => rt.block_on(tmux_home::client::query(socket)),
         Cmd::SpikeControl { socket } => rt.block_on(tmux_home::tmux::source::spike_control(socket)),
-        Cmd::Popup { .. } | Cmd::Status { .. } | Cmd::Reopen { .. } => unreachable!(),
+        Cmd::Popup { .. } | Cmd::Status { .. } | Cmd::Reopen { .. } | Cmd::Query { .. } => {
+            unreachable!()
+        }
     }
 }
