@@ -55,26 +55,33 @@ fn source_hash(root: &Path) -> String {
     h.digest().to_string()[..12].to_string()
 }
 
+/// The crate's git checkout, if the crate root is the top of one (not, say,
+/// a crate unpacked inside some unrelated repository).
+fn own_checkout(root: &Path) -> bool {
+    let top = git(&["-C", root.to_str().unwrap(), "rev-parse", "--show-toplevel"]);
+    let canon = |p: &Path| std::fs::canonicalize(p).ok();
+    top.is_some_and(|t| canon(Path::new(&t)).is_some() && canon(Path::new(&t)) == canon(root))
+}
+
 fn main() {
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let r = root.to_str().unwrap();
     let version = std::env::var("CARGO_PKG_VERSION").unwrap();
-    // Re-run when the sources change (dirty hash) or HEAD/the index move
-    // (a commit, a checkout). Paths that don't exist are simply re-checked.
+    // Re-run when the sources change (the dirty hash) or the commit moves.
+    // Only existing paths are named: cargo treats a missing one as changed
+    // and would re-run (and recompile the crate) on every build.
     for f in ["src", "build.rs", "Cargo.toml", "Cargo.lock"] {
         println!("cargo:rerun-if-changed={f}");
     }
-    let sha = git(&[
-        "-C",
-        root.to_str().unwrap(),
-        "rev-parse",
-        "--short=12",
-        "HEAD",
-    ]);
+    let sha = own_checkout(&root)
+        .then(|| git(&["-C", r, "rev-parse", "--short=12", "HEAD"]))
+        .flatten();
     let id = match sha {
         Some(sha) if !sha.is_empty() => {
-            // HEAD, the branch it names, and the index (worktree-aware paths)
-            let r = root.to_str().unwrap();
-            let mut watch = vec!["HEAD".to_string(), "index".into(), "packed-refs".into()];
+            // HEAD (a checkout) and the branch it names (a commit): the loose
+            // ref, or packed-refs where it may live instead. Not the index:
+            // any `git status` (a prompt, an editor) rewrites it.
+            let mut watch = vec!["HEAD".to_string(), "packed-refs".into()];
             if let Some(b) = git(&["-C", r, "rev-parse", "--symbolic-full-name", "HEAD"])
                 && b.starts_with("refs/")
             {
@@ -82,12 +89,17 @@ fn main() {
             }
             for w in watch {
                 if let Some(p) = git(&["-C", r, "rev-parse", "--git-path", &w]) {
-                    println!("cargo:rerun-if-changed={}", root.join(p).display());
+                    let p = root.join(p);
+                    if p.exists() {
+                        println!("cargo:rerun-if-changed={}", p.display());
+                    }
                 }
             }
+            // --no-optional-locks: never take index.lock from a build
             let dirty = git(&[
+                "--no-optional-locks",
                 "-C",
-                root.to_str().unwrap(),
+                r,
                 "status",
                 "--porcelain",
                 "--untracked-files=normal",
