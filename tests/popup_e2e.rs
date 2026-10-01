@@ -226,3 +226,126 @@ fn cursor_opens_on_the_window_selected_just_before() {
     o.keys(&["Escape"]);
     o.wait_gone("F1 help");
 }
+
+/// A live agent pane in `beta:agent` (`sleep`, so not a shell) with these
+/// `@pane_*` options, faked the way tmux-agent-sidebar's hooks write them.
+fn fake_agent(s: &TestServer, window: &str, opts: &[(&str, &str)]) {
+    let target = format!("beta:{window}");
+    if s.tmux(&["list-windows", "-t", "beta", "-F", "#W"])
+        .lines()
+        .all(|w| w != window)
+    {
+        s.tmux(&[
+            "new-window",
+            "-d",
+            "-t",
+            "beta:",
+            "-n",
+            window,
+            "sleep 1000",
+        ]);
+    }
+    for (k, v) in opts {
+        s.tmux(&["set-option", "-p", "-t", &target, k, v]);
+    }
+}
+
+const WAITING: &[(&str, &str)] = &[
+    ("@pane_agent", "claude"),
+    ("@pane_status", "waiting"),
+    ("@pane_attention", "notification"),
+    ("@pane_wait_reason", "permission_prompt"),
+    ("@pane_prompt", "tidy the changelog"),
+];
+
+/// Lines between the NEEDS YOU header and the next header.
+fn needs_you_rows(screen: &str) -> Vec<String> {
+    screen
+        .lines()
+        .skip_while(|l| !l.contains("─ NEEDS YOU ─"))
+        .skip(1)
+        .take_while(|l| !l.contains("─ sessions ─"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// An agent starting to wait while the popup is open is pinned in NEEDS
+/// YOU (the poll picks the option up), counted in the header, and ^g
+/// jumps to it; ⏎ there switches to its window.
+#[test]
+fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
+    let (_env, s, o) = popup_fixture();
+    fake_agent(&s, "agent", &[]);
+    o.open_popup();
+    o.wait_for(r"^> .*5/5");
+    assert!(!o.screen().contains("NEEDS YOU"), "{}", o.screen());
+    fake_agent(&s, "agent", WAITING);
+    o.wait_for("─ NEEDS YOU ─");
+    let screen = o.screen();
+    let pinned = needs_you_rows(&screen);
+    assert_eq!(pinned.len(), 1, "{screen}");
+    assert!(
+        pinned[0].contains("agent") && pinned[0].contains("◐ waiting"),
+        "{screen}"
+    );
+    assert!(pinned[0].contains("permission"), "{screen}");
+    assert!(screen.contains("agents: 1 waiting"), "{screen}");
+    // the agent card previews it, with the prompt
+    o.wait_cursor_on("editor");
+    o.keys(&["C-g"]);
+    o.wait_cursor_on("agent");
+    let screen = o.screen();
+    assert_eq!(
+        needs_you_rows(&screen).first().map(|l| l.starts_with('▌')),
+        Some(true),
+        "^g lands on the pinned row:\n{screen}"
+    );
+    o.wait_for("needs you  permission");
+    o.wait_for("prompt     tidy the changelog");
+    o.keys(&["Enter"]);
+    o.wait_gone("F1 help");
+    wait_until("client on beta:agent", || client_at(&s) == "beta:agent");
+}
+
+/// `@waiting` keeps only the waiting agent's window; an agent whose pane
+/// is back at its shell is shown dimmed with "(ended?)", and is neither
+/// pinned nor counted.
+#[test]
+fn waiting_filter_and_stale_agent() {
+    let (_env, s, o) = popup_fixture();
+    fake_agent(&s, "agent", WAITING);
+    for (k, v) in [("@pane_agent", "claude"), ("@pane_status", "waiting")] {
+        s.tmux(&["set-option", "-p", "-t", "alpha:win two", k, v]);
+    }
+    o.open_popup();
+    o.wait_for("─ NEEDS YOU ─");
+    o.wait_for(r"win two .*\(ended\?\)");
+    let screen = o.screen();
+    assert_eq!(needs_you_rows(&screen).len(), 1, "{screen}");
+    assert!(
+        regex::Regex::new(r"(?m)agents: 1 waiting( |$)")
+            .unwrap()
+            .is_match(&screen),
+        "the stale agent isn't counted:\n{screen}"
+    );
+    // dimmed: SGR 2 on the stale cell
+    let raw = o.tmux(&["capture-pane", "-p", "-e", "-t", "outer"]);
+    let stale = raw.lines().find(|l| l.contains("(ended?)")).unwrap();
+    assert!(
+        regex::Regex::new(r"\x1b\[(?:[0-9;]*;)?2(?:;[0-9;]*)?m[^\x1b]*◐ waiting \(ended\?\)")
+            .unwrap()
+            .is_match(stale),
+        "{stale:?}"
+    );
+    o.typed("@waiting");
+    o.wait_for(r"^> @waiting .*1/5");
+    let screen = o.screen();
+    assert!(!screen.contains("win two"), "{screen}");
+    assert_eq!(
+        screen.lines().filter(|l| l.contains("  agent ")).count(),
+        2,
+        "pinned and in its session:\n{screen}"
+    );
+    o.typed(" s:alpha");
+    o.wait_for(r"^> @waiting s:alpha .*0/5");
+}
