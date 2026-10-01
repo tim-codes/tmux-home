@@ -83,9 +83,16 @@ impl Store {
             Ok(b) => match serde_json::from_slice::<ClosedFile>(&b) {
                 Ok(f) => Ok(f.closed),
                 // hand-edited, truncated or from an incompatible version:
-                // keep it for inspection and start an empty stack
+                // keep it for inspection and start an empty stack (even if
+                // it can't be moved aside: the next write replaces it)
                 Err(_) => {
-                    std::fs::rename(self.file(), self.dir.join("closed.json.corrupt"))?;
+                    let aside = self.dir.join(corrupt_name(std::time::SystemTime::now()));
+                    if let Err(e) = std::fs::rename(self.file(), &aside) {
+                        eprintln!(
+                            "tmux-home: unreadable {} not moved aside: {e}",
+                            self.file().display()
+                        );
+                    }
                     Ok(vec![])
                 }
             },
@@ -154,6 +161,19 @@ impl Store {
     pub fn is_empty(&self) -> anyhow::Result<bool> {
         Ok(self.len()? == 0)
     }
+}
+
+/// `closed.json.corrupt.<unix seconds>.<nanos>`: each unreadable file is
+/// kept, none overwrites an earlier one.
+fn corrupt_name(now: std::time::SystemTime) -> String {
+    let d = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "closed.json.corrupt.{}.{:09}",
+        d.as_secs(),
+        d.subsec_nanos()
+    )
 }
 
 /// `session index prev next auto active layout name path...`, US-separated.

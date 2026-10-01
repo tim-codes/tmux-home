@@ -394,9 +394,8 @@ fn daemon_death_falls_back_to_polling() {
         "/nonexistent/tmux-home",
     ]);
     o.open_popup();
-    // live first: the header has no "(direct)"
-    std::thread::sleep(Duration::from_millis(600));
-    assert!(!o.screen().contains("(direct)"), "{}", o.screen());
+    // live first: the header loses its "(direct)"
+    o.wait_gone(r"\(direct\)");
     kill_daemon(&s);
     o.wait_for(r"\(direct\)");
     s.tmux(&["new-window", "-d", "-t", "beta:", "-n", "later"]);
@@ -450,5 +449,14 @@ fn corrupt_store_does_not_break_close_and_reopen() {
     o.keys(&["C-t"]);
     o.wait_for(r"^> +.*4/4");
     o.wait_cursor_on("win two");
-    assert!(dir.join("closed.json.corrupt").exists());
+    let aside = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("closed.json.corrupt.")
+        })
+        .count();
+    assert_eq!(aside, 1, "the corrupt file is kept, timestamped");
 }
