@@ -1,6 +1,8 @@
 use super::Tmux;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::LazyLock;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Snapshot {
@@ -67,6 +69,15 @@ pub struct Pane {
     /// `@pane_role` (e.g. `sidebar`); sidebar panes are views, not work.
     #[serde(default)]
     pub role: String,
+    /// The pane's agent options (`crate::agent::OPTIONS`), the non-empty
+    /// ones only. Raw: `crate::agent` turns them into agent state. They
+    /// change on agent events, never by the clock (a run's start time is
+    /// stored, not its elapsed time), so they can be hashed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_opts: BTreeMap<String, String>,
+    /// The pane's terminal (`/dev/ttys004`), for stopped-job checks.
+    #[serde(default)]
+    pub tty: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
@@ -86,7 +97,39 @@ const REC_END: &str = "\x1e\n";
 // Field separator is ASCII unit separator \x1f (not typeable at a prompt, so it
 // cannot appear in names tmux-home's users type in). Names are the *last* field
 // in each format so a stray separator elsewhere can't shift the other fields.
-const PANE_FMT: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{@pane_role}\x1f#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
+// The agent options sit between the fixed fields and the names; a prompt is
+// stored with newlines and `|` replaced, but a literal \x1f in one would
+// shift the fields after it (the record is then misread, not lost).
+const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{@pane_role}\x1f#{pane_tty}\x1f";
+const PANE_TAIL: &str = "#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
+/// Fields before the agent options.
+const HEAD_FIELDS: usize = 12;
+/// Fields in a `list-panes` record.
+fn pane_fields() -> usize {
+    HEAD_FIELDS + crate::agent::OPTIONS.len() + 3
+}
+
+/// `#{@a}\x1f#{@b}\x1f…\x1f`: the agent options, each followed by a separator.
+fn agent_opts_fmt() -> String {
+    crate::agent::OPTIONS
+        .iter()
+        .map(|o| format!("#{{{o}}}\x1f"))
+        .collect()
+}
+
+/// Agent options from their fields, in `agent::OPTIONS` order; empty
+/// values are dropped.
+fn agent_opts_from(fields: &[&str]) -> BTreeMap<String, String> {
+    crate::agent::OPTIONS
+        .iter()
+        .zip(fields)
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+static PANE_FMT: LazyLock<String> =
+    LazyLock::new(|| format!("{PANE_HEAD}{}{PANE_TAIL}", agent_opts_fmt()));
 const CLIENT_FMT: &str = "#{client_name}\x1f#{client_tty}\x1f#{session_id}\x1f#{client_flags}\x1e";
 
 /// Reads a full snapshot of the tmux server (synchronously; the daemon
@@ -115,8 +158,15 @@ pub async fn read_snapshot_async(t: &Tmux) -> anyhow::Result<Snapshot> {
     tokio::task::spawn_blocking(move || read_snapshot(&t)).await?
 }
 
+/// The panes of one window (or any `list-panes -t` target), parsed exactly
+/// as a snapshot's are.
+pub fn read_panes(t: &Tmux, target: &str) -> anyhow::Result<Vec<Pane>> {
+    let out = t.run(&["list-panes", "-t", target, "-F", &PANE_FMT])?;
+    Ok(parse(&out, "").panes)
+}
+
 fn read_parsed(t: &Tmux) -> anyhow::Result<Snapshot> {
-    let panes = t.run(&["list-panes", "-a", "-F", PANE_FMT])?;
+    let panes = t.run(&["list-panes", "-a", "-F", &PANE_FMT])?;
     let clients = t.run(&["list-clients", "-F", CLIENT_FMT])?;
     Ok(parse(&panes, &clients))
 }
@@ -144,8 +194,9 @@ struct PaneRec<'a> {
 }
 
 fn pane_record(rec: &str) -> Option<PaneRec<'_>> {
-    let f: Vec<&str> = rec.splitn(14, SEP).collect();
-    if f.len() != 14 {
+    let n = pane_fields();
+    let f: Vec<&str> = rec.splitn(n, SEP).collect();
+    if f.len() != n {
         return None;
     }
     Some(PaneRec {
@@ -171,10 +222,12 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
             continue;
         };
         let (sid, wid) = (f[0].to_string(), f[1].to_string());
+        let n = f.len();
+        let (sname, title, wname) = (f[n - 3], f[n - 2], f[n - 1]);
         if !s.sessions.iter().any(|x| x.id == sid) {
             s.sessions.push(Session {
                 id: sid.clone(),
-                name: f[11].to_string(),
+                name: sname.to_string(),
                 attached: 0,
             });
         }
@@ -185,7 +238,7 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
                 index: window_index,
                 active: f[3] == "1",
                 automatic_rename: f[4] == "1",
-                name: f[13].to_string(),
+                name: wname.to_string(),
             });
         }
         s.panes.push(Pane {
@@ -196,8 +249,10 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
             active: f[7] == "1",
             current_command: f[8].to_string(),
             current_path: f[9].to_string(),
-            title: f[12].to_string(),
+            title: title.to_string(),
             role: f[10].to_string(),
+            tty: f[11].to_string(),
+            agent_opts: agent_opts_from(&f[HEAD_FIELDS..n - 3]),
         });
     }
     for rec in records(clients) {

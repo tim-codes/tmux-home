@@ -166,6 +166,25 @@ window) and the filter is kept.
 State comes from the pane options the tmux-agent-sidebar hooks publish
 (event-driven, sub-second). tmux-home adds no hooks of its own.
 
+> **Until pass 5** (implemented in pass 4), this state comes only from
+> tmux-agent-sidebar's `@pane_*` options, read in the same `list-panes` call
+> as everything else. The model (`src/agent/`) reads them through an
+> `AgentSource`; pass 5's own hooks write `@home_*` and add a second source
+> ahead of it, without UI changes. Pass-4 details: there is also an
+> `@background` token; staleness is a positive check per kind (Claude is
+> alive only as its version, `claude` or `node`; other kinds as any
+> non-shell); a notification on a *running* agent doesn't need you (the
+> sidebar flags TaskCompleted mid-run); the lead pane (card, preview, `⏎`
+> focus) is the one that needs you; a status token
+> (`@running`, …) matches a window with a live agent in that status, and
+> several are alternatives; `@agent` includes stale agents; `s:` is a
+> case-insensitive prefix; free text matches prompts word by word as
+> substrings rather than fuzzily (a long prompt matches almost any short
+> fuzzy query). A NEEDS YOU window is listed twice, pinned and in its
+> session; `^g` visits the pinned copies. Claude's `pane_current_command` is
+> its version (`2.1.283`), so agents are named by `@pane_agent`, also in the
+> `^x` prompt.
+
 | Option | Shown as |
 | --- | --- |
 | `@pane_agent` | agent kind (claude / codex / opencode) |

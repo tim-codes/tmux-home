@@ -446,3 +446,41 @@ fn new_window_after_lands_next_with_its_name_and_cwd() {
     let unnamed = tx.new_window_after(&new, "/", "").unwrap();
     assert_eq!(show(&s, &unnamed, "#{window_index}"), "2");
 }
+
+/// ^x on a window whose agent is mid-run says so, and names the agent
+/// rather than its command; a stale agent (pane back at its shell) and an
+/// idle one don't.
+#[test]
+fn close_plan_warns_about_a_working_agent() {
+    use tmux_home::ops::ClosePlan;
+    let s = TestServer::start();
+    let claude = common::fake_claude();
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "ag", &claude]);
+    // claude's pane, but running something else: stale too
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "vi", "sleep 1000"]);
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "st"]);
+    s.wait_settled();
+    let tx = Tx::new(s.socket.clone());
+    let set = |t: &str, k: &str, v: &str| {
+        s.tmux(&["set-option", "-p", "-t", t, k, v]);
+    };
+    for t in ["alpha:ag", "alpha:st", "alpha:vi"] {
+        set(t, "@pane_agent", "claude");
+        set(t, "@pane_status", "waiting");
+    }
+    let ask = |w: &str| match tx.close_plan(&wid(&s, w)).unwrap() {
+        ClosePlan::Ask(p) => p,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        ask("alpha:ag"),
+        "close \"ag\"? agent still working — running: claude (y/N) "
+    );
+    set("alpha:ag", "@pane_status", "running");
+    assert!(ask("alpha:ag").contains("agent still working"));
+    set("alpha:ag", "@pane_status", "idle");
+    assert_eq!(ask("alpha:ag"), "close \"ag\"? running: claude (y/N) ");
+    // stale: the pane is at its shell, so it closes at once
+    assert_eq!(tx.close_plan(&wid(&s, "alpha:st")).unwrap(), ClosePlan::Now);
+    assert_eq!(ask("alpha:vi"), "close \"vi\"? running: sleep (y/N) ");
+}

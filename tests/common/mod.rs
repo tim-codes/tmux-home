@@ -463,3 +463,43 @@ pub fn row_sessions(screen: &str) -> Vec<String> {
         .filter_map(|l| r.captures(l).map(|c| c[1].to_string()))
         .collect()
 }
+
+/// A stand-in for Claude Code in a pane: a program named like Claude's
+/// versioned binary (`…/2.1.283`), so `pane_current_command` reads as a
+/// live Claude does. A copied system binary won't run on macOS and a
+/// script reports its interpreter, so it is compiled once, with `cc`, into
+/// the target's test tmpdir. It blocks until killed.
+pub fn fake_claude() -> String {
+    use std::sync::OnceLock;
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fake-claude");
+        let bin = dir.join("2.1.283");
+        if !bin.exists() {
+            std::fs::create_dir_all(&dir).unwrap();
+            let src = dir.join("main.c");
+            std::fs::write(
+                &src,
+                "#include <unistd.h>\nint main(void){for(;;)pause();}\n",
+            )
+            .unwrap();
+            // build beside, then rename: a concurrent test binary never runs
+            // a half-written file
+            let tmp = dir.join(format!("build-{}", std::process::id()));
+            let out = Command::new("cc")
+                .arg("-o")
+                .arg(&tmp)
+                .arg(&src)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "cc: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::fs::rename(&tmp, &bin).unwrap();
+        }
+        bin.to_str().unwrap().to_string()
+    })
+    .clone()
+}
