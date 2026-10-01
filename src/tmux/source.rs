@@ -85,7 +85,14 @@ async fn control(tmux: Tmux, tx: mpsc::Sender<SourceEvent>) -> anyhow::Result<()
     let mut last = Some(refresh(&tmux, &tx, None).await?);
     let mut dirty = false;
     let debounce = Duration::from_millis(30);
+    // A pinned, reused timer: only `reset` on the *first* Changed notification
+    // after a refresh, so a steady stream of control-mode lines (even
+    // Line::Other ones, e.g. %output) can't keep restarting a freshly-created
+    // sleep future and indefinitely postpone the debounced refresh.
+    let debounce_sleep = tokio::time::sleep(Duration::from_secs(3600));
+    tokio::pin!(debounce_sleep);
     let mut resync = tokio::time::interval(RESYNC_EVERY);
+    resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     resync.tick().await; // first tick is immediate
     loop {
         tokio::select! {
@@ -93,11 +100,14 @@ async fn control(tmux: Tmux, tx: mpsc::Sender<SourceEvent>) -> anyhow::Result<()
                 let Some(line) = line? else { return Ok(()) }; // EOF: server gone
                 match parse_line(&line) {
                     Line::Notify(Notification::Exit(_)) => return Ok(()),
-                    Line::Notify(Notification::Changed(_)) => dirty = true,
+                    Line::Notify(Notification::Changed(_)) if !dirty => {
+                        dirty = true;
+                        debounce_sleep.as_mut().reset(tokio::time::Instant::now() + debounce);
+                    }
                     _ => {}
                 }
             }
-            _ = tokio::time::sleep(debounce), if dirty => {
+            () = &mut debounce_sleep, if dirty => {
                 dirty = false;
                 last = Some(refresh(&tmux, &tx, last).await?);
             }

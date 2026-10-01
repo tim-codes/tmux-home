@@ -55,14 +55,49 @@ async fn control_source() {
     check_source(SourceKind::Control, Duration::from_millis(300)).await;
 }
 
+/// The control client's attached session, read from `list-clients`
+/// (`#{client_flags}` identifies our control-mode client; everything after
+/// the first space is its `#{session_name}`).
+fn control_client_session(s: &common::TestServer) -> String {
+    let clients = s.tmux(&["list-clients", "-F", "#{client_flags} #{session_name}"]);
+    clients
+        .lines()
+        .find_map(|l| {
+            let (flags, session) = l.split_once(' ')?;
+            flags
+                .split(',')
+                .any(|f| f == "control-mode")
+                .then(|| session.to_string())
+        })
+        .expect("no control-mode client found in list-clients")
+}
+
 #[tokio::test]
 async fn control_sees_other_sessions_and_renames() {
     let s = common::TestServer::start();
-    s.tmux(&["new-session", "-d", "-s", "beta", "/bin/sh"]);
+    s.wait_settled();
+    // `attach-session` with no `-t` attaches to the server's current/most
+    // recently created session — "alpha" is the only one that exists yet,
+    // so the control client lands there deterministically.
     let mut rx = start(SourceKind::Control, Tmux::new(s.socket.clone()));
     let _ = next_snap(&mut rx, Duration::from_secs(2)).await;
+    assert_eq!(
+        control_client_session(&s),
+        "alpha",
+        "control client should be attached to alpha, not a session created afterwards"
+    );
+
+    s.tmux(&["new-session", "-d", "-s", "beta", "/bin/sh"]);
+    s.wait_settled();
+    assert_eq!(
+        control_client_session(&s),
+        "alpha",
+        "creating beta must not move the already-attached control client onto it"
+    );
+
     // a window added to a session the control client is NOT attached to
     s.tmux(&["new-window", "-d", "-t", "beta", "-n", "elsewhere"]);
+    s.wait_settled();
     let Some(SourceEvent::Snapshot(snap)) = next_snap(&mut rx, Duration::from_millis(300)).await
     else {
         panic!("missed other-session window")

@@ -73,10 +73,16 @@ impl TestServer {
         // startup churn independent of the one wait_settled rides out below.
         // Tests don't rely on automatic-rename, so turn it off globally to
         // remove that source of flakiness outright.
-        let _ = Command::new("tmux")
+        let out = Command::new("tmux")
             .args(["-L", &name, "set-option", "-g", "automatic-rename", "off"])
             .env_remove("TMUX")
-            .output();
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "set-option automatic-rename off: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let socket = Command::new("tmux")
             .args(["-L", &name, "display", "-p", "#{socket_path}"])
             .env_remove("TMUX")
@@ -87,8 +93,10 @@ impl TestServer {
     }
 
     /// Polls `list-panes -a` until two consecutive reads of
-    /// `pane_current_command` agree, to ride out the brief churn a freshly
-    /// spawned pane's shell produces right after start. Panics if it never
+    /// `pane_current_command`, `pane_current_path`, `pane_title` and
+    /// `window_name` all agree, to ride out the brief churn a freshly
+    /// spawned pane's shell (and, for window_name, tmux's automatic-rename
+    /// hook following it) produces right after start. Panics if it never
     /// stabilizes within 3s.
     pub fn wait_settled(&self) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
