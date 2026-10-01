@@ -10,7 +10,8 @@ where to go.
 > reopen, `M-↑`/`M-↓` reorder and `M-n` new window, plus read-only agent
 > awareness (pass 4: status, NEEDS YOU, `^g`, filter tokens, agent card) from
 > [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s pane
-> options. tmux-home's own hooks and the sidebar come in later milestones; see
+> options, and (pass 5a) from tmux-home's own Claude Code hooks, which run
+> alongside the sidebar's. Git badges and the sidebar come in later milestones; see
 > [`docs/superpowers/specs/2026-09-29-rust-daemon-design.md`](docs/superpowers/specs/2026-09-29-rust-daemon-design.md) §13.
 
 ## Why
@@ -105,9 +106,10 @@ case). For example `@waiting s:main api`.
 
 ### Agents
 
-When [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s
-hooks are installed, tmux-home reads the `@pane_*` options they publish
-(read-only: it never writes or clears them). An agent window's row shows
+Agent state comes from tmux-home's own Claude Code hooks (`@home_*`, below)
+or, for panes they haven't touched, from the `@pane_*` options
+[tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s hooks
+publish (read-only: tmux-home never writes or clears those). An agent window's row shows
 status icon **and** word, the current run's elapsed time and the agent kind
 (`● running  12m  claude ×2` for two agents), in place of command and path.
 Windows whose agent is waiting, errored or has a pending notification are
@@ -120,8 +122,131 @@ last reply), then the pane's last lines.
 An agent whose pane has moved on (the agent crashed and left its options
 behind: Claude counts as alive only while its pane runs its versioned binary,
 `claude` or `node`; other agents while it isn't a shell) is **stale**: dimmed with `(ended?)`, never pinned or
-counted. Without the sidebar, windows are listed as before, with no agent
-column.
+counted. With neither set of hooks, windows are listed as before, with no
+agent column.
+
+### Claude Code hooks
+
+tmux-home records Claude Code's state itself with `tmux-home hook claude
+<Event>`: it reads the hook's JSON on stdin, finds its pane from
+`$TMUX_PANE` (and the server from `$TMUX`), and writes that pane's
+`@home_*` options (`@home_agent`, `@home_status`, `@home_wait_reason`,
+`@home_run_started`, `@home_prompt`, …). It talks to no daemon (the daemon's
+poll picks the options up), and it always exits 0, silently and in about
+11 ms (release build, p50 of 100 runs; p95 12.5 ms): a problem (no
+`$TMUX_PANE`, tmux unreachable, bad JSON) is a no-op, noted in
+`<state root>/<server key>/hook.log` (rotated to `hook.log.1` at 64 KiB).
+
+Wire it in Claude Code's settings (`~/.claude/settings.json` or a
+project's `.claude/settings.json`), merged into any `hooks` you already
+have. The event names are Claude Code's, and the command's last word must
+match the key it sits under:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SessionStart"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude UserPromptSubmit"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude Stop"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude StopFailure"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude Notification"
+          }
+        ]
+      }
+    ],
+    "PermissionDenied": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude PermissionDenied"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SessionEnd"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SubagentStart"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SubagentStop"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Only these nine events: none on the tool-call path (`PostToolUse`,
+`Task*`), so the hook never slows a tool call down. tmux-home's options
+live in their own namespace, so these hooks run side by side with
+tmux-agent-sidebar's; for a pane with `@home_*` options they take
+precedence, and panes without them fall back to the sidebar's `@pane_*`.
+Background shells are only seen through the sidebar (its `PostToolUse`
+hook sets `@pane_bg_cmd`): with it, a Stop while one is live reads
+`◎ background`; without it, `○ idle`.
 
 `^x` closes at once when every pane in the window is idle at a shell prompt
 (bash, zsh, fish, sh, …; sidebar panes don't count). Otherwise it asks

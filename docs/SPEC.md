@@ -163,8 +163,30 @@ window) and the filter is kept.
 
 ## 7. Agent awareness
 
-State comes from the pane options the tmux-agent-sidebar hooks publish
-(event-driven, sub-second). tmux-home adds no hooks of its own.
+State comes from pane options that agent hooks publish (event-driven,
+sub-second): tmux-home's own (`tmux-home hook claude <Event>`, writing
+`@home_*`, pass 5a) and tmux-agent-sidebar's (`@pane_*`), per pane in that
+order.
+
+> **Pass 5a.** `tmux-home hook claude <Event>` handles SessionStart,
+> UserPromptSubmit, Stop, StopFailure, Notification, PermissionDenied,
+> SessionEnd, SubagentStart and SubagentStop (not PostToolUse or Task*),
+> ported from the sidebar's handlers through an `AgentAdapter`
+> (`src/agent/adapter.rs`, `claude.rs`). It writes `@home_agent`,
+> `@home_status`, `@home_attention`, `@home_wait_reason`,
+> `@home_run_started`, `@home_prompt` / `_prompt_source`,
+> `@home_subagents`, `@home_bg_cmd`, `@home_permission_mode`,
+> `@home_worktree_name` / `_branch`, `@home_session_id`, with the
+> sidebar's value vocabulary, so the table below applies with `@home_`
+> for `@pane_` (and `@home_run_started` for `@pane_started_at`). The
+> `HomeSource` reads them first; a pane without them falls back to the
+> sidebar's. Differences from the sidebar: no activity log, cwd or desktop
+> notifications; no TaskCompleted, so a running agent never gets
+> attention; a background shell is known only from the sidebar's
+> `@pane_bg_cmd` (mirrored into `@home_bg_cmd` at Stop and Notification),
+> since the hook stays off PostToolUse; a SessionEnd whose payload names an
+> `agent_id` is a subagent's and ignored, besides the sidebar's guard
+> (ignored while `@home_subagents` is non-empty).
 
 > **Until pass 5** (implemented in pass 4), this state comes only from
 > tmux-agent-sidebar's `@pane_*` options, read in the same `list-panes` call

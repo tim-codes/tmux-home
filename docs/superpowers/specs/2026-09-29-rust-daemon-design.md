@@ -176,6 +176,16 @@ UserPromptSubmit, Stop, StopFailure, Notification, PermissionDenied,
 SessionEnd, SubagentStart, SubagentStop. Not PostToolUse / Task* — kept off
 the tool-call path. Payload on stdin, pane from `$TMUX_PANE`.
 
+> **As built (pass 5a).** The trait is `agent::adapter::AgentAdapter`:
+> `kind()`, `events()` and `on_hook(event, payload, prior, now) ->
+> Vec<Change>`, pure; `prior` is the pane state the rules need (subagent
+> list, live background shell), read in one `display-message` call, and
+> the changes are written in one chained `set-option` call. Liveness stays
+> on `AgentSource::looks_alive` (by kind). A background shell is known
+> only from the sidebar's `@pane_bg_cmd` while both run; after the R5
+> cutover Stop always lands in idle unless a non-tool-path signal is
+> found. The 10-minute stale clean-up is not built yet.
+
 **Storage:** pane options in tmux-home's own namespace (`@home_agent`,
 `@home_status`, `@home_wait_reason`, `@home_run_started`, `@home_prompt`, …)
 so the old and new hooks can run side by side during migration without
