@@ -150,12 +150,8 @@ impl Tx {
     /// (running or waiting). An agent pane is named by its agent kind
     /// (`claude`), not its command (Claude reports its version).
     pub fn busy(&self, wid: &str) -> Busy {
-        let fmt = format!(
-            "#{{pane_id}}\x1f#{{pane_tty}}\x1f#{{@pane_role}}\x1f#{{pane_current_command}}\x1f{}\x1e",
-            crate::tmux::snapshot::agent_opts_fmt()
-        );
         let mut busy = Busy::default();
-        let Ok(out) = self.run(&["list-panes", "-t", wid, "-F", &fmt]) else {
+        let Ok(panes) = crate::tmux::snapshot::read_panes(&self.tmux, wid) else {
             return busy;
         };
         let mut add = |c: String| {
@@ -163,38 +159,18 @@ impl Tx {
                 busy.commands.push(c);
             }
         };
-        for rec in out.split("\x1e\n").map(|r| r.trim_end_matches('\x1e')) {
-            let f: Vec<&str> = rec.split(US).collect();
-            if f.len() < 4 {
-                continue;
-            }
-            let (id, tty, role, cmd) = (f[0], f[1], f[2], f[3]);
-            if role == "sidebar" {
-                continue;
-            }
-            let pane = crate::tmux::snapshot::Pane {
-                id: id.into(),
-                window_id: wid.into(),
-                session_id: String::new(),
-                index: 0,
-                active: false,
-                current_command: cmd.into(),
-                current_path: String::new(),
-                title: String::new(),
-                role: role.into(),
-                agent_opts: crate::tmux::snapshot::agent_opts_from(&f[4..]),
-            };
-            let agent = crate::agent::pane_agent(&pane).filter(|a| a.live());
+        for pane in panes.iter().filter(|p| p.role != "sidebar") {
+            let agent = crate::agent::pane_agent(pane).filter(|a| a.live());
             if let Some(a) = &agent {
                 busy.agent_working |= a.state.status.working();
             }
-            if !is_shell(cmd) {
+            if !is_shell(&pane.current_command) {
                 match agent {
                     Some(a) => add(a.state.kind.name().to_string()),
-                    None => add(cmd.to_string()),
+                    None => add(pane.current_command.clone()),
                 }
             } else {
-                for job in stopped_jobs(tty) {
+                for job in stopped_jobs(&pane.tty) {
                     add(format!("{job} (stopped)"));
                 }
             }

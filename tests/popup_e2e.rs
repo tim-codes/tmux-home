@@ -227,7 +227,7 @@ fn cursor_opens_on_the_window_selected_just_before() {
     o.wait_gone("F1 help");
 }
 
-/// A live agent pane in `beta:agent` (`sleep`, so not a shell) with these
+/// A live agent pane in `beta:<window>` (`fake_claude`) with these
 /// `@pane_*` options, faked the way tmux-agent-sidebar's hooks write them.
 fn fake_agent(s: &TestServer, window: &str, opts: &[(&str, &str)]) {
     let target = format!("beta:{window}");
@@ -242,7 +242,7 @@ fn fake_agent(s: &TestServer, window: &str, opts: &[(&str, &str)]) {
             "beta:",
             "-n",
             window,
-            "sleep 1000",
+            &fake_claude(),
         ]);
     }
     for (k, v) in opts {

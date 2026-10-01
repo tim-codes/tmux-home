@@ -81,11 +81,13 @@ fn newline_in_pane_path_round_trips() {
 fn unparseable_record_is_skipped() {
     let opts = "\x1f".repeat(tmux_home::agent::OPTIONS.len());
     let good = format!(
-        "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1f\x1f{opts}alpha\x1ft\x1fw\x1e\n"
+        "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1f\x1f/dev/ttys9\x1f{opts}alpha\x1ft\x1fw\x1e\n"
     );
     let panes = format!("garbage\x1e\n{good}");
     let snap = tmux_home::tmux::snapshot::parse(&panes, "also garbage\x1e\n");
     assert_eq!(snap.panes.len(), 1);
+    assert_eq!(snap.panes[0].tty, "/dev/ttys9");
+    assert_eq!(snap.windows[0].name, "w");
     assert!(snap.clients.is_empty());
 }
 

@@ -8,30 +8,43 @@
 //!
 //! Today the only source is tmux-agent-sidebar's `@pane_*` options
 //! (`sidebar`). Pass 5 adds tmux-home's own hooks writing `@home_*`: one more
-//! module implementing `AgentSource`, its names appended to `OPTIONS` and
-//! the source put first in `SOURCES`. Nothing in the UI changes.
+//! module implementing `AgentSource`, put first in `SOURCES`; `OPTIONS`
+//! picks up its names. Nothing in the UI changes.
 
 pub mod sidebar;
 
 use crate::tmux::snapshot::Pane;
-
-/// Every pane option any source reads; the snapshot fetches these.
-pub const OPTIONS: &[&str] = sidebar::OPTIONS;
+use std::sync::LazyLock;
 
 /// Sources in priority order: the first that recognises a pane wins.
 pub const SOURCES: &[&dyn AgentSource] = &[&sidebar::Sidebar];
 
+/// Every pane option any source reads, each once, in source order; the
+/// snapshot fetches these.
+pub static OPTIONS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let mut v: Vec<&'static str> = Vec::new();
+    for o in SOURCES.iter().flat_map(|s| s.options()) {
+        if !v.contains(o) {
+            v.push(o);
+        }
+    }
+    v
+});
+
 /// One provider of agent state.
 pub trait AgentSource: Sync {
+    /// The pane options this source reads.
+    fn options(&self) -> &'static [&'static str];
+
     /// The pane's agent state, if this source has any for it.
     fn read(&self, pane: &Pane) -> Option<AgentState>;
 
     /// Staleness check: whether the agent the options describe still looks
     /// alive. The options are only cleaned up by the agent's own exit
-    /// hook; a crash or `kill -9` leaves them behind on a pane that is back
-    /// at its shell prompt.
-    fn looks_alive(&self, pane: &Pane, _state: &AgentState) -> bool {
-        !crate::ops::is_shell(&pane.current_command)
+    /// hook; a crash or `kill -9` leaves them behind on a pane that has
+    /// moved on (back at its shell prompt, or running something else).
+    fn looks_alive(&self, pane: &Pane, state: &AgentState) -> bool {
+        state.kind.looks_alive(&pane.current_command)
     }
 }
 
@@ -53,6 +66,18 @@ impl AgentKind {
         }
     }
 
+    /// Whether a pane running `cmd` (its `pane_current_command`) still runs
+    /// this agent. Claude is checked positively: it runs as its version
+    /// (`2.1.283`, the name of its versioned binary), or as `claude` or
+    /// `node` (npm installs); anything else means it has gone. Other kinds
+    /// are alive unless the pane is back at a shell.
+    pub fn looks_alive(&self, cmd: &str) -> bool {
+        match self {
+            AgentKind::Claude => matches!(cmd, "claude" | "node") || is_version(cmd),
+            _ => !crate::ops::is_shell(cmd),
+        }
+    }
+
     pub fn name(&self) -> &str {
         match self {
             AgentKind::Claude => "claude",
@@ -62,6 +87,15 @@ impl AgentKind {
             AgentKind::Other(s) => s,
         }
     }
+}
+
+/// `^\d+\.\d+\.\d+$`.
+fn is_version(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Agent status. The derived order is urgency: a window shows its most
@@ -117,7 +151,10 @@ impl Status {
 /// Why an agent is waiting (or what went wrong).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WaitReason {
+    /// A permission prompt is open.
     Permission,
+    /// A permission was denied (by a rule or the user); the run stopped.
+    PermissionDenied,
     /// A question to the user (`elicitation_dialog`).
     Question,
     /// A teammate went idle; its name.
@@ -132,6 +169,7 @@ impl WaitReason {
     pub fn label(&self) -> String {
         match self {
             WaitReason::Permission => "permission".into(),
+            WaitReason::PermissionDenied => "permission denied".into(),
             WaitReason::Question => "question".into(),
             WaitReason::TeammateIdle(n) => format!("teammate idle: {n}"),
             WaitReason::Error(e) => format!("error: {e}"),
@@ -179,11 +217,13 @@ pub struct PaneAgent {
 }
 
 impl PaneAgent {
-    /// NEEDS YOU: a pending notification, or waiting/error, and not stale.
+    /// NEEDS YOU: waiting or error, or a pending notification on an agent
+    /// that isn't running (the sidebar's TaskCompleted hook flags attention
+    /// mid-run without changing the status); never when stale.
     pub fn needs_you(&self) -> bool {
         !self.stale
-            && (self.state.attention
-                || matches!(self.state.status, Status::Waiting | Status::Error))
+            && (matches!(self.state.status, Status::Waiting | Status::Error)
+                || (self.state.attention && self.state.status != Status::Running))
     }
 
     pub fn live(&self) -> bool {
@@ -220,15 +260,18 @@ impl WindowAgents {
         (!panes.is_empty()).then_some(WindowAgents { panes })
     }
 
-    /// The pane the window is shown by: the most urgent live agent (the
-    /// first of equals), else the first stale one.
+    /// The pane the window is shown by (row, card, preview, ⏎): the one
+    /// that needs you, if any; else the most urgent live agent (the first
+    /// of equals); else the first stale one.
     pub fn lead(&self) -> &PaneAgent {
-        self.panes
-            .iter()
-            .filter(|p| p.live())
-            .rev() // max_by_key keeps the last maximum
-            .max_by_key(|p| p.state.status)
-            .unwrap_or(&self.panes[0])
+        self.needing().unwrap_or_else(|| {
+            self.panes
+                .iter()
+                .filter(|p| p.live())
+                .rev() // max_by_key keeps the last maximum
+                .max_by_key(|p| p.state.status)
+                .unwrap_or(&self.panes[0])
+        })
     }
 
     /// Window status: the most urgent live agent's; `None` when every
@@ -346,6 +389,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>(),
+            tty: String::new(),
         }
     }
 
@@ -436,6 +480,84 @@ pub(crate) mod tests {
             ("@pane_attention", "clear")
         ]));
         assert!(!needs(&[("@pane_status", "idle")]));
+    }
+
+    /// The sidebar's TaskCompleted hook sets attention without touching
+    /// the status: a running agent with a notification isn't waiting on you.
+    #[test]
+    fn running_with_a_notification_doesnt_need_you() {
+        let p = |status| {
+            pane_agent(&pane(
+                "%1",
+                "2.1.283",
+                &[
+                    ("@pane_agent", "claude"),
+                    ("@pane_status", status),
+                    ("@pane_attention", "notification"),
+                ],
+            ))
+            .unwrap()
+        };
+        assert!(!p("running").needs_you());
+        assert!(p("idle").needs_you());
+        assert!(p("background").needs_you());
+        assert!(p("waiting").needs_you() && p("error").needs_you());
+    }
+
+    /// The lead (card, preview, ⏎) is the pane that needs you, when one
+    /// does, even if another pane is more urgent by status.
+    #[test]
+    fn lead_is_the_pane_that_needs_you() {
+        let panes = [
+            agent("%1", "node", "running"),
+            pane(
+                "%2",
+                "node",
+                &[
+                    ("@pane_agent", "claude"),
+                    ("@pane_status", "idle"),
+                    ("@pane_attention", "notification"),
+                ],
+            ),
+        ];
+        let w = WindowAgents::of(&panes).unwrap();
+        assert_eq!(w.status(), Some(Status::Running));
+        assert_eq!(w.lead().pane, "%2");
+        assert_eq!(w.needing().unwrap().pane, "%2");
+    }
+
+    /// Positive liveness per kind: Claude runs as its version (or
+    /// `claude`/`node`); anything else in its pane means it has gone.
+    #[test]
+    fn liveness_by_kind() {
+        let stale = |kind: &str, cmd: &str| {
+            pane_agent(&pane(
+                "%1",
+                cmd,
+                &[("@pane_agent", kind), ("@pane_status", "running")],
+            ))
+            .unwrap()
+            .stale
+        };
+        for cmd in ["2.1.283", "10.0.1", "claude", "node"] {
+            assert!(!stale("claude", cmd), "{cmd}");
+        }
+        for cmd in ["fish", "-zsh", "nvim", "ssh", "1.2", "2.1.x", "v2.1.3", ""] {
+            assert!(stale("claude", cmd), "{cmd}");
+        }
+        assert!(!stale("codex", "nvim") && !stale("codex", "codex"));
+        assert!(stale("codex", "zsh") && stale("opencode", "bash"));
+    }
+
+    #[test]
+    fn options_are_every_sources_names_once() {
+        for o in sidebar::OPTIONS {
+            assert!(OPTIONS.contains(o), "{o}");
+        }
+        let mut v = OPTIONS.clone();
+        v.sort();
+        v.dedup();
+        assert_eq!(v.len(), OPTIONS.len());
     }
 
     #[test]

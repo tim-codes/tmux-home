@@ -75,6 +75,9 @@ pub struct Pane {
     /// stored, not its elapsed time), so they can be hashed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agent_opts: BTreeMap<String, String>,
+    /// The pane's terminal (`/dev/ttys004`), for stopped-job checks.
+    #[serde(default)]
+    pub tty: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
@@ -97,17 +100,17 @@ const REC_END: &str = "\x1e\n";
 // The agent options sit between the fixed fields and the names; a prompt is
 // stored with newlines and `|` replaced, but a literal \x1f in one would
 // shift the fields after it (the record is then misread, not lost).
-const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{@pane_role}\x1f";
+const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{@pane_role}\x1f#{pane_tty}\x1f";
 const PANE_TAIL: &str = "#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
 /// Fields before the agent options.
-const HEAD_FIELDS: usize = 11;
+const HEAD_FIELDS: usize = 12;
 /// Fields in a `list-panes` record.
 fn pane_fields() -> usize {
     HEAD_FIELDS + crate::agent::OPTIONS.len() + 3
 }
 
 /// `#{@a}\x1f#{@b}\x1f…\x1f`: the agent options, each followed by a separator.
-pub fn agent_opts_fmt() -> String {
+fn agent_opts_fmt() -> String {
     crate::agent::OPTIONS
         .iter()
         .map(|o| format!("#{{{o}}}\x1f"))
@@ -116,7 +119,7 @@ pub fn agent_opts_fmt() -> String {
 
 /// Agent options from their fields, in `agent::OPTIONS` order; empty
 /// values are dropped.
-pub fn agent_opts_from(fields: &[&str]) -> BTreeMap<String, String> {
+fn agent_opts_from(fields: &[&str]) -> BTreeMap<String, String> {
     crate::agent::OPTIONS
         .iter()
         .zip(fields)
@@ -153,6 +156,13 @@ pub fn read_snapshot(t: &Tmux) -> anyhow::Result<Snapshot> {
 pub async fn read_snapshot_async(t: &Tmux) -> anyhow::Result<Snapshot> {
     let t = t.clone();
     tokio::task::spawn_blocking(move || read_snapshot(&t)).await?
+}
+
+/// The panes of one window (or any `list-panes -t` target), parsed exactly
+/// as a snapshot's are.
+pub fn read_panes(t: &Tmux, target: &str) -> anyhow::Result<Vec<Pane>> {
+    let out = t.run(&["list-panes", "-t", target, "-F", &PANE_FMT])?;
+    Ok(parse(&out, "").panes)
 }
 
 fn read_parsed(t: &Tmux) -> anyhow::Result<Snapshot> {
@@ -241,6 +251,7 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
             current_path: f[9].to_string(),
             title: title.to_string(),
             role: f[10].to_string(),
+            tty: f[11].to_string(),
             agent_opts: agent_opts_from(&f[HEAD_FIELDS..n - 3]),
         });
     }

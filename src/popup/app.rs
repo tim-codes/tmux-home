@@ -791,6 +791,7 @@ mod tests {
                 title: String::new(),
                 role: String::new(),
                 agent_opts: Default::default(),
+                tty: String::new(),
             });
         }
         // a sidebar pane never describes the row
@@ -805,6 +806,7 @@ mod tests {
             title: String::new(),
             role: "sidebar".into(),
             agent_opts: Default::default(),
+            tty: String::new(),
         });
         s.clients.push(Client {
             name: "/dev/ttys1".into(),

@@ -628,6 +628,7 @@ mod tests {
                 title: String::new(),
                 role: String::new(),
                 agent_opts: Default::default(),
+                tty: String::new(),
             });
         }
         s.clients.push(Client {

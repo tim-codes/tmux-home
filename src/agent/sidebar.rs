@@ -6,8 +6,8 @@
 //! - `@pane_status`: `running` / `background` / `waiting` / `idle` /
 //!   `error` (older builds: `notification`, shown as waiting);
 //! - `@pane_attention`: `notification` or `clear`;
-//! - `@pane_wait_reason`: `permission`, `permission_prompt`,
-//!   `permission_denied`, `elicitation_dialog`, `teammate_idle:<name>[:why]`,
+//! - `@pane_wait_reason`: `permission`, `permission_prompt` (a prompt is
+//!   open), `permission_denied` (PermissionDenied: the run was refused), `elicitation_dialog`, `teammate_idle:<name>[:why]`,
 //!   `session_resumed[_compact]`, or the error text when status is `error`;
 //! - `@pane_started_at`: Unix seconds at UserPromptSubmit, cleared at
 //!   Stop (unless a bg shell lives on) and StopFailure;
@@ -36,9 +36,17 @@ pub const OPTIONS: &[&str] = &[
     "@pane_session_id",
 ];
 
+/// Prompts are cut to this many characters when read: the sidebar stores
+/// whole prompts (or replies), and the popup shows a few lines at most.
+pub const MAX_PROMPT: usize = 2000;
+
 pub struct Sidebar;
 
 impl AgentSource for Sidebar {
+    fn options(&self) -> &'static [&'static str] {
+        OPTIONS
+    }
+
     fn read(&self, pane: &Pane) -> Option<AgentState> {
         let get = |k: &str| {
             pane.agent_opts
@@ -73,7 +81,7 @@ impl AgentSource for Sidebar {
             attention: get("@pane_attention") == Some("notification"),
             wait_reason,
             run_started: get("@pane_started_at").and_then(|s| s.parse().ok()),
-            prompt: get("@pane_prompt").map(str::to_string),
+            prompt: get("@pane_prompt").map(|p| p.chars().take(MAX_PROMPT).collect()),
             prompt_is_reply: get("@pane_prompt_source") == Some("response"),
             subagents: get("@pane_subagents")
                 .map(|s| {
@@ -93,7 +101,8 @@ impl AgentSource for Sidebar {
 
 fn parse_reason(r: &str, status: Status) -> WaitReason {
     match r {
-        "permission" | "permission_prompt" | "permission_denied" => WaitReason::Permission,
+        "permission" | "permission_prompt" => WaitReason::Permission,
+        "permission_denied" => WaitReason::PermissionDenied,
         "elicitation_dialog" => WaitReason::Question,
         _ => {
             if let Some(rest) = r.strip_prefix("teammate_idle:") {
@@ -164,6 +173,14 @@ mod tests {
     }
 
     #[test]
+    fn long_prompts_are_cut_at_read() {
+        let long = "é".repeat(5000);
+        let s = read(&[("@pane_agent", "claude"), ("@pane_prompt", &long)]).unwrap();
+        assert_eq!(s.prompt.unwrap().chars().count(), MAX_PROMPT);
+        assert_eq!(MAX_PROMPT, 2000);
+    }
+
+    #[test]
     fn statuses_and_reasons() {
         let st = |v| read(&[("@pane_agent", "claude"), ("@pane_status", v)]).unwrap();
         assert_eq!(st("notification").status, Status::Waiting);
@@ -179,7 +196,14 @@ mod tests {
             .unwrap()
         };
         assert_eq!(r("waiting", "permission_prompt"), WaitReason::Permission);
-        assert_eq!(r("waiting", "permission_denied"), WaitReason::Permission);
+        assert_eq!(
+            r("waiting", "permission_denied"),
+            WaitReason::PermissionDenied
+        );
+        assert_ne!(
+            WaitReason::PermissionDenied.label(),
+            WaitReason::Permission.label()
+        );
         assert_eq!(r("waiting", "elicitation_dialog"), WaitReason::Question);
         assert_eq!(
             r("waiting", "teammate_idle:alice:tokens"),
