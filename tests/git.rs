@@ -770,3 +770,92 @@ async fn an_unrepresentable_key_fails_closed() {
         assert!(!marker.exists(), "{format}: the driver ran");
     }
 }
+
+// ---- re-review 3: never recurse into submodules ------------------------------
+
+#[tokio::test]
+async fn submodule_filters_never_run() {
+    git_env();
+    for format in ["sha1", "sha256"] {
+        let t = TempDir::new("submod");
+        let sub = t.repo_in(&format!("sub-{format}"), format);
+        write(&sub, "f.txt", "one\n");
+        commit_all(&sub, "f");
+        let root = t.repo_in(&format!("super-{format}"), format);
+        git_at(
+            &root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub.to_str().unwrap(),
+                "sm",
+            ],
+        );
+        commit_all(&root, "add sm");
+        let marker = t.0.join(format!("marker-{format}"));
+        let script = fake_git(&t.0, &format!("touch '{}'; cat", marker.display()));
+        let modules = root.join(".git/modules/sm");
+        write(&modules, "info/attributes", "* filter=se\n");
+        git_at(
+            &modules,
+            &["config", "filter.se.clean", script.to_str().unwrap()],
+        );
+        git_at(
+            &modules,
+            &["config", "filter.se.process", script.to_str().unwrap()],
+        );
+        git_at(
+            &modules,
+            &["config", "core.fsmonitor", script.to_str().unwrap()],
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        write(&root.join("sm"), "f.txt", "two\n");
+        write(&root, "README", "edited\n");
+        let st = full(&root).await;
+        assert!(
+            !marker.exists(),
+            "{format}: a submodule's filter ran in status"
+        );
+        assert!(!st.stale && !st.limited, "{format}: {st:?}");
+        // the submodule reads as unchanged; the superproject's edit shows
+        assert_eq!(st.modified, 1, "{format}: {st:?}");
+        let diff = file_diff(&Git::default(), &root, " M", "sm").await;
+        assert!(
+            !diff.contains("Subproject"),
+            "{format}: diffed into sm: {diff}"
+        );
+        assert!(!marker.exists(), "{format}: a submodule's filter ran");
+    }
+}
+
+/// Config written after a refresh read its guard: the status re-reads the
+/// guard right before it runs (`run_fresh`), so the new driver is
+/// overridden too.
+#[tokio::test]
+async fn the_guard_is_read_again_right_before_status() {
+    git_env();
+    for format in ["sha1", "sha256"] {
+        let t = TempDir::new("late");
+        let root = t.repo_in(&format!("r-{format}"), format);
+        write(&root, "x.odd", "one\n");
+        commit_all(&root, "odd");
+        let p = paths(&root);
+        let early = Git::default().guarded(&root).await.unwrap();
+        // now a driver appears
+        let marker = t.0.join("marker");
+        let script = fake_git(&t.0, &format!("touch '{}'; cat", marker.display()));
+        write(&root, ".git/info/attributes", "*.odd filter=late+one\n");
+        git_at(
+            &root,
+            &["config", "filter.late+one.clean", script.to_str().unwrap()],
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        write(&root, "x.odd", "two\n");
+        let (_, s) = git::read_status_fresh(&early, &p).await.unwrap();
+        assert_eq!(s.counts.unstaged, 1, "{format}");
+        assert!(!marker.exists(), "{format}: the late driver ran");
+    }
+}

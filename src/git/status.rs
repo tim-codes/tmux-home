@@ -57,7 +57,15 @@ pub async fn file_diff(git: &Git, root: &Path, code: &str, path: &str) -> String
     match git
         .run(
             root,
-            &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", path],
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=all",
+                "HEAD",
+                "--",
+                path,
+            ],
         )
         .await
     {
@@ -65,7 +73,14 @@ pub async fn file_diff(git: &Git, root: &Path, code: &str, path: &str) -> String
         Ok(_) => git
             .run(
                 root,
-                &["diff", "--no-ext-diff", "--no-textconv", "--", path],
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--ignore-submodules=all",
+                    "--",
+                    path,
+                ],
             )
             .await
             .unwrap_or_default(),
@@ -87,7 +102,14 @@ pub async fn file_diff(git: &Git, root: &Path, code: &str, path: &str) -> String
             Err(_) => git
                 .run(
                     root,
-                    &["diff", "--no-ext-diff", "--no-textconv", "--", path],
+                    &[
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--ignore-submodules=all",
+                        "--",
+                        path,
+                    ],
                 )
                 .await
                 .unwrap_or_else(|e| e.to_string()),
@@ -179,19 +201,21 @@ fn push_entry(counts: &mut StatusCounts, code: String, path: String) {
 /// `git status` of the working tree at `dir`: counts and the branch
 /// header (upstream ahead/behind come from `branch.ab`, in the same fork).
 pub async fn status_counts(git: &Git, dir: &Path) -> Result<(StatusCounts, HeadInfo), GitError> {
-    let out = git
-        .run(
-            dir,
-            &[
-                "status",
-                "--porcelain=v2",
-                "--branch",
-                "--untracked-files=normal",
-            ],
-        )
-        .await?;
+    let out = git.run(dir, STATUS_ARGS).await?;
     Ok(parse_status(&out))
 }
+
+/// `git status` as tmux-home runs it: porcelain v2 with the branch header,
+/// untracked files always (item 2), and never into submodules (a
+/// submodule's own filters and fsmonitor aren't covered by the guard; a
+/// submodule reads as unchanged).
+pub const STATUS_ARGS: &[&str] = &[
+    "status",
+    "--porcelain=v2",
+    "--branch",
+    "--untracked-files=normal",
+    "--ignore-submodules=all",
+];
 
 pub fn parse_track(track: &str) -> (usize, usize, bool) {
     // e.g. "[ahead 2, behind 1]" or "[gone]" or ""

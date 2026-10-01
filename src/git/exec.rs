@@ -23,6 +23,14 @@
 //!   a stat-dirty file without its clean filter or eol attributes, so an LFS
 //!   or `text=auto` file can show as modified until the user's own git
 //!   refreshes the index;
+//! - never recurses into submodules (`--ignore-submodules=all` on status
+//!   and diffs, `diff.ignoreSubmodules=all`, `submodule.recurse=false`, …):
+//!   the guard reads only the superproject's config, and the `git status`
+//!   child in a submodule would read the submodule's own; a submodule
+//!   therefore reads as unchanged;
+//! - re-reads the guard right before `status` (`run_fresh`, one permit,
+//!   no await between): config written between the reads has only a
+//!   fork's start-up to slip in;
 //! - never shows colour (`color.ui=always` would put escapes in the output);
 //! - runs in its own process group with a timeout: on timeout the whole
 //!   group is killed (and the child again on drop, `kill_on_drop`), so a
@@ -195,6 +203,12 @@ const SAFE_CONFIG: &[&str] = &[
     "color.ui=false",
     "log.showSignature=false",
     "diff.external=",
+    // never into submodules: their own config and attributes aren't read
+    // by the guard (a submodule's filter ran in the `git status` child)
+    "diff.ignoreSubmodules=all",
+    "status.submoduleSummary=false",
+    "submodule.recurse=false",
+    "fetch.recurseSubmodules=false",
 ];
 
 const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -267,8 +281,13 @@ impl Git {
         if self.guard.is_some() {
             return Ok(self.clone());
         }
+        self.read_guard(dir, true).await
+    }
+
+    /// Reads `dir`'s guard afresh (one fork), taking a permit or not.
+    async fn read_guard(&self, dir: &Path, permit: bool) -> Result<Git, GitError> {
         let args = ["config", "-z", "--get-regexp", GUARD_REGEX];
-        let out = self.spawn(dir, &args, &[]).await?;
+        let out = self.spawn(dir, &args, &[], permit).await?;
         let config = match out.status.code() {
             Some(0) | Some(1) => String::from_utf8_lossy(&out.stdout).into_owned(),
             _ => return Err(failed(&out)),
@@ -281,6 +300,40 @@ impl Git {
             guard: Some(Arc::new(Guard { overrides, config })),
             ..self.clone()
         })
+    }
+
+    /// Reads `dir`'s guard afresh and runs `args` under it right after,
+    /// both under one permit: nothing waits between the config read and the
+    /// call, so config written in between has a window of one fork's
+    /// start-up, not a permit queue. Returns the guarded `Git` (for the
+    /// calls that follow) and the call's stdout.
+    pub async fn run_fresh(&self, dir: &Path, args: &[&str]) -> Result<(Git, String), GitError> {
+        let _permit = self.permit().await?;
+        let g = Git {
+            guard: None,
+            ..self.clone()
+        }
+        .read_guard(dir, false)
+        .await?;
+        let overrides = &g.guard.as_ref().expect("guarded").overrides;
+        let out = self.spawn(dir, args, overrides, false).await?;
+        if out.status.success() {
+            Ok((g.clone(), String::from_utf8_lossy(&out.stdout).into_owned()))
+        } else {
+            Err(failed(&out))
+        }
+    }
+
+    async fn permit(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, GitError> {
+        match &self.gate {
+            Some(g) => Ok(Some(
+                g.clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| GitError::Spawn(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
     }
 
     /// The command for `git -C dir <args>`, scrubbed and read-only, with
@@ -338,25 +391,19 @@ impl Git {
     async fn raw(&self, dir: &Path, args: &[&str]) -> Result<std::process::Output, GitError> {
         let g = self.guarded(dir).await?;
         let overrides = &g.guard.as_ref().expect("guarded").overrides;
-        self.spawn(dir, args, overrides).await
+        self.spawn(dir, args, overrides, true).await
     }
 
-    /// Runs git to completion (or its timeout) under a permit.
+    /// Runs git to completion (or its timeout), under a permit of its own
+    /// if `permit` (else the caller holds one).
     async fn spawn(
         &self,
         dir: &Path,
         args: &[&str],
         overrides: &[String],
+        permit: bool,
     ) -> Result<std::process::Output, GitError> {
-        let _permit = match &self.gate {
-            Some(g) => Some(
-                g.clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| GitError::Spawn(e.to_string()))?,
-            ),
-            None => None,
-        };
+        let _permit = if permit { self.permit().await? } else { None };
         let child = self
             .command(dir, args, overrides)
             .spawn()

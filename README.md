@@ -171,7 +171,10 @@ written, fsmonitor off (no hook, no `fsmonitor--daemon`), no hooks, no
 clean/process filters, textconv or external diff (every such key in the
 repo's config, whatever its name, is overridden to nothing, and attributes
 are read from the empty tree), inherited `GIT_DIR`-style variables removed,
-`LC_ALL=C`, each call in its own process group. One consequence: a
+`LC_ALL=C`, each call in its own process group, and never into a
+submodule (`--ignore-submodules=all`: a submodule's own config and
+attributes could name a filter), so **changes inside a submodule don't
+show** — the superproject's badge counts it as unchanged. One consequence: a
 stat-dirty LFS or `text=auto` file can show as modified (`!`) until your
 own git refreshes the index.
 Badges need the daemon: a popup reading tmux directly (`(direct)`) shows

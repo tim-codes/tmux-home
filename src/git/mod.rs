@@ -129,6 +129,14 @@ pub async fn read_status(git: &Git, p: &RepoPaths) -> Result<StatusPart, GitErro
     Ok(StatusPart { counts, info })
 }
 
+/// Stage 2 with the guard re-read right before it (`Git::run_fresh`): the
+/// guarded `Git` for the calls after, and the status.
+pub async fn read_status_fresh(git: &Git, p: &RepoPaths) -> Result<(Git, StatusPart), GitError> {
+    let (g, out) = git.run_fresh(&p.root, status::STATUS_ARGS).await?;
+    let (counts, info) = status::parse_status(&out);
+    Ok((g, StatusPart { counts, info }))
+}
+
 /// The badge of a repo whose config names a command that can't be switched
 /// off (`exec::Guard`): only what the HEAD stage read from files, marked
 /// `limited` (`⊗`).
@@ -149,8 +157,11 @@ pub fn limited(st: &RepoStatus) -> RepoStatus {
 pub async fn full_status(git: &Git, p: &RepoPaths, memo: &mut RefsMemo) -> RepoStatus {
     let mut st = RepoStatus::default();
     apply_head(&mut st, p);
-    let git = &match git.guarded(&p.root).await {
-        Ok(g) => g,
+    let git = &match read_status_fresh(git, p).await {
+        Ok((g, s)) => {
+            apply_status(&mut st, &s);
+            g
+        }
         Err(GitError::Limited(_)) => return limited(&st),
         Err(e) => {
             st.stale = true;
@@ -158,14 +169,6 @@ pub async fn full_status(git: &Git, p: &RepoPaths, memo: &mut RefsMemo) -> RepoS
             return st;
         }
     };
-    match read_status(git, p).await {
-        Ok(s) => apply_status(&mut st, &s),
-        Err(e) => {
-            st.stale = true;
-            st.error = Some(e.to_string());
-            return st;
-        }
-    }
     match memo.refresh(git, p).await {
         Ok(_) => apply_refs(&mut st, &memo.fields, p),
         Err(e) => {

@@ -304,7 +304,14 @@ details this section leaves open, or departs from it:
   (an `=` in it, an unparseable record) fails closed: HEAD-only badge
   `⊗` (limited), no status or diff checks, logged once. That read also
   carries item 7's keys, so it replaces the refs stage's config fork (no
-  extra fork) and is part of the memo key. Driver names in
+  extra fork) and is part of the memo key. Re-review 3: nothing recurses into
+  submodules (`--ignore-submodules=all` on status/diff/diff-tree, plus
+  `diff.ignoreSubmodules=all`, `status.submoduleSummary=false`,
+  `submodule.recurse=false`, `fetch.recurseSubmodules=false`): the status
+  child in a submodule read the submodule's own config and ran its filter.
+  A submodule now always reads as unchanged. The guard is re-read right
+  before status, both under one permit (`Git::run_fresh`): the residual
+  window for config written between the two is one fork's start-up. Driver names in
   `info/attributes` are overridden too, as a second layer. So no
   clean/process filter or textconv runs (trade-off: a stat-dirty LFS or
   `text=auto` file can read as modified). Each call runs in its own

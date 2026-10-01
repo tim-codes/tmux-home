@@ -632,15 +632,21 @@ async fn refresh(
         st = h;
         let _ = tx.send(stage(st.clone()));
     }
-    // 2. the guard: the repo's command-running config keys, each to be
-    // overridden; one that can't be leaves a HEAD-only badge, `limited`
+    // 2. the guard (the repo's command-running config keys, each to be
+    // overridden; one that can't be leaves a HEAD-only badge, `limited`),
+    // read afresh, then `git status` right after it under the same permit
     let t0 = Instant::now();
-    let git = match git.guarded(&p.root).await {
-        Ok(g) => {
+    let git = match git::read_status_fresh(&git, &p).await {
+        Ok((g, s)) => {
+            git::apply_status(&mut st, &s);
             st.limited = false;
+            st.stale = false;
+            st.error = None;
+            let _ = tx.send(stage(st.clone()));
             g
         }
         Err(e) => {
+            // back off from what it cost: the timeout, or the real time
             let took = if e == GitError::Timeout {
                 git.timeout
             } else {
@@ -657,30 +663,8 @@ async fn refresh(
             return;
         }
     };
-    // 3. git status
-    match git::read_status(&git, &p).await {
-        Ok(s) => {
-            git::apply_status(&mut st, &s);
-            st.stale = false;
-            st.error = None;
-            let _ = tx.send(stage(st.clone()));
-        }
-        Err(e) => {
-            st.stale = true;
-            st.error = (e != GitError::Timeout).then(|| e.to_string());
-            let _ = tx.send(stage(st.clone()));
-            // back off from what it cost: the timeout, or the real time
-            let took = if e == GitError::Timeout {
-                git.timeout
-            } else {
-                t0.elapsed()
-            };
-            let _ = tx.send(done(memo, Some(took)));
-            return;
-        }
-    }
     let took = t0.elapsed();
-    // 4. refs: a probe, then more only if something changed
+    // 3. refs: a probe, then more only if something changed
     match memo.refresh(&git, &p).await {
         Ok(_) => {
             git::apply_refs(&mut st, &memo.fields, &p);

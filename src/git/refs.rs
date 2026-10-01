@@ -195,6 +195,7 @@ async fn integrated(git: &Git, dir: &std::path::Path, b: &str, t: &str) -> Resul
             dir,
             &[
                 "diff-tree",
+                "--ignore-submodules=all",
                 "--no-ext-diff",
                 "--no-textconv",
                 "--quiet",
