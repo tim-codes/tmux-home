@@ -240,31 +240,43 @@ Deferred until asked for: marks + bulk actions, move-to-session, peek
 
 ## 12. Implementation
 
-**M0–M1: bash + a recent fzf, one script.** fzf 0.74 covers every v1
-interaction without leaving the popup:
+**Now (R1): Rust + ratatui, one binary, with a daemon.** The bash + fzf
+prototype (M0–M1, `bin/tmux-home`) was the reference implementation until
+the Rust popup reached parity with it, then it was deleted. The design is
+`docs/superpowers/specs/2026-09-29-rust-daemon-design.md`, which supersedes
+this section, and §7, §8, §10 and §13 where they conflict.
 
-- inline rename: `^r` → `transform` into rename mode (`change-prompt`,
-  `change-query` pre-filled with the name, `disable-search`, `rebind` of
-  `enter`), commit via `execute-silent(tmux rename-window -t {id} {q})` then
-  back to list mode + `reload`;
-- close confirm: same mode switch with a `y/n` prompt;
-- live refresh: `--listen` + a 1 s background ticker posting `reload`;
-- grouping: session header lines as non-selectable rows (`--header-lines`
-  per session is not enough; headers are rows skipped by a `transform` on
-  movement), agent card via `--preview`.
+- `tmux-home popup` runs inside `display-popup -E -B -w 100% -h 100%`, pinned
+  to the invoking client (`-c`, and `TMUX_HOME_CLIENT` in its environment):
+  every switch and every notion of "current" use that client.
+- `tmux-home daemon`, one per tmux server, reads tmux (polling every 500 ms
+  by default) and pushes snapshots to subscribers. The popup subscribes; if
+  the daemon is down it reads tmux itself, shows `(direct)` in the header,
+  and starts a new daemon in the background. After each of its own writes
+  the popup re-reads tmux at once.
+- The popup's state is a pure state machine (`src/popup/app.rs`: keys and
+  snapshots in, actions out); `src/ops.rs` performs the writes. Every write
+  targets IDs (`@n`, `%n`, `$n`), never indexes or names. Names and paths
+  are escaped for tmux (`#` → `##`) so they are stored exactly as typed.
+- Closed windows go to `<state root>/<server key>/closed.json`: a 10-deep
+  LIFO of window shapes, written atomically under `state.lock`, shared by
+  the popup and `tmux-home reopen`. The bash prototype's `closed` file is
+  imported once.
+- Sidebar panes (`@pane_role=sidebar`) are never the row's pane, never
+  previewed, never close-checked and never part of a reopen shape. A job
+  stopped with `^z` makes its pane busy.
 
-Rows carry hidden ID fields (`--with-nth` / `--nth`) so every action targets
-`@id`/`%id`, never the visible index.
+**Install:** a TPM plugin. `tmux-home.tmux` binds `@home-keys` (default `.`)
+and starts the daemon; without a built binary the key shows a one-line
+message and the plugin starts `cargo build --release` in the background.
+Dependencies: tmux ≥ 3.3 and a Rust toolchain.
 
-**Rust + ratatui later, only if the prototype hits fzf's limits** (e.g.
-editors disturbed by reload, header rows fighting navigation, preview
-latency). Same stack as tmux-agent-sidebar.
-
-**Install:** a TPM plugin (`tmux-home.tmux` sets the bindings and nothing
-else). Dependencies: bash, a recent fzf (M0 uses `--id-nth`, `--footer` and `wait`; tested with 0.74.4), tmux ≥ 3.3.
-
-**Testing:** all tmux I/O in one function set, exercised against a
-throwaway `tmux -L tmux-home-test` server.
+**Testing:** `cargo test`. Unit tests cover the pure popup state and drawing;
+integration and end-to-end tests run against throwaway servers only
+(`tmux -L th-test-*`, plus a `th-outer-*` server whose pane hosts a real
+client, so the popup's binding is pressed and the popup is read back with
+`capture-pane`). `docs/superpowers/notes/r1-parity.md` maps the retired bash
+suite's checks to these tests.
 
 ## 13. Milestones
 

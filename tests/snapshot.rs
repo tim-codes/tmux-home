@@ -79,7 +79,7 @@ async fn newline_in_pane_path_round_trips() {
 
 #[test]
 fn unparseable_record_is_skipped() {
-    let good = "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1falpha\x1ft\x1fw\x1e\n";
+    let good = "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1f\x1falpha\x1ft\x1fw\x1e\n";
     let panes = format!("garbage\x1e\n{good}");
     let snap = tmux_home::tmux::snapshot::parse(&panes, "also garbage\x1e\n");
     assert_eq!(snap.panes.len(), 1);

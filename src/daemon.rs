@@ -4,7 +4,7 @@ use crate::{
     paths::Paths,
     tmux::{
         Tmux,
-        snapshot::Snapshot,
+        snapshot::{Snapshot, read_snapshot},
         source::{self, SourceEvent, SourceKind},
     },
 };
@@ -78,6 +78,7 @@ pub async fn run_with_version(
     let listener = UnixListener::bind(&paths.sock)?;
 
     let (tx, latest) = watch::channel(None);
+    let reader = Tmux::new(tmux_socket.clone());
     let mut events = source::start(kind, Tmux::new(tmux_socket));
     let restart = Arc::new(Notify::new());
     let mut seq = 0u64;
@@ -94,7 +95,7 @@ pub async fn run_with_version(
                 Some(SourceEvent::Gone) | None => break Ok(()),
             },
             conn = listener.accept() => match conn {
-                Ok((stream, _)) => { tokio::spawn(serve(stream, latest.clone(), restart.clone(), version)); }
+                Ok((stream, _)) => { tokio::spawn(serve(stream, latest.clone(), reader.clone(), restart.clone(), version)); }
                 Err(e) => {
                     eprintln!("tmux-home: accept error: {e:#}");
                     tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
@@ -114,6 +115,7 @@ pub async fn run_with_version(
 async fn serve(
     stream: UnixStream,
     mut latest: Latest,
+    reader: Tmux,
     restart: Arc<Notify>,
     version: &'static str,
 ) {
@@ -133,7 +135,14 @@ async fn serve(
     if latest.wait_for(|s| s.is_some()).await.is_err() {
         return;
     }
-    let cur = latest.borrow_and_update().clone();
+    let mut cur = latest.borrow_and_update().clone();
+    // a subscriber (the popup) places its cursor on the current window from
+    // its first snapshot: read it fresh, the source's may be up to a poll old
+    if let (Request::Subscribe { .. }, Some((seq, _))) = (&req, &cur)
+        && let Ok((fresh, _)) = read_snapshot(&reader).await
+    {
+        cur = Some((*seq, fresh));
+    }
     if send(&mut w, cur).await.is_err() {
         return;
     }
