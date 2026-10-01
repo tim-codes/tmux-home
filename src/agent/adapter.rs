@@ -25,6 +25,12 @@ pub struct Prior {
     pub sidebar_bg_cmd: String,
     /// `@home_bg_cmd`: the background shell the last Stop reported.
     pub home_bg_cmd: String,
+    /// `@home_status`, `@home_attention`, `@home_wait_reason`: what a
+    /// resolution event (a tool finishing after a permission prompt) needs
+    /// to decide whether there is a wait to end.
+    pub status: String,
+    pub attention: String,
+    pub wait_reason: String,
 }
 
 pub trait AgentAdapter: Sync {
@@ -35,6 +41,13 @@ pub trait AgentAdapter: Sync {
     /// The events `on_hook` acts on; any other is a no-op, decided before
     /// tmux is asked anything.
     fn events(&self) -> &'static [&'static str];
+
+    /// Events whose payload `on_hook` never looks at (per-tool-call
+    /// events, whose payload carries the tool's whole output): the hook
+    /// drains stdin without parsing it and passes an empty object.
+    fn payload_unused(&self, _event: &str) -> bool {
+        false
+    }
 
     /// The changes `event` (with its stdin `payload`) makes to a pane in
     /// state `prior`; `now` is Unix seconds. Unknown events: no changes.

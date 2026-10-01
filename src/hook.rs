@@ -54,8 +54,16 @@ fn run(args: &[String]) {
     let Some(socket) = socket.clone() else {
         return; // no $TMUX: nowhere to write, nowhere to log
     };
+    let payload_unused = ad.payload_unused(event);
     let mut input = String::new();
-    if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+    let read = if payload_unused {
+        // drained, never parsed: Claude Code's write must not hit a
+        // closed pipe, and a tool's output can be megabytes of JSON
+        std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()).map(|_| ())
+    } else {
+        std::io::stdin().read_to_string(&mut input).map(|_| ())
+    };
+    if let Err(e) = read {
         return log(&format!("stdin: {e}"));
     }
     let payload: serde_json::Value = if input.trim().is_empty() {
@@ -74,7 +82,8 @@ fn run(args: &[String]) {
 }
 
 /// Reads the pane's prior state, runs the adapter, writes its changes:
-/// two tmux commands at most.
+/// two tmux commands at most, one when there is nothing to change (the
+/// fast path of a per-tool-call event on a pane that isn't waiting).
 pub fn apply_event(
     t: &Tmux,
     pane: &str,
@@ -88,17 +97,18 @@ pub fn apply_event(
     write(t, pane, &changes)
 }
 
-/// The pane's subagent list and known background shells, in one call:
-/// tmux-agent-sidebar's `@pane_bg_cmd` (set by its PostToolUse hook,
-/// cleared by its refresh sweep; tmux-home stays off the tool-call path,
-/// spec §5) and `@home_bg_cmd` (from the last Stop's `background_tasks`).
+/// The pane's subagent list, known background shells and wait state, in
+/// one call: tmux-agent-sidebar's `@pane_bg_cmd` (set by its PostToolUse
+/// hook, cleared by its refresh sweep), `@home_bg_cmd` (from the last
+/// Stop's `background_tasks`), and `@home_status` / `@home_attention` /
+/// `@home_wait_reason`.
 pub fn read_prior(t: &Tmux, pane: &str) -> anyhow::Result<Prior> {
     let out = t.run(&[
         "display-message",
         "-p",
         "-t",
         pane,
-        "#{@home_subagents}\x1f#{@pane_bg_cmd}\x1f#{@home_bg_cmd}",
+        "#{@home_subagents}\x1f#{@pane_bg_cmd}\x1f#{@home_bg_cmd}\x1f#{@home_status}\x1f#{@home_attention}\x1f#{@home_wait_reason}",
     ])?;
     let out = out.strip_suffix('\n').unwrap_or(&out);
     let mut f = out.split('\x1f').map(|v| v.trim().to_string());
@@ -106,6 +116,9 @@ pub fn read_prior(t: &Tmux, pane: &str) -> anyhow::Result<Prior> {
         subagents: f.next().unwrap_or_default(),
         sidebar_bg_cmd: f.next().unwrap_or_default(),
         home_bg_cmd: f.next().unwrap_or_default(),
+        status: f.next().unwrap_or_default(),
+        attention: f.next().unwrap_or_default(),
+        wait_reason: f.next().unwrap_or_default(),
     })
 }
 

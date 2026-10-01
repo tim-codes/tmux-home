@@ -133,7 +133,7 @@ tmux-home records Claude Code's state itself with `tmux-home hook claude
 `@home_*` options (`@home_agent`, `@home_status`, `@home_wait_reason`,
 `@home_run_started`, `@home_prompt`, …). It talks to no daemon (the daemon's
 poll picks the options up), and it always exits 0, silently and in about
-11 ms (release build, p50 of 100 runs; p95 12.1 ms): a problem (no
+10 ms (release build, p50 of 100 runs; p95 11.7 ms): a problem (no
 `$TMUX_PANE`, tmux unreachable, bad JSON) is a no-op, noted in
 `<state root>/<server key>/hook.log` (rotated to `hook.log.1` at 64 KiB).
 
@@ -247,13 +247,50 @@ every Stop going), and a UserPromptSubmit hook's stdout becomes context.
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude PostToolUse >/dev/null 2>&1 || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude PostToolUseFailure >/dev/null 2>&1 || true",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
-Only these nine events: none on the tool-call path (`PostToolUse`,
-`Task*`), so the hook never slows a tool call down. tmux-home's options
+Claude Code fires no hook when you answer a permission prompt (or an MCP
+elicitation): `PermissionRequest` fires as the dialog opens and
+`Notification permission_prompt` six seconds later, but nothing on the
+answer. The first sign is the approved tool's `PostToolUse` (or
+`PostToolUseFailure`) as it finishes, so those two take a waiting pane
+back to `running` (attention and reason cleared, run time kept); without
+them the pane would read `waiting`, pinned under NEEDS YOU, until the
+turn's Stop. They have no `matcher`, since any tool can ask for
+permission. They run on every tool call, so they take a fast path: stdin
+is drained unparsed, the pane's state is read in one tmux call, and on a
+pane that isn't waiting on a prompt nothing else happens (about 6 ms,
+p50 of 100 release runs with a 256 KiB tool output on stdin; p95 6.7 ms;
+the transition itself 10 ms, p95 10.9 ms). The wait is the pane's, not
+one agent's: Claude Code's notification doesn't say whether the parent
+or a subagent asked, so any tool use on the pane, a subagent's included,
+ends it, and a sibling finishing a tool while another agent's dialog is
+still open ends it early. No `Task*` hooks. tmux-home's options
 live in their own namespace, so these hooks run side by side with
 tmux-agent-sidebar's. For a pane with both, tmux-home's win while they are
 current (every write stamps `@home_updated`); if they go quiet and the
