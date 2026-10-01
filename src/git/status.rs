@@ -102,6 +102,9 @@ pub struct HeadInfo {
     pub upstream: Option<String>,
     pub ahead: usize,
     pub behind: usize,
+    /// An upstream is configured but `branch.ab` is missing: the remote
+    /// branch is gone.
+    pub gone: bool,
 }
 
 pub fn parse_status(text: &str) -> (StatusCounts, HeadInfo) {
@@ -110,6 +113,7 @@ pub fn parse_status(text: &str) -> (StatusCounts, HeadInfo) {
         head: "?".to_string(),
         ..HeadInfo::default()
     };
+    let mut saw_ab = false;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("# branch.head ") {
             if rest == "(detached)" {
@@ -121,6 +125,7 @@ pub fn parse_status(text: &str) -> (StatusCounts, HeadInfo) {
         } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
             info.upstream = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            saw_ab = true;
             for part in rest.split_whitespace() {
                 if let Some(n) = part.strip_prefix('+') {
                     info.ahead = n.parse().unwrap_or(0);
@@ -161,6 +166,7 @@ pub fn parse_status(text: &str) -> (StatusCounts, HeadInfo) {
             push_entry(&mut counts, "??".to_string(), path.to_string());
         }
     }
+    info.gone = info.upstream.is_some() && !saw_ab;
     (counts, info)
 }
 
@@ -493,6 +499,19 @@ mod tests {
         assert_eq!(info.ahead, 2);
         assert_eq!(info.behind, 1);
         assert_eq!(counts.total(), 0);
+    }
+
+    /// An upstream with no `branch.ab` line is one whose remote branch is
+    /// gone.
+    #[test]
+    fn parse_status_upstream_without_ab_is_gone() {
+        let (_, info) = parse_status("# branch.head x\n# branch.upstream origin/x\n");
+        assert!(info.gone);
+        let (_, info) =
+            parse_status("# branch.head x\n# branch.upstream origin/x\n# branch.ab +0 -0\n");
+        assert!(!info.gone);
+        let (_, info) = parse_status("# branch.head x\n");
+        assert!(!info.gone, "no upstream at all");
     }
 
     #[test]

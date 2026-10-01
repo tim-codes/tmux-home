@@ -63,6 +63,7 @@ pub fn apply_status(st: &mut RepoStatus, s: &StatusPart) {
     st.untracked = c.untracked as u32;
     st.conflicts = c.conflicts as u32;
     st.upstream = s.info.upstream.clone();
+    st.gone = s.info.gone;
     st.ahead = s.info.ahead as u32;
     st.behind = s.info.behind as u32;
     if s.info.detached {
@@ -96,8 +97,9 @@ pub fn apply_refs(st: &mut RepoStatus, f: &RefFields, p: &RepoPaths) {
 }
 
 /// `⚑`: the worktree's branch is checked out in another worktree too, or a
-/// linked worktree's directory isn't named after its branch (neither name
-/// contains the other, `/` read as `-`).
+/// linked worktree's directory isn't named after its branch: the name must
+/// be the branch, or end in `.<branch>` or `-<branch>` (worktrunk's
+/// templates), the branch sanitised as worktrunk does (`/` and `\` → `-`).
 fn mismatch(w: &model::Worktree, all: &[model::Worktree]) -> bool {
     let Some(b) = &w.branch else { return false };
     let dup = all
@@ -114,10 +116,11 @@ fn mismatch(w: &model::Worktree, all: &[model::Worktree]) -> bool {
     let dir = w
         .path
         .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
+        .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let b = b.replace('/', "-").to_lowercase();
-    !(dir.contains(&b) || b.contains(&dir))
+    let b = b.replace(['/', '\\'], "-");
+    let named = dir == b || dir.ends_with(&format!(".{b}")) || dir.ends_with(&format!("-{b}"));
+    !named
 }
 
 /// Stage 2 for real: `git status` → `StatusPart`.
@@ -167,6 +170,18 @@ mod tests {
     }
 
     #[test]
+    fn a_gone_upstream_shows_no_sync_at_the_status_stage() {
+        let mut st = RepoStatus {
+            branch: "x".into(),
+            ..RepoStatus::default()
+        };
+        let (counts, info) = status::parse_status("# branch.head x\n# branch.upstream origin/x\n");
+        apply_status(&mut st, &StatusPart { counts, info });
+        assert!(st.gone);
+        assert_eq!(st.badge_text(), "x");
+    }
+
+    #[test]
     fn mismatch_rules() {
         let all = vec![
             wt("/r", Some("main"), true),
@@ -180,5 +195,26 @@ mod tests {
         assert!(mismatch(&all[2], &all), "not named after its branch");
         assert!(mismatch(&all[3], &all));
         assert!(!mismatch(&all[4], &all), "detached");
+    }
+
+    /// `⚑` for a linked worktree: its directory is the branch (sanitised
+    /// like worktrunk: `/` and `\` as `-`), or ends in `.<branch>` or
+    /// `-<branch>`; containment isn't enough, short names included.
+    #[test]
+    fn mismatch_needs_the_branch_as_the_name_or_its_suffix() {
+        let main = wt("/r", Some("main"), true);
+        let ok = |dir: &str, b: &str| {
+            let w = wt(dir, Some(b), false);
+            !mismatch(&w, &[main.clone(), w.clone()])
+        };
+        assert!(ok("/x", "x"));
+        assert!(ok("/app.x", "x"));
+        assert!(ok("/app-x", "x"));
+        assert!(ok("/app.feat-x", "feat/x"));
+        assert!(ok("/feat-x", "feat\\x"));
+        assert!(!ok("/box", "x"), "contains x, isn't named after it");
+        assert!(!ok("/x-old", "x"));
+        assert!(!ok("/appx", "x"));
+        assert!(!ok("/feat", "feat/x"), "the branch contains the dir");
     }
 }
