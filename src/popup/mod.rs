@@ -1,7 +1,9 @@
 //! `tmux-home popup`: the full-window window manager, run inside
 //! `display-popup -E -B -w 100% -h 100%`.
 
+pub mod agents;
 pub mod app;
+pub mod filter;
 pub mod fresh;
 
 use crate::{
@@ -143,7 +145,7 @@ impl Runtime {
     }
 
     fn update_preview(&mut self, app: &App, force: bool) {
-        let pane = app.selected().and_then(|r| r.pane.clone());
+        let pane = app.selected().and_then(|r| r.preview_pane());
         if !force && pane == self.preview.0 && self.preview_at.elapsed() < PREVIEW_EVERY {
             return;
         }
@@ -281,6 +283,7 @@ fn event_loop(
     feed: &mpsc::Receiver<Feed>,
 ) -> anyhow::Result<()> {
     let mut dirty = true;
+    let mut drawn_at = 0;
     loop {
         // latest snapshot wins
         let mut latest = None;
@@ -308,8 +311,14 @@ fn event_loop(
         if rt.preview_at != before {
             dirty = true;
         }
+        // agent rows show run time: redraw as the clock moves
+        let now = crate::agent::now();
+        if now != drawn_at && app.rows.iter().any(|r| r.agents.is_some()) {
+            dirty = true;
+        }
         if dirty {
-            term.draw(|f| draw(f, app, rt.live, &rt.preview.1))?;
+            term.draw(|f| draw(f, app, rt.live, &rt.preview.1, now))?;
+            drawn_at = now;
             dirty = false;
         }
         if event::poll(Duration::from_millis(50))? {
@@ -351,8 +360,8 @@ fn preview_rect(area: Rect, flip: bool) -> (Rect, Option<Rect>, Direction) {
 }
 
 /// Draws the popup; `live` is false in degraded mode, `preview` is the
-/// selected pane's captured text.
-fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str) {
+/// selected pane's captured text, `now` Unix seconds (run times).
+fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str, now: u64) {
     let area = f.area();
     let bg = Block::default().style(Style::default().bg(Color::Reset));
     f.render_widget(bg, area);
@@ -376,6 +385,9 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str) {
     let mut h = vec![Span::styled(" tmux-home", bold)];
     if !app.location.is_empty() {
         h.push(Span::raw(format!("   {}", app.location)));
+    }
+    if app.tally.total() > 0 {
+        h.push(Span::raw(format!("  ·  agents: {}", app.tally.label())));
     }
     if !live {
         h.push(Span::styled("   (direct)", dim));
@@ -404,7 +416,12 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str) {
     if matches!(app.mode, Mode::List) {
         f.render_widget(
             Paragraph::new(Span::styled(
-                format!("{}/{} ", app.visible.len(), app.rows.len()),
+                // windows, not rows: a pinned copy isn't counted twice
+                format!(
+                    "{}/{} ",
+                    app.visible.iter().filter(|&&i| !app.rows[i].pinned).count(),
+                    app.rows.iter().filter(|r| !r.pinned).count()
+                ),
                 dim,
             ))
             .alignment(ratatui::layout::Alignment::Right),
@@ -416,7 +433,7 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str) {
 
     // list + preview
     let (list, prev, dir) = preview_rect(v[2], app.preview_flip);
-    draw_list(f, app, list);
+    draw_list(f, app, list, now);
     if let Some(p) = prev {
         let block = Block::default()
             .borders(if dir == Direction::Horizontal {
@@ -425,8 +442,16 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str) {
                 Borders::TOP
             })
             .border_style(dim);
-        let inner = block.inner(p);
+        let mut inner = block.inner(p);
         f.render_widget(block, p);
+        // an agent window: the agent card above the pane's last lines
+        if let Some(a) = app.selected().and_then(|r| r.agents.as_ref()) {
+            let card = agents::card(a, now, inner.width as usize);
+            let h = (card.len() as u16).min(inner.height);
+            f.render_widget(Paragraph::new(card), Rect { height: h, ..inner });
+            inner.y += h;
+            inner.height -= h;
+        }
         let lines: Vec<&str> = preview.lines().collect();
         let skip = lines.len().saturating_sub(inner.height as usize);
         let body: Vec<Line> = lines[skip..].iter().map(|l| Line::raw(*l)).collect();
@@ -436,7 +461,7 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str) {
     f.render_widget(Paragraph::new(Span::styled(app.footer(), dim)), v[3]);
 }
 
-fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_list(f: &mut Frame, app: &mut App, area: Rect, now: u64) {
     let h = area.height as usize;
     app.page = h.saturating_sub(1).max(1);
     let sw = app
@@ -446,31 +471,67 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
         .max()
         .unwrap_or(0)
         .min(16);
-    let top = app.sel.saturating_sub(h.saturating_sub(1));
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let width = area.width as usize;
+    // The list as lines: a NEEDS YOU group (when any window needs you)
+    // gets a header, and so do the sessions below it.
+    enum Item {
+        Header(&'static str),
+        Row(usize),
+    }
+    let mut items = Vec::new();
+    let mut in_pinned = false;
+    for (pos, &i) in app.visible.iter().enumerate() {
+        let pinned = app.rows[i].pinned;
+        if pinned && !in_pinned {
+            items.push(Item::Header(" NEEDS YOU "));
+        } else if !pinned && in_pinned {
+            items.push(Item::Header(" sessions "));
+        }
+        in_pinned = pinned;
+        items.push(Item::Row(pos));
+    }
+    let sel_line = items
+        .iter()
+        .position(|it| matches!(it, Item::Row(p) if *p == app.sel))
+        .unwrap_or(0);
+    let top = sel_line.saturating_sub(h.saturating_sub(1));
     let mut lines = Vec::new();
-    let mut prev_sid: Option<&str> = None;
     // the session name is emphasised on the first row of each group
     // (counting rows above the viewport), dimmed on the rest
-    if top > 0 {
-        prev_sid = Some(&app.rows[app.visible[top - 1]].sid);
-    }
-    for (pos, &i) in app.visible.iter().enumerate().skip(top).take(h) {
-        let r = &app.rows[i];
-        let selected = pos == app.sel;
-        let first = prev_sid != Some(r.sid.as_str());
+    let mut prev_sid: Option<&str> = None;
+    for (n, it) in items.iter().enumerate() {
+        let pos = match it {
+            Item::Header(t) => {
+                prev_sid = None;
+                if n >= top && lines.len() < h {
+                    let rule = "─".repeat(width.saturating_sub(t.chars().count() + 2));
+                    lines.push(Line::styled(format!(" ─{t}{rule}"), dim));
+                }
+                continue;
+            }
+            Item::Row(p) => *p,
+        };
+        let r = &app.rows[app.visible[pos]];
+        let first = r.pinned || prev_sid != Some(r.sid.as_str());
         prev_sid = Some(&r.sid);
+        if n < top || lines.len() >= h {
+            continue;
+        }
+        let selected = pos == app.sel;
         let sname: String = r.session.chars().take(sw).collect();
         let sstyle = if first {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().add_modifier(Modifier::DIM)
+            dim
         };
-        let editing = match &app.mode {
-            Mode::Rename { wid, .. } | Mode::Confirm { wid, .. } => wid == &r.wid,
-            _ => false,
-        };
+        let editing = !r.pinned
+            && match &app.mode {
+                Mode::Rename { wid, .. } | Mode::Confirm { wid, .. } => wid == &r.wid,
+                _ => false,
+            };
         let mut spans = vec![
             Span::styled(
                 if selected { "▌" } else { " " },
@@ -491,23 +552,20 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default()
                 },
             ),
-            Span::styled(
-                format!("  {:<10}  {}", r.cmd, r.path),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
         ];
+        match &r.agents {
+            Some(a) => spans.extend(agents::row_cell(a, now)),
+            None => spans.push(Span::styled(format!("  {:<10}  {}", r.cmd, r.path), dim)),
+        }
         if selected {
             for s in spans.iter_mut().skip(1) {
                 s.style = s.style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
             }
         }
-        lines.push(Line::from(std::mem::take(&mut spans)));
+        lines.push(Line::from(spans));
     }
     if app.visible.is_empty() {
-        lines.push(Line::styled(
-            "  (no matches)",
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+        lines.push(Line::styled("  (no matches)", dim));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -585,7 +643,8 @@ mod tests {
 
     fn screen(a: &mut App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, a, true, "line one\nline two")).unwrap();
+        t.draw(|f| draw(f, a, true, "line one\nline two", NOW))
+            .unwrap();
         let buf = t.backend().buffer().clone();
         (0..h)
             .map(|y| {
@@ -597,6 +656,152 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    const NOW: u64 = 1_790_000_000;
+
+    /// Session "dev": an agent waiting on a permission prompt (`@0`), two
+    /// running agents in one window (`@1`), a stale one (`@2`) and a plain
+    /// shell (`@3`); the client is on `@3`.
+    fn agent_app() -> App {
+        use crate::agent::tests::pane;
+        let mut s = Snapshot::default();
+        s.sessions.push(Session {
+            id: "$0".into(),
+            name: "dev".into(),
+            attached: 1,
+        });
+        let started = (NOW - 12 * 60).to_string();
+        let waiting = [
+            ("@pane_agent", "claude"),
+            ("@pane_status", "waiting"),
+            ("@pane_attention", "notification"),
+            ("@pane_wait_reason", "permission_prompt"),
+            ("@pane_started_at", started.as_str()),
+            (
+                "@pane_prompt",
+                "please refactor the api layer so that every handler returns typed errors and nothing panics",
+            ),
+            ("@pane_prompt_source", "user"),
+            ("@pane_subagents", "Explore:a,Plan:b"),
+            ("@pane_bg_cmd", "npm run dev"),
+            ("@pane_permission_mode", "plan"),
+            ("@pane_worktree_name", "fix-x"),
+            ("@pane_worktree_branch", "fix/x"),
+        ];
+        let running = [
+            ("@pane_agent", "claude"),
+            ("@pane_status", "running"),
+            ("@pane_started_at", started.as_str()),
+        ];
+        let stale = [("@pane_agent", "claude"), ("@pane_status", "waiting")];
+        let panes = [
+            ("@0", pane("%0", "2.1.283", &waiting)),
+            ("@1", pane("%1", "2.1.283", &running)),
+            ("@1", pane("%11", "2.1.283", &running)),
+            ("@2", pane("%2", "fish", &stale)),
+            ("@3", pane("%3", "fish", &[])),
+        ];
+        for (i, name) in ["fix", "api", "old", "shell"].into_iter().enumerate() {
+            s.windows.push(Window {
+                id: format!("@{i}"),
+                session_id: "$0".into(),
+                index: i as u32,
+                name: name.into(),
+                automatic_rename: false,
+                active: i == 3,
+            });
+        }
+        for (wid, mut p) in panes {
+            p.window_id = wid.into();
+            p.index = if p.id == "%11" { 1 } else { 0 };
+            p.active = p.index == 0;
+            s.panes.push(p);
+        }
+        s.clients.push(Client {
+            name: "c".into(),
+            tty: "c".into(),
+            session_id: "$0".into(),
+        });
+        let mut a = App::new();
+        a.set_rows(app::build_rows(&s, Some("c"), ""));
+        a.select_current();
+        a
+    }
+
+    #[test]
+    fn agent_rows_tally_and_needs_you() {
+        let mut a = agent_app();
+        for (w, h) in [(200, 50), (100, 30)] {
+            let s = screen(&mut a, w, h);
+            let line = |pat: &str| {
+                s.lines()
+                    .find(|l| l.contains(pat))
+                    .unwrap_or_else(|| panic!("no {pat:?} in\n{s}"))
+                    .to_string()
+            };
+            // stale agents aren't counted
+            assert!(
+                line("tmux-home").contains("agents: 1 waiting · 2 running"),
+                "{s}"
+            );
+            let lines: Vec<&str> = s.lines().collect();
+            let needs = lines
+                .iter()
+                .position(|l| l.contains("─ NEEDS YOU ─"))
+                .unwrap();
+            assert!(lines[needs + 1].contains("fix"), "{s}");
+            assert!(lines[needs + 1].contains("◐ waiting"), "{s}");
+            assert!(lines[needs + 1].contains("permission"), "{s}");
+            assert!(lines[needs + 2].contains("─ sessions ─"), "{s}");
+            assert!(line("  api").contains("● running"), "{s}");
+            assert!(line("  api").contains("12m  claude ×2"), "{s}");
+            let old = line("  old");
+            assert!(old.contains("◐ waiting (ended?)"), "{s}");
+            assert!(
+                line("  shell").contains("fish"),
+                "a plain window keeps its command"
+            );
+            // the fix window is listed twice: pinned, and in its session
+            assert_eq!(s.matches(" fix ").count(), 2, "{s}");
+            assert!(line("> ").ends_with("4/4"), "windows, not rows: {s}");
+        }
+    }
+
+    #[test]
+    fn agent_card_in_the_preview() {
+        let mut a = agent_app();
+        a.select_wid("@0");
+        for (w, h) in [(200, 50), (120, 40)] {
+            let s = screen(&mut a, w, h);
+            for want in [
+                "◐ waiting  ·  claude  ·  run 12m",
+                "needs you  permission",
+                "subagents  +2 (Explore, Plan)",
+                "background npm run dev",
+                "worktree   fix-x (fix/x)",
+                "mode       plan",
+                "prompt     please refactor",
+                "line two",
+            ] {
+                assert!(s.contains(want), "{w}x{h}: no {want:?} in\n{s}");
+            }
+        }
+        // a stale window's card says so
+        a.select_wid("@2");
+        let s = screen(&mut a, 200, 50);
+        assert!(s.contains("◐ waiting (ended?)  ·  claude"), "{s}");
+        assert!(s.contains("left-over options"), "{s}");
+        // a plain window: no card
+        a.select_wid("@3");
+        let s = screen(&mut a, 200, 50);
+        assert!(!s.contains("·  claude"), "{s}");
+    }
+
+    #[test]
+    fn no_agents_no_tally_no_group() {
+        let s = screen(&mut app(), 200, 50);
+        assert!(!s.contains("agents:") && !s.contains("NEEDS YOU"), "{s}");
     }
 
     #[test]

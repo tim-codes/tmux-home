@@ -143,36 +143,63 @@ impl Tx {
     /// (`vim (stopped)`): the shell is back in the foreground, so the pane
     /// looks idle, but closing it would kill the job.
     pub fn busy_commands(&self, wid: &str) -> Vec<String> {
-        let Ok(out) = self.run(&[
-            "list-panes",
-            "-t",
-            wid,
-            "-F",
-            "#{pane_tty}\x1f#{@pane_role}\x1f#{pane_current_command}",
-        ]) else {
-            return vec![];
+        self.busy(wid).commands
+    }
+
+    /// `busy_commands`, plus whether a live agent in the window is mid-run
+    /// (running or waiting). An agent pane is named by its agent kind
+    /// (`claude`), not its command (Claude reports its version).
+    pub fn busy(&self, wid: &str) -> Busy {
+        let fmt = format!(
+            "#{{pane_id}}\x1f#{{pane_tty}}\x1f#{{@pane_role}}\x1f#{{pane_current_command}}\x1f{}\x1e",
+            crate::tmux::snapshot::agent_opts_fmt()
+        );
+        let mut busy = Busy::default();
+        let Ok(out) = self.run(&["list-panes", "-t", wid, "-F", &fmt]) else {
+            return busy;
         };
-        let mut seen: Vec<String> = Vec::new();
         let mut add = |c: String| {
-            if !seen.contains(&c) {
-                seen.push(c);
+            if !busy.commands.contains(&c) {
+                busy.commands.push(c);
             }
         };
-        for l in out.lines() {
-            let f: Vec<&str> = l.splitn(3, US).collect();
-            let [tty, role, cmd] = f[..] else { continue };
+        for rec in out.split("\x1e\n").map(|r| r.trim_end_matches('\x1e')) {
+            let f: Vec<&str> = rec.split(US).collect();
+            if f.len() < 4 {
+                continue;
+            }
+            let (id, tty, role, cmd) = (f[0], f[1], f[2], f[3]);
             if role == "sidebar" {
                 continue;
             }
+            let pane = crate::tmux::snapshot::Pane {
+                id: id.into(),
+                window_id: wid.into(),
+                session_id: String::new(),
+                index: 0,
+                active: false,
+                current_command: cmd.into(),
+                current_path: String::new(),
+                title: String::new(),
+                role: role.into(),
+                agent_opts: crate::tmux::snapshot::agent_opts_from(&f[4..]),
+            };
+            let agent = crate::agent::pane_agent(&pane).filter(|a| a.live());
+            if let Some(a) = &agent {
+                busy.agent_working |= a.state.status.working();
+            }
             if !is_shell(cmd) {
-                add(cmd.to_string());
+                match agent {
+                    Some(a) => add(a.state.kind.name().to_string()),
+                    None => add(cmd.to_string()),
+                }
             } else {
                 for job in stopped_jobs(tty) {
                     add(format!("{job} (stopped)"));
                 }
             }
         }
-        seen
+        busy
     }
 
     fn sessions(&self) -> Vec<String> {
@@ -195,11 +222,17 @@ impl Tx {
         if last_in_session && !self.sessions().iter().any(|s| s != sid) {
             return Ok(ClosePlan::Refuse);
         }
-        let busy = self.busy_commands(wid);
+        let Busy {
+            commands: busy,
+            agent_working,
+        } = self.busy(wid);
         if busy.is_empty() && !last_in_session {
             return Ok(ClosePlan::Now);
         }
         let mut why = String::new();
+        if agent_working {
+            why.push_str(" agent still working —");
+        }
         if !busy.is_empty() {
             why.push_str(&format!(" running: {}", busy.join(", ")));
         }
@@ -436,6 +469,14 @@ impl Tx {
         }
         Ok(())
     }
+}
+
+/// What is running in a window (`Tx::busy`).
+#[derive(Debug, Default, PartialEq)]
+pub struct Busy {
+    pub commands: Vec<String>,
+    /// A live agent is running or waiting.
+    pub agent_working: bool,
 }
 
 #[derive(Debug, PartialEq)]

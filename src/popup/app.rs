@@ -1,6 +1,8 @@
 //! Pure popup state: rows, filter, selection and modes. Keys map to
 //! `Action`s the runtime executes against tmux; nothing here does I/O.
 
+use super::filter::Query;
+use crate::agent::{Tally, WindowAgents};
 use crate::tmux::snapshot::Snapshot;
 use nucleo_matcher::{
     Config, Matcher, Utf32Str,
@@ -29,11 +31,36 @@ pub struct Row {
     pub path: String,
     /// The invoking client's current window.
     pub current: bool,
-    hay: String,
+    /// The window's agents (SPEC §7), if any pane has agent state.
+    pub agents: Option<WindowAgents>,
+    /// A copy of a window that needs you, pinned in the NEEDS YOU group
+    /// above the sessions.
+    pub pinned: bool,
+    /// Selection identity: the window ID, `!`-prefixed on a pinned copy.
+    pub key: String,
+    pub(crate) hay: String,
+    /// The agents' prompts, lowercased (matched by substring).
+    pub(crate) prompts: String,
+}
+
+impl Row {
+    /// The pane the preview shows: the lead agent's in an agent window,
+    /// else the row's pane.
+    pub fn preview_pane(&self) -> Option<String> {
+        match &self.agents {
+            Some(a) => Some(a.lead().pane.clone()),
+            None => self.pane.clone(),
+        }
+    }
+
+    pub fn needs_you(&self) -> bool {
+        self.agents.as_ref().is_some_and(WindowAgents::needs_you)
+    }
 }
 
 /// Rows grouped by session (the client's session first, then by name),
-/// windows in index order.
+/// windows in index order; windows that need you are also pinned, in the
+/// same order, above them all.
 pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
     let csid = client
         .and_then(|c| s.clients.iter().find(|x| x.name == c))
@@ -64,7 +91,22 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                 .map(|p| (p.current_command.clone(), p.current_path.clone()))
                 .unwrap_or_default();
             let path = short_path(&cwd, home);
-            let hay = format!("{} {} {} {} {}", sess.name, w.index, w.name, cmd, path);
+            let agents = WindowAgents::of(panes.iter().copied());
+            let kind = agents
+                .as_ref()
+                .map(|a| a.lead().state.kind.name().to_string())
+                .unwrap_or_default();
+            let hay = format!(
+                "{} {} {} {} {} {}",
+                sess.name, w.index, w.name, cmd, path, kind
+            );
+            let prompts = agents
+                .iter()
+                .flat_map(|a| &a.panes)
+                .filter_map(|p| p.state.prompt.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .to_lowercase();
             rows.push(Row {
                 sid: sess.id.clone(),
                 session: sess.name.clone(),
@@ -76,11 +118,25 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                 cwd,
                 path,
                 current: Some(&sess.id) == csid.as_ref() && w.active,
+                agents,
+                pinned: false,
+                key: w.id.clone(),
                 hay,
+                prompts,
             });
         }
     }
-    rows
+    let mut pinned: Vec<Row> = rows
+        .iter()
+        .filter(|r| r.needs_you())
+        .map(|r| Row {
+            pinned: true,
+            key: format!("!{}", r.wid),
+            ..r.clone()
+        })
+        .collect();
+    pinned.append(&mut rows);
+    pinned
 }
 
 /// `~/dev/dotfiles/src` → `~/d/d/src`.
@@ -254,6 +310,8 @@ pub struct App {
     pub preview_flip: bool,
     /// " <session> ▸ <index>" of the invoking client.
     pub location: String,
+    /// Live agents by status (header).
+    pub tally: Tally,
     pub page: usize,
     matcher: Matcher,
 }
@@ -277,6 +335,7 @@ impl App {
             notice: None,
             preview_flip: false,
             location: String::new(),
+            tally: Tally::default(),
             page: 10,
             matcher: Matcher::new(Config::DEFAULT),
         }
@@ -300,9 +359,23 @@ impl App {
             .find(|r| r.current)
             .map(|r| format!("{} ▸ {}", r.session, r.index))
             .unwrap_or_default();
+        self.tally = Tally::default();
+        for p in rows
+            .iter()
+            .filter(|r| !r.pinned)
+            .filter_map(|r| r.agents.as_ref())
+            .flat_map(|a| &a.panes)
+        {
+            self.tally.add(p);
+        }
         self.rows = rows;
         self.refilter();
-        match self.sel_wid.clone().and_then(|w| self.pos_of(&w)) {
+        // a pinned copy that's no longer pinned (answered): its window
+        let key = self.sel_wid.clone().map(|k| match self.pos_of(&k) {
+            None if k.starts_with('!') => k[1..].to_string(),
+            _ => k,
+        });
+        match key.and_then(|w| self.pos_of(&w)) {
             Some(p) => {
                 self.sel = p;
                 self.clamp();
@@ -332,7 +405,11 @@ impl App {
 
     /// Put the selection on the client's current window (startup).
     pub fn select_current(&mut self) {
-        if let Some(p) = self.visible.iter().position(|&i| self.rows[i].current) {
+        if let Some(p) = self
+            .visible
+            .iter()
+            .position(|&i| self.rows[i].current && !self.rows[i].pinned)
+        {
             self.set_sel(p);
         }
     }
@@ -356,8 +433,10 @@ impl App {
         self.want_until = Some(now + WANT_FOR);
     }
 
-    fn pos_of(&self, wid: &str) -> Option<usize> {
-        self.visible.iter().position(|&i| self.rows[i].wid == wid)
+    /// Position of the row with this key (a window ID selects the window's
+    /// row in its session, not a pinned copy).
+    fn pos_of(&self, key: &str) -> Option<usize> {
+        self.visible.iter().position(|&i| self.rows[i].key == key)
     }
 
     fn set_sel(&mut self, p: usize) {
@@ -367,7 +446,7 @@ impl App {
 
     fn clamp(&mut self) {
         self.clamp_pos();
-        self.sel_wid = self.selected().map(|r| r.wid.clone());
+        self.sel_wid = self.selected().map(|r| r.key.clone());
     }
 
     fn clamp_pos(&mut self) {
@@ -379,21 +458,55 @@ impl App {
     }
 
     fn refilter(&mut self) {
-        let q = self.filter.as_string();
-        if q.trim().is_empty() {
+        let q = Query::parse(&self.filter.as_string());
+        if q.is_empty() {
             self.visible = (0..self.rows.len()).collect();
             return;
         }
-        let pat = Pattern::parse(&q, CaseMatching::Smart, Normalization::Smart);
+        let pat = Pattern::parse(&q.text, CaseMatching::Smart, Normalization::Smart);
         let mut buf = Vec::new();
         let m = &mut self.matcher;
         self.visible = self
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| pat.score(Utf32Str::new(&r.hay, &mut buf), m).is_some())
+            .filter(|(_, r)| {
+                q.tokens_match(r)
+                    && (q.text.is_empty()
+                        || pat.score(Utf32Str::new(&r.hay, &mut buf), m).is_some()
+                        || q.prompt_match(r))
+            })
             .map(|(i, _)| i)
             .collect();
+    }
+
+    /// `^g`: the next window needing you, after the selection, cycling. A
+    /// window pinned in NEEDS YOU is visited there, not again in its
+    /// session.
+    fn jump_attention(&mut self) {
+        let mut seen = Vec::new();
+        let stops: Vec<usize> = (0..self.visible.len())
+            .filter(|&p| {
+                let r = &self.rows[self.visible[p]];
+                r.needs_you() && !seen.contains(&r.wid) && {
+                    seen.push(r.wid.clone());
+                    true
+                }
+            })
+            .collect();
+        if stops.is_empty() {
+            self.notice = Some(" nothing needs you".into());
+            return;
+        }
+        let cur = self.selected().map(|r| r.wid.clone());
+        let next = match stops
+            .iter()
+            .position(|&p| Some(&self.rows[self.visible[p]].wid) == cur.as_ref())
+        {
+            Some(i) => stops[(i + 1) % stops.len()],
+            None => *stops.iter().find(|&&p| p > self.sel).unwrap_or(&stops[0]),
+        };
+        self.set_sel(next);
     }
 
     pub fn clear_filter(&mut self) {
@@ -527,7 +640,7 @@ impl App {
                 self.set_sel(0);
             }
             KeyCode::Char('c') | KeyCode::Char('q') if ctrl => return Action::Quit,
-            KeyCode::Char('g') if ctrl => {}
+            KeyCode::Char('g') if ctrl => self.jump_attention(),
             KeyCode::Char('r') if ctrl => {
                 if let Some(r) = sel {
                     self.notice = None;
@@ -584,7 +697,7 @@ impl App {
             return Action::None;
         }
         let other = &self.rows[self.visible[p as usize]];
-        if other.sid != cur.sid {
+        if other.sid != cur.sid || cur.pinned || other.pinned {
             return Action::None;
         }
         Action::Swap {
@@ -598,6 +711,9 @@ impl App {
             return n.clone();
         }
         match self.mode {
+            Mode::List | Mode::Help if self.rows.iter().any(|r| r.pinned) => {
+                FOOTER_LIST.replacen("   ^r rename", "   ^g needs you   ^r rename", 1)
+            }
             Mode::List | Mode::Help => FOOTER_LIST.into(),
             Mode::Rename { .. } => FOOTER_EDIT.into(),
             Mode::NewWindow { .. } => FOOTER_NEW.into(),
@@ -608,11 +724,14 @@ impl App {
 
 pub const HELP: &str = "tmux-home — keys
 
-  type            filter windows (session, name, command, path)
+  type            filter windows (session, name, command, path, agent
+                  prompt); tokens narrow it, combined with the text:
+                  @attn @agent @running @waiting @idle @error s:<session>
   ↑ ↓  ^p ^n  ^k ^j   move selection
   PgUp PgDn       page
   ← →  Home End   edit the filter
   ⏎               switch to the selected window and close
+  ^g              jump to the next window that needs you (NEEDS YOU)
   Esc             clear the filter; close if it is already empty
   ^r              rename the window inline (⏎ save, Esc/empty cancel)
   M-r             reset the window to its automatic name
@@ -1039,6 +1158,147 @@ mod tests {
             });
         a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
         assert_eq!(a.selected().unwrap().wid, under);
+    }
+
+    /// `snap()` with agents: alpha/win two waits (prompt "deploy the
+    /// frontend"), beta/build runs, alpha/editor is stale (a shell).
+    fn agent_snap() -> Snapshot {
+        let mut s = snap();
+        let set = |p: &mut Pane, cmd: &str, opts: &[(&str, &str)]| {
+            p.current_command = cmd.into();
+            for (k, v) in opts {
+                p.agent_opts.insert(k.to_string(), v.to_string());
+            }
+        };
+        set(
+            &mut s.panes[1],
+            "node",
+            &[
+                ("@pane_agent", "claude"),
+                ("@pane_status", "waiting"),
+                ("@pane_prompt", "Deploy the frontend to staging"),
+            ],
+        );
+        set(
+            &mut s.panes[3],
+            "node",
+            &[("@pane_agent", "codex"), ("@pane_status", "running")],
+        );
+        set(
+            &mut s.panes[0],
+            "fish",
+            &[("@pane_agent", "claude"), ("@pane_status", "error")],
+        );
+        s
+    }
+
+    fn agent_app() -> App {
+        let mut a = App::new();
+        a.set_rows(build_rows(&agent_snap(), Some("/dev/ttys1"), "/home/u"));
+        a.select_current();
+        a
+    }
+
+    fn keys_visible(app: &App) -> Vec<&str> {
+        app.visible
+            .iter()
+            .map(|&i| app.rows[i].key.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn needs_you_rows_are_pinned_first() {
+        let a = agent_app();
+        assert_eq!(keys_visible(&a), ["!@1", "@2", "@3", "@0", "@1"]);
+        assert_eq!(
+            a.tally.label(),
+            "1 waiting · 1 running",
+            "stale not counted"
+        );
+        // the cursor opens on the client's window, not on a pinned copy
+        assert_eq!(a.selected().unwrap().key, "@2");
+        assert!(a.footer().contains("^g"));
+    }
+
+    #[test]
+    fn filter_tokens() {
+        let mut a = agent_app();
+        let mut q = |s: &str| {
+            a.clear_filter();
+            typed(&mut a, s);
+            keys_visible(&a).join(" ")
+        };
+        assert_eq!(q("@waiting"), "!@1 @1");
+        assert_eq!(q("@running"), "@3");
+        assert_eq!(
+            q("@running @waiting"),
+            "!@1 @3 @1",
+            "statuses are alternatives"
+        );
+        assert_eq!(q("@error"), "", "a stale error isn't an error");
+        assert_eq!(q("@agent"), "!@1 @3 @0 @1", "stale agents are agents");
+        assert_eq!(q("@attn"), "!@1 @1");
+        assert_eq!(q("@idle"), "");
+        assert_eq!(q("s:al"), "!@1 @0 @1");
+        assert_eq!(q("s:BE @agent"), "@3");
+        assert_eq!(q("@agent s:alpha editor"), "@0");
+        assert_eq!(q("s:beta @waiting"), "");
+        // the prompt is filterable (by words), and the agent kind fuzzily
+        assert_eq!(q("staging deploy"), "!@1 @1");
+        assert_eq!(q("codex"), "@3");
+        assert_eq!(q("@bogus"), "", "unknown tokens are text");
+    }
+
+    #[test]
+    fn ctrl_g_cycles_windows_that_need_you() {
+        let mut s = agent_snap();
+        // beta/logs (%2) needs you too
+        s.panes[2].current_command = "node".into();
+        s.panes[2]
+            .agent_opts
+            .insert("@pane_agent".into(), "claude".into());
+        s.panes[2]
+            .agent_opts
+            .insert("@pane_attention".into(), "notification".into());
+        let mut a = App::new();
+        a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
+        a.select_current();
+        assert_eq!(keys_visible(&a), ["!@2", "!@1", "@2", "@3", "@0", "@1"]);
+        assert_eq!(a.selected().unwrap().key, "@2");
+        // from beta/logs (pinned as !@2): next is alpha/win two, in NEEDS YOU
+        a.key(ctrl('g'));
+        assert_eq!(a.selected().unwrap().key, "!@1");
+        a.key(ctrl('g'));
+        assert_eq!(
+            a.selected().unwrap().key,
+            "!@2",
+            "cycles, pinned copies only"
+        );
+        a.key(ctrl('g'));
+        assert_eq!(a.selected().unwrap().key, "!@1");
+        // nothing needs you: a notice, the selection stays
+        let mut a = app();
+        a.key(ctrl('g'));
+        assert_eq!(a.selected().unwrap().key, "@2");
+        assert!(a.footer().contains("nothing needs you"));
+    }
+
+    #[test]
+    fn an_answered_pinned_row_hands_over_to_its_window() {
+        let mut a = agent_app();
+        a.key(ctrl('g'));
+        assert_eq!(a.selected().unwrap().key, "!@1");
+        // M-↑↓ never moves a pinned copy
+        let alt = |c| KeyEvent::new(c, KeyModifiers::ALT);
+        assert_eq!(a.key(alt(KeyCode::Down)), Action::None);
+        // the agent was answered: the selection stays on the window
+        let mut s = agent_snap();
+        s.panes[1]
+            .agent_opts
+            .insert("@pane_status".into(), "running".into());
+        a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
+        assert_eq!(a.selected().unwrap().key, "@1");
+        assert_eq!(a.selected().unwrap().wid, "@1");
     }
 
     #[test]
