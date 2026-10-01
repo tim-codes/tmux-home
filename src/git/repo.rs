@@ -203,15 +203,6 @@ pub fn stamp(p: &RepoPaths) -> u64 {
     h.finish()
 }
 
-/// Modification time of the worktree registry (`<common>/worktrees`),
-/// part of the refs memo's key: `git worktree add` of an existing branch
-/// changes no ref.
-pub fn worktrees_mtime(common_dir: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(common_dir.join("worktrees"))
-        .and_then(|m| m.modified())
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

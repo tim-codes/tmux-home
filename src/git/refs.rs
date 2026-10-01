@@ -3,17 +3,19 @@
 //! `config.rs::default_branch` and `git/mod.rs::check_integration`,
 //! reimplemented).
 //!
-//! One `for-each-ref refs/heads refs/remotes refs/stash` per refresh is the
-//! probe: when its output (and the worktree registry's mtime) is what the
-//! memo last saw, nothing ref-derived can have changed and no other git
-//! runs. Otherwise the fields are recomputed, and per-branch results
+//! Each refresh runs three cheap forks: the probe (`for-each-ref
+//! refs/heads refs/remotes refs/stash`), the few config keys that matter
+//! (`config --get-regexp`), and `worktree list` (worktrees change without
+//! any ref moving: a lock, a switch inside a linked worktree). When probe
+//! and config output are what the memo last saw, nothing ref-derived can
+//! have changed and no other git runs. Otherwise the fields are recomputed, and per-branch results
 //! (unpushed count, integration) are reused for every branch whose SHA —
 //! and, for unpushed, the set of remote SHAs — is unchanged. The memo
 //! lives in the daemon's memory, never in `.git`.
 
 use super::exec::{Git, GitError};
 use super::model::Worktree;
-use super::repo::{RepoPaths, worktrees_mtime};
+use super::repo::RepoPaths;
 use super::status::{parse_track, parse_worktrees, unpushed};
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -236,15 +238,9 @@ impl RefsMemo {
                 ],
             )
             .await?;
-        let mut h = DefaultHasher::new();
-        (&out, worktrees_mtime(&p.common_dir)).hash(&mut h);
-        let key = h.finish();
-        if self.key == Some(key) {
-            self.last_forks = forks;
-            return Ok(false);
-        }
-        let rows = parse_refs(&out);
-
+        // config and worktrees change without any ref moving (`remote add`,
+        // `worktree lock`, a switch inside a linked worktree): both are read
+        // on every refresh, config into the key, worktrees outside the memo
         forks += 1;
         let cfg_out = git
             .output(
@@ -259,6 +255,20 @@ impl RefsMemo {
             .await
             .map(|(_, o)| o)
             .unwrap_or_default();
+        forks += 1;
+        self.fields.worktrees = match git.run(dir, &["worktree", "list", "--porcelain"]).await {
+            Ok(o) => parse_worktrees(&o),
+            Err(GitError::Timeout) => return Err(GitError::Timeout),
+            Err(_) => Vec::new(),
+        };
+        let mut h = DefaultHasher::new();
+        (&out, &cfg_out).hash(&mut h);
+        let key = h.finish();
+        if self.key == Some(key) {
+            self.last_forks = forks;
+            return Ok(false);
+        }
+        let rows = parse_refs(&out);
         let (cfg, remotes) = parse_config(&cfg_out);
         let remote_rows: Vec<&RefRow> = rows
             .iter()
@@ -274,13 +284,6 @@ impl RefsMemo {
             h.finish()
         };
         let default = default_branch(&cfg, &remotes, &rows);
-
-        forks += 1;
-        let worktrees = match git.run(dir, &["worktree", "list", "--porcelain"]).await {
-            Ok(o) => parse_worktrees(&o),
-            Err(GitError::Timeout) => return Err(GitError::Timeout),
-            Err(_) => Vec::new(),
-        };
 
         // integration targets: the default branch, and its upstream when
         // that differs (local main may lag or lead origin/main)
@@ -377,7 +380,7 @@ impl RefsMemo {
             has_remote,
             default_branch: default,
             branches,
-            worktrees,
+            worktrees: std::mem::take(&mut self.fields.worktrees),
         };
         self.key = Some(key);
         self.last_forks = forks;

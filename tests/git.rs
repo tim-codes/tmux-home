@@ -266,9 +266,9 @@ async fn refs_memo_probes_once_when_nothing_changed() {
     // probe + config + worktree list + 3 × log + integration checks
     assert!(first >= 6, "{first}");
     assert_eq!(memo.fields.stray().len(), 3);
-    // unchanged: the probe alone
+    // unchanged: probe, config and worktree list only
     assert!(!memo.refresh(&git, &p).await.unwrap());
-    assert_eq!(memo.last_forks, 1);
+    assert_eq!(memo.last_forks, 3);
     // one branch moves: only it is recomputed
     git_at(&root, &["switch", "-q", "a"]);
     write(&root, "a2", "x");
@@ -613,4 +613,57 @@ async fn no_lazy_fetch_and_no_transport() {
     ] {
         assert!(seen.contains(want), "{want} missing:\n{seen}");
     }
+}
+
+// ---- review fix: what the refs memo key misses -------------------------------
+
+#[tokio::test]
+async fn worktree_and_config_changes_show_without_a_ref_moving() {
+    git_env();
+    let t = TempDir::new("memo2");
+    let root = t.repo("app");
+    git_at(&root, &["branch", "other"]);
+    git_at(
+        &root,
+        &["worktree", "add", "-q", "../app.feat", "-b", "feat"],
+    );
+    let wt = t.0.join("app.feat");
+    let (git, p) = (Git::default(), paths(&wt));
+    let mut memo = RefsMemo::default();
+    let mut st = RepoStatus::default();
+    let again = async |memo: &mut RefsMemo, st: &mut RepoStatus| {
+        memo.refresh(&git, &p).await.unwrap();
+        git::apply_head(st, &p);
+        git::apply_refs(st, &memo.fields, &p);
+    };
+    again(&mut memo, &mut st).await;
+    assert!(!st.locked && !st.has_remote && !st.mismatch, "{st:?}");
+    // lock: no ref moves
+    git_at(&root, &["worktree", "lock", "../app.feat"]);
+    again(&mut memo, &mut st).await;
+    assert!(st.locked, "lock not seen: {st:?}");
+    // a branch switch inside the linked worktree: no ref moves either
+    git_at(&wt, &["switch", "-q", "other"]);
+    again(&mut memo, &mut st).await;
+    let me = memo
+        .fields
+        .worktrees
+        .iter()
+        .find(|w| w.path.ends_with("app.feat"))
+        .unwrap();
+    assert_eq!(
+        me.branch.as_deref(),
+        Some("other"),
+        "{:?}",
+        memo.fields.worktrees
+    );
+    assert!(st.mismatch, "app.feat on `other`: {st:?}");
+    // a remote added: config only
+    git_at(&root, &["remote", "add", "origin", "/nonexistent.git"]);
+    again(&mut memo, &mut st).await;
+    assert!(st.has_remote, "remote add not seen: {st:?}");
+    // worktrunk's default branch: config only
+    git_at(&root, &["config", "worktrunk.default-branch", "other"]);
+    again(&mut memo, &mut st).await;
+    assert_eq!(st.default_branch.as_deref(), Some("other"));
 }
