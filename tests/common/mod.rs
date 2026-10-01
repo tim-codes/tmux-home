@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 pub struct TestEnv {
+    base: PathBuf,
     pub runtime: PathBuf,
     pub state: PathBuf,
 }
@@ -15,12 +16,23 @@ impl TestEnv {
         let state = base.join("state");
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::create_dir_all(&state).unwrap();
-        // SAFETY: tests that use TestEnv run single-threaded per process (see Cargo.toml [[test]] harness note below).
+        // SAFETY: tests that use TestEnv run single-threaded per process
+        // (RUST_TEST_THREADS=1 in .cargo/config.toml).
         unsafe {
             std::env::set_var("TMUX_HOME_RUNTIME_DIR", &runtime);
             std::env::set_var("TMUX_HOME_STATE_DIR", &state);
         }
-        TestEnv { runtime, state }
+        TestEnv {
+            base,
+            runtime,
+            state,
+        }
+    }
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.base);
     }
 }
 
@@ -153,5 +165,7 @@ impl Drop for TestServer {
             .arg(&self.socket)
             .arg("kill-server")
             .output();
+        // tmux leaves its socket file behind after kill-server.
+        let _ = std::fs::remove_file(&self.socket);
     }
 }

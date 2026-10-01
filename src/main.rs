@@ -20,6 +20,8 @@ enum Cmd {
     Query {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
+        /// Print JSON (accepted for forward compatibility; JSON is
+        /// currently the only output format).
         #[arg(long)]
         json: bool,
     },
