@@ -22,6 +22,10 @@ unset TMUX TMUX_PANE TMUX_HOME_CLIENT
 TMUX_HOME_STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tmux-home-test.XXXXXX")
 export TMUX_HOME_STATE_DIR XDG_STATE_HOME=$TMUX_HOME_STATE_DIR/xdg
 CLOSED=$TMUX_HOME_STATE_DIR/closed
+# daemon socket/lock dir: tmux-home.tmux starts the Rust daemon when
+# target/release/tmux-home is built; keep it out of the real runtime dir
+TMUX_HOME_RUNTIME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tmux-home-test-run.XXXXXX")
+export TMUX_HOME_RUNTIME_DIR
 export TMUX_HOME_TMUX="tmux -L tmux-home-test"
 export SHELL=/bin/sh # predictable, fast pane shells
 export LC_ALL=en_US.UTF-8
@@ -35,7 +39,17 @@ cleanup() {
 	O kill-server 2>/dev/null
 	S kill-server 2>/dev/null
 }
-trap 'cleanup; rm -rf "$TMUX_HOME_STATE_DIR"' EXIT
+# A daemon exits with its server, removing its socket; give it a moment so
+# none outlives the run.
+reap_daemons() {
+	local i
+	for i in {1..40}; do
+		compgen -G "$TMUX_HOME_RUNTIME_DIR/*.sock" >/dev/null || return 0
+		sleep 0.05
+	done
+	echo "warning: daemon socket left in $TMUX_HOME_RUNTIME_DIR" >&2
+}
+trap 'cleanup; reap_daemons; rm -rf "$TMUX_HOME_STATE_DIR" "$TMUX_HOME_RUNTIME_DIR"' EXIT
 cleanup
 
 pass=0 fail=0

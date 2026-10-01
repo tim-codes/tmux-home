@@ -76,6 +76,19 @@ it is gone. The popup stays open with the cursor on it. The stack lives in
 `tests/run` drives the real popup through a client attached to a throwaway
 `tmux -L tmux-home-test` server; it never touches your tmux server.
 
+## Build (phase 2, in progress)
+
+A Rust daemon (one per tmux server) is being built alongside the bash
+popup; `tmux-home.tmux` starts it automatically once it's built. Build it
+with `cargo build --release`, then `tmux-home query --json` prints the
+daemon's current snapshot of the server (starting a daemon if one isn't
+already running). The popup you interact with is still the bash one above
+— the daemon doesn't drive it yet.
+
+The daemon polls tmux every 500 ms by default; `--source control` (a tmux
+control-mode client) is also available but isn't the default — see
+[`docs/superpowers/notes/r0-control-mode.md`](docs/superpowers/notes/r0-control-mode.md).
+
 ## Planned
 
 - `prefix w` / `prefix f` open a borderless full-window popup, cursor in the
