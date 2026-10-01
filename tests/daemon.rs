@@ -71,6 +71,64 @@ async fn query_and_subscribe() {
     assert!(!p.sock.exists());
 }
 
+/// A new subscriber's first snapshot is read fresh, not the source's last
+/// one (a poll source's can be up to 500 ms old): the popup places its
+/// cursor on the current window from it.
+#[tokio::test]
+async fn subscribe_starts_from_a_fresh_read() {
+    let _env = common::TestEnv::new();
+    let s = common::TestServer::start();
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "two"]);
+    let p = Paths::for_socket(&s.socket).unwrap();
+    let d = tokio::spawn(tmux_home::daemon::run(s.socket.clone(), SourceKind::Poll));
+    let subscribe = || async {
+        let (r, mut w) = connect(&p).await.into_split();
+        write_msg(
+            &mut w,
+            &Request::Subscribe {
+                v: v(),
+                client: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut r = BufReader::new(r);
+        let Some(Reply::Snapshot { data, .. }) = read_msg(&mut r).await.unwrap() else {
+            panic!()
+        };
+        (data, r, w)
+    };
+    let active = |data: &tmux_home::tmux::snapshot::Snapshot| {
+        data.windows
+            .iter()
+            .find(|w| w.active)
+            .map(|w| w.name.clone())
+    };
+    let (first, mut r, _w) = subscribe().await;
+    assert!(first.windows.iter().any(|w| w.name == "two"));
+    // ride the poll: right after it ticks, the next one is ~500 ms away
+    s.tmux(&["rename-window", "-t", "=alpha:two", "tick"]);
+    loop {
+        let Some(Reply::Snapshot { data, .. }) =
+            tokio::time::timeout(Duration::from_secs(2), read_msg(&mut r))
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!()
+        };
+        if data.windows.iter().any(|w| w.name == "tick") {
+            break;
+        }
+    }
+    s.tmux(&["select-window", "-t", "=alpha:tick"]);
+    let (fresh, _r, _w) = subscribe().await;
+    assert_eq!(active(&fresh).as_deref(), Some("tick"));
+
+    s.tmux(&["kill-server"]);
+    let _ = tokio::time::timeout(Duration::from_secs(5), d).await;
+}
+
 #[tokio::test]
 async fn second_daemon_is_a_no_op() {
     let _env = common::TestEnv::new();

@@ -263,15 +263,10 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
         preview_at: Instant::now(),
     };
     let mut app = App::new();
-    // first picture: whatever the feed gives within a moment, else direct
-    match feed.recv_timeout(Duration::from_millis(400)) {
-        Ok(f) => {
-            rt.live = f.live;
-            let rows = rt.rows(&f.snap);
-            app.set_rows(rows);
-        }
-        Err(_) => rt.refresh(&mut app),
-    }
+    // first picture: read tmux directly, so the cursor lands on the window
+    // the client shows now (the daemon's snapshot can be a poll behind);
+    // the feed only brings updates after this
+    rt.refresh(&mut app);
     app.select_current();
 
     let mut term = ratatui::init();
