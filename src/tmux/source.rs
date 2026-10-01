@@ -60,7 +60,52 @@ async fn poll(tmux: Tmux, tx: mpsc::Sender<SourceEvent>) -> anyhow::Result<()> {
 }
 
 async fn control(tmux: Tmux, tx: mpsc::Sender<SourceEvent>) -> anyhow::Result<()> {
-    poll(tmux, tx).await // replaced in Task 6
+    use super::control::{Line, Notification, parse_line};
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut child = tmux
+        .command()
+        .args([
+            "-C",
+            "attach-session",
+            "-f",
+            "no-output,ignore-size,read-only",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped");
+    let mut lines = BufReader::new(child.stdout.take().expect("piped")).lines();
+    stdin
+        .write_all(b"refresh-client -B 'th-panes:%*:#{pane_current_command}#{pane_current_path}#{pane_title}'\n")
+        .await?;
+
+    let mut last = Some(refresh(&tmux, &tx, None).await?);
+    let mut dirty = false;
+    let debounce = Duration::from_millis(30);
+    let mut resync = tokio::time::interval(RESYNC_EVERY);
+    resync.tick().await; // first tick is immediate
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line? else { return Ok(()) }; // EOF: server gone
+                match parse_line(&line) {
+                    Line::Notify(Notification::Exit(_)) => return Ok(()),
+                    Line::Notify(Notification::Changed(_)) => dirty = true,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(debounce), if dirty => {
+                dirty = false;
+                last = Some(refresh(&tmux, &tx, last).await?);
+            }
+            _ = resync.tick() => {
+                last = Some(refresh(&tmux, &tx, last).await?);
+            }
+        }
+    }
 }
 
 pub async fn spike_control(_socket: std::path::PathBuf) -> anyhow::Result<()> {

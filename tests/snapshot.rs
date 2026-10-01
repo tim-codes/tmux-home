@@ -42,7 +42,7 @@ async fn hash_changes_only_on_change() {
     // reports a transitional #{pane_current_command} (e.g. "zsh" before
     // "bash") right after spawn, which is a real, tmux-reported state change
     // and not a bug in read_snapshot — just not what this test is about.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    s.wait_settled();
     let (_, h1) = read_snapshot(&t).await.unwrap();
     let (_, h2) = read_snapshot(&t).await.unwrap();
     assert_eq!(h1, h2);

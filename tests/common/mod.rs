@@ -66,6 +66,17 @@ impl TestServer {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+        // Automatic window rename lags pane_current_command by a further,
+        // separately-timed hook (confirmed by probing: pane_current_command
+        // flips to the real shell within ~100ms, but window_name can take
+        // several hundred ms more to follow) — it is a second source of
+        // startup churn independent of the one wait_settled rides out below.
+        // Tests don't rely on automatic-rename, so turn it off globally to
+        // remove that source of flakiness outright.
+        let _ = Command::new("tmux")
+            .args(["-L", &name, "set-option", "-g", "automatic-rename", "off"])
+            .env_remove("TMUX")
+            .output();
         let socket = Command::new("tmux")
             .args(["-L", &name, "display", "-p", "#{socket_path}"])
             .env_remove("TMUX")
@@ -73,6 +84,31 @@ impl TestServer {
             .unwrap();
         let socket = PathBuf::from(String::from_utf8(socket.stdout).unwrap().trim());
         TestServer { name, socket }
+    }
+
+    /// Polls `list-panes -a` until two consecutive reads of
+    /// `pane_current_command` agree, to ride out the brief churn a freshly
+    /// spawned pane's shell produces right after start. Panics if it never
+    /// stabilizes within 3s.
+    pub fn wait_settled(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut last: Option<String> = None;
+        loop {
+            let cur = self.tmux(&[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id} #{pane_current_command} #{pane_current_path} #{pane_title} #{window_name}",
+            ]);
+            if last.as_deref() == Some(cur.as_str()) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("panes never settled: last={last:?} cur={cur}");
+            }
+            last = Some(cur);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     pub fn tmux(&self, args: &[&str]) -> String {
