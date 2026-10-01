@@ -574,7 +574,8 @@ pub const HELP: &str = "tmux-home — keys
   ^r              rename the window inline (⏎ save, Esc/empty cancel)
   M-r             reset the window to its automatic name
   ^x              close the window; asks first (y/N) if anything but a
-                  shell is running in it, or if it is its session's last
+                  shell is running in it (a job stopped with ^z counts),
+                  or if it is its session's last
   ^t              reopen the last closed window (up to 10 back): same
                   place, name, panes, layout and directories — but fresh
                   shells; what was running in it is gone

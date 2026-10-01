@@ -146,24 +146,39 @@ impl Tx {
         lines.join("\n")
     }
 
-    /// Distinct non-shell commands of a window's non-sidebar panes.
+    /// Distinct non-shell commands of a window's non-sidebar panes, plus
+    /// any job stopped with ^z in a pane that sits at its shell prompt
+    /// (`vim (stopped)`): the shell is back in the foreground, so the pane
+    /// looks idle, but closing it would kill the job.
     pub fn busy_commands(&self, wid: &str) -> Vec<String> {
         let Ok(out) = self.run(&[
             "list-panes",
             "-t",
             wid,
             "-F",
-            "#{pane_current_command}\x1f#{@pane_role}",
+            "#{pane_tty}\x1f#{@pane_role}\x1f#{pane_current_command}",
         ]) else {
             return vec![];
         };
-        let mut seen = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut add = |c: String| {
+            if !seen.contains(&c) {
+                seen.push(c);
+            }
+        };
         for l in out.lines() {
-            let (cmd, role) = l.split_once(US).unwrap_or((l, ""));
-            if role == "sidebar" || is_shell(cmd) || seen.iter().any(|c| c == cmd) {
+            let f: Vec<&str> = l.splitn(3, US).collect();
+            let [tty, role, cmd] = f[..] else { continue };
+            if role == "sidebar" {
                 continue;
             }
-            seen.push(cmd.to_string());
+            if !is_shell(cmd) {
+                add(cmd.to_string());
+            } else {
+                for job in stopped_jobs(tty) {
+                    add(format!("{job} (stopped)"));
+                }
+            }
         }
         seen
     }
@@ -442,6 +457,31 @@ pub enum ClosePlan {
 pub enum CloseOutcome {
     Closed,
     Refused,
+}
+
+/// Commands of the stopped (state `T`) processes on a terminal, by `ps`.
+/// Empty if `ps` fails: a missed warning, never a refused close.
+pub fn stopped_jobs(tty: &str) -> Vec<String> {
+    let tty = tty.strip_prefix("/dev/").unwrap_or(tty);
+    if tty.is_empty() {
+        return vec![];
+    }
+    let Ok(out) = Command::new("ps")
+        .args(["-o", "stat=,comm=", "-t", tty])
+        .output()
+    else {
+        return vec![];
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (stat, comm) = l.trim().split_once(char::is_whitespace)?;
+            stat.starts_with('T').then(|| {
+                let comm = comm.trim();
+                comm.rsplit('/').next().unwrap_or(comm).to_string()
+            })
+        })
+        .collect()
 }
 
 /// A pane is idle when it sits at a shell prompt (login shells show "-zsh").

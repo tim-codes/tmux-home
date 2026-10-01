@@ -162,3 +162,93 @@ fn reopen_failing_after_create_keeps_the_stack_popped() {
     assert_eq!(count(), "2");
     let _ = std::fs::remove_dir_all(sdir);
 }
+
+#[test]
+fn busy_idle_shell_is_empty() {
+    let s = TestServer::start();
+    s.wait_settled();
+    assert!(
+        Tx::new(s.socket.clone())
+            .busy_commands(&wid(&s, "alpha:"))
+            .is_empty()
+    );
+}
+
+#[test]
+fn busy_lists_each_non_shell_command() {
+    let s = TestServer::start();
+    s.tmux(&[
+        "new-window",
+        "-d",
+        "-t",
+        "alpha:",
+        "-n",
+        "qb-two",
+        "sleep 1000",
+    ]);
+    s.tmux(&[
+        "split-window",
+        "-d",
+        "-t",
+        "alpha:qb-two",
+        "tail -f /dev/null",
+    ]);
+    s.tmux(&["split-window", "-d", "-t", "alpha:qb-two", "sleep 1001"]);
+    s.wait_settled();
+    let got = Tx::new(s.socket.clone()).busy_commands(&wid(&s, "alpha:qb-two"));
+    assert_eq!(got, ["sleep", "tail"]);
+}
+
+#[test]
+fn busy_ignores_sidebar_panes() {
+    let s = TestServer::start();
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "qb-side"]);
+    s.tmux(&[
+        "split-window",
+        "-d",
+        "-h",
+        "-t",
+        "alpha:qb-side",
+        "sleep 1000",
+    ]);
+    s.tmux(&[
+        "set-option",
+        "-p",
+        "-t",
+        "alpha:qb-side.1",
+        "@pane_role",
+        "sidebar",
+    ]);
+    s.wait_settled();
+    assert!(
+        Tx::new(s.socket.clone())
+            .busy_commands(&wid(&s, "alpha:qb-side"))
+            .is_empty()
+    );
+}
+
+/// ^z leaves the shell in the foreground: the pane looks idle, but the
+/// stopped job would die with the window.
+#[test]
+fn busy_reports_a_stopped_job() {
+    let s = TestServer::start();
+    s.wait_settled();
+    let w = wid(&s, "alpha:");
+    s.tmux(&["send-keys", "-t", &w, "sleep 1000", "Enter"]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while show(&s, &w, "#{pane_current_command}") != "sleep" {
+        assert!(Instant::now() < deadline, "sleep never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    s.tmux(&["send-keys", "-t", &w, "C-z"]);
+    let tx = Tx::new(s.socket.clone());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while tx.busy_commands(&w) != ["sleep (stopped)"] {
+        assert!(
+            Instant::now() < deadline,
+            "stopped job not reported: {:?}",
+            tx.busy_commands(&w)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
