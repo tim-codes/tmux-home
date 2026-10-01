@@ -158,13 +158,20 @@ re-checked when a window's directory changes, when one of its windows gains
 focus, when git itself changes it (the index, HEAD, reflogs, packed refs,
 `FETCH_HEAD`: watched by `stat` once a second), and otherwise every
 `max(10 s, 20 × its last status time)`. Each check is fast-first: the branch
-from `.git/HEAD` (no git process), then one `git status`, then one
-`for-each-ref` whose result is memoised — branches, stray detection,
-worktrees and the default branch are recomputed only when a ref moved.
+from `.git/HEAD` (no git process), then one `git status`, then three
+small reads (`for-each-ref`, a few config keys, `worktree list`) whose
+result is memoised — unpushed counts, stray detection and the default
+branch are recomputed only when a ref or that config changed.
 At most 4 git processes run at once, each with a 10 s timeout
 (`TMUX_HOME_GIT_TIMEOUT_MS` overrides it); badges reach the popup at most
-once a second. Git runs read-only: `--no-optional-locks`, no fetch, no
-config written, inherited `GIT_DIR`-style variables removed, `LC_ALL=C`.
+once a second. Git runs read-only and runs nothing a repo or your config
+names: `--no-optional-locks`, no fetch or any transport, no config
+written, fsmonitor off (no hook, no `fsmonitor--daemon`), no hooks, no
+clean/process filters, textconv or external diff (attributes are read
+from the empty tree), inherited `GIT_DIR`-style variables removed,
+`LC_ALL=C`, each call in its own process group. One consequence: a
+stat-dirty LFS or `text=auto` file can show as modified (`!`) until your
+own git refreshes the index.
 Badges need the daemon: a popup reading tmux directly (`(direct)`) shows
 none.
 

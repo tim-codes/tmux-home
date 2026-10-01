@@ -289,18 +289,31 @@ details this section leaves open, or departs from it:
   status's duration, so a hung repo backs off to `20 × 10 s`.
 - *Item 1:* the scrub removes every inherited `GIT_*` variable except
   `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`/`GIT_CONFIG_NOSYSTEM` (they pick
-  user config files, not a repo); calls also pass `-c color.ui=false -c
-  log.showSignature=false` and `GIT_TERMINAL_PROMPT=0`. `$TMUX_HOME_GIT`
+  user config files, not a repo). Review fix: no call runs a command a
+  repo or user config names — `core.fsmonitor=false` always (badges
+  included: a hook script would run, `true` starts a resident daemon),
+  `core.hooksPath=/dev/null`, `protocol.allow=never`,
+  `GIT_NO_LAZY_FETCH=1`, empty `credential.helper` and `diff.external`,
+  `--no-ext-diff --no-textconv` on diffs, and attributes from the empty
+  tree (`--attr-source`, sha1 or sha256) with global/system attributes
+  off and drivers named in `info/attributes` overridden, so no
+  clean/process filter or textconv runs (trade-off: a stat-dirty LFS or
+  `text=auto` file can read as modified). Each call runs in its own
+  process group, killed as a whole on timeout. Also `color.ui=false`,
+  `log.showSignature=false`, `GIT_TERMINAL_PROMPT=0`. `$TMUX_HOME_GIT`
   replaces the binary (tests).
 - *Item 4:* the probe is `for-each-ref
   %(refname)%00%(objectname)%00%(symref)%00%(upstream)%00%(upstream:track)`;
-  its key also covers the worktree registry's mtime. A branch whose tip is
+  its key also covers the config keys item 7 reads (read every refresh),
+  and `worktree list` runs every refresh outside the memo (a lock or a
+  switch inside a linked worktree moves no ref). A branch whose tip is
   a remote ref's commit has 0 unpushed without a fork. Stashes are the
   lines of `logs/refs/stash` (no fork; also right after `stash drop
   stash@{1}`, which leaves `refs/stash` alone).
 - *Item 6:* `⚑` is a branch checked out in two worktrees, or a linked
-  worktree whose directory name and branch (`/` as `-`) don't contain one
-  another — a stand-in for worktrunk's path template, which tmux-home
+  worktree whose directory isn't the branch and doesn't end in
+  `.<branch>`/`-<branch>` (the branch sanitised as worktrunk does: `/`,
+  `\` → `-`) — a stand-in for worktrunk's path template, which tmux-home
   doesn't know.
 - *Item 7:* one `config -z --get-regexp` fork reads
   `worktrunk.default-branch`, `init.defaultBranch` and the remotes;
@@ -314,13 +327,18 @@ details this section leaves open, or departs from it:
 - *Badge order* (as the pass brief's example): `branch (wt) +!?✘ ⇡n ⇣n |
   $n ⚠n ↻⊟⊞⊘⚑ ~`; `|` only once a status has landed, no arrows for a gone
   upstream.
-- *Measured* (release build, `core.fsmonitor=false`, 9 repos under `~/dev`,
-  warm cache): HEAD stage 20–40 µs; `git status` 8–16 ms; refs probe
-  8–13 ms when nothing changed (1 fork). The first refs pass is 3–7 forks /
-  25–165 ms for most repos, and 49–67 forks / 0.6–1.4 s for the two with
-  20–30 stray-candidate branches (one `log` and up to a few integration
-  forks each, memoised afterwards). Steady state per repo: ~20–30 ms of git
-  per refresh, every 10 s.
+- *Measured* (release build, fsmonitor off, 8 repos under `~/dev`,
+  warm cache, after the review fixes): HEAD stage 20–40 µs; `git status`
+  8–15 ms; the refs stage 23–32 ms when nothing changed (3 forks: probe,
+  config, worktree list). The first refs pass is 3–7 forks / 23–125 ms for
+  most repos, and 49–67 forks / 0.6–1.5 s for the two with 20–30
+  stray-candidate branches (one `log` and up to a few integration forks
+  each, memoised afterwards). Steady state per repo: ~35–45 ms of git per
+  refresh, every 10 s.
+- *Generations:* each tracking of a root is a generation; a dropped
+  root's refresh is aborted and late messages from an older generation
+  are ignored. A refresh that panics resets its root (stale); a panicking
+  task marks every badge stale and is restarted by a supervisor.
 
 ## 7. Popup (Rust)
 
