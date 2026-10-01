@@ -133,14 +133,18 @@ tmux-home records Claude Code's state itself with `tmux-home hook claude
 `@home_*` options (`@home_agent`, `@home_status`, `@home_wait_reason`,
 `@home_run_started`, `@home_prompt`, …). It talks to no daemon (the daemon's
 poll picks the options up), and it always exits 0, silently and in about
-11 ms (release build, p50 of 100 runs; p95 12.5 ms): a problem (no
+11 ms (release build, p50 of 100 runs; p95 12.1 ms): a problem (no
 `$TMUX_PANE`, tmux unreachable, bad JSON) is a no-op, noted in
 `<state root>/<server key>/hook.log` (rotated to `hook.log.1` at 64 KiB).
 
 Wire it in Claude Code's settings (`~/.claude/settings.json` or a
 project's `.claude/settings.json`), merged into any `hooks` you already
-have. The event names are Claude Code's, and the command's last word must
-match the key it sits under:
+have. The event names are Claude Code's, and the command's event must
+match the key it sits under. Each command ends in `>/dev/null 2>&1 ||
+true` and has a 5-second timeout, so a missing or out-of-date binary can
+never get in Claude's way: Claude Code treats a hook's exit 2 as "block"
+(an unknown subcommand exits 2, which would block every prompt and keep
+every Stop going), and a UserPromptSubmit hook's stdout becomes context.
 
 ```json
 {
@@ -150,7 +154,8 @@ match the key it sits under:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SessionStart"
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SessionStart >/dev/null 2>&1 || true",
+            "timeout": 5
           }
         ]
       }
@@ -160,7 +165,8 @@ match the key it sits under:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude UserPromptSubmit"
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude UserPromptSubmit >/dev/null 2>&1 || true",
+            "timeout": 5
           }
         ]
       }
@@ -170,7 +176,8 @@ match the key it sits under:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude Stop"
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude Stop >/dev/null 2>&1 || true",
+            "timeout": 5
           }
         ]
       }
@@ -180,7 +187,8 @@ match the key it sits under:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude StopFailure"
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude StopFailure >/dev/null 2>&1 || true",
+            "timeout": 5
           }
         ]
       }
@@ -190,7 +198,8 @@ match the key it sits under:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude Notification"
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude Notification >/dev/null 2>&1 || true",
+            "timeout": 5
           }
         ]
       }
@@ -200,7 +209,8 @@ match the key it sits under:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude PermissionDenied"
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude PermissionDenied >/dev/null 2>&1 || true",
+            "timeout": 5
           }
         ]
       }
@@ -210,7 +220,8 @@ match the key it sits under:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SessionEnd"
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SessionEnd >/dev/null 2>&1 || true",
+            "timeout": 5
           }
         ]
       }
@@ -220,7 +231,8 @@ match the key it sits under:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SubagentStart"
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SubagentStart >/dev/null 2>&1 || true",
+            "timeout": 5
           }
         ]
       }
@@ -230,7 +242,8 @@ match the key it sits under:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SubagentStop"
+            "command": "~/.tmux/plugins/tmux-home/target/release/tmux-home hook claude SubagentStop >/dev/null 2>&1 || true",
+            "timeout": 5
           }
         ]
       }
@@ -242,11 +255,13 @@ match the key it sits under:
 Only these nine events: none on the tool-call path (`PostToolUse`,
 `Task*`), so the hook never slows a tool call down. tmux-home's options
 live in their own namespace, so these hooks run side by side with
-tmux-agent-sidebar's; for a pane with `@home_*` options they take
-precedence, and panes without them fall back to the sidebar's `@pane_*`.
-Background shells are only seen through the sidebar (its `PostToolUse`
-hook sets `@pane_bg_cmd`): with it, a Stop while one is live reads
-`◎ background`; without it, `○ idle`.
+tmux-agent-sidebar's. For a pane with both, tmux-home's win while they are
+current (every write stamps `@home_updated`); if they go quiet and the
+sidebar's are clearly newer, or name another session, the sidebar's are
+shown. Panes without `@home_*` fall back to the sidebar's `@pane_*`.
+Background work comes from Stop's `background_tasks` (and, alongside the
+sidebar, its `@pane_bg_cmd`): a Stop with any still running reads
+`◎ background`, with the first shell's command.
 
 `^x` closes at once when every pane in the window is idle at a shell prompt
 (bash, zsh, fish, sh, …; sidebar panes don't count). Otherwise it asks

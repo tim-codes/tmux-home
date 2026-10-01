@@ -37,10 +37,13 @@ pub enum Key {
     WorktreeName,
     WorktreeBranch,
     SessionId,
+    /// Unix seconds of the last hook write (set on every write that sets
+    /// anything); how fresh these options are against the sidebar's.
+    Updated,
 }
 
 impl Key {
-    pub const ALL: [Key; 13] = [
+    pub const ALL: [Key; 14] = [
         Key::Agent,
         Key::Status,
         Key::Attention,
@@ -54,6 +57,7 @@ impl Key {
         Key::WorktreeName,
         Key::WorktreeBranch,
         Key::SessionId,
+        Key::Updated,
     ];
 
     pub fn option(self) -> &'static str {
@@ -71,6 +75,7 @@ impl Key {
             Key::WorktreeName => "@home_worktree_name",
             Key::WorktreeBranch => "@home_worktree_branch",
             Key::SessionId => "@home_session_id",
+            Key::Updated => "@home_updated",
         }
     }
 }
@@ -89,6 +94,7 @@ pub const OPTIONS: &[&str] = &[
     "@home_worktree_name",
     "@home_worktree_branch",
     "@home_session_id",
+    "@home_updated",
 ];
 
 const NAMES: Names = Names {
@@ -117,13 +123,17 @@ impl AgentSource for Home {
     fn read(&self, pane: &Pane) -> Option<AgentState> {
         read_named(&NAMES, pane)
     }
+
+    fn updated(&self, pane: &Pane) -> Option<u64> {
+        pane.agent_opts.get("@home_updated")?.trim().parse().ok()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::tests::pane;
-    use crate::agent::{AgentKind, Status, WaitReason, pane_agent};
+    use crate::agent::{AgentKind, Status, WaitReason, pane_agent, pane_agent_at};
 
     #[test]
     fn options_match_keys() {
@@ -156,6 +166,57 @@ mod tests {
         assert_eq!(
             Home.read(&pane("%1", "node", &[("@pane_agent", "claude")])),
             None
+        );
+    }
+
+    /// Both sources on one pane: `@home_*` wins while it is current; a
+    /// stale `@home_*` (tmux-home's hooks no longer firing for this pane)
+    /// loses to a fresher sidebar.
+    #[test]
+    fn stale_home_loses_to_a_fresh_sidebar() {
+        let now = 1_790_000_000u64;
+        let p = |home_updated: u64, home_sid: &str, pane_started: u64, pane_sid: &str| {
+            let (hu, ps) = (home_updated.to_string(), pane_started.to_string());
+            let opts = [
+                ("@home_agent", "claude"),
+                ("@home_status", "running"),
+                ("@home_updated", hu.as_str()),
+                ("@home_session_id", home_sid),
+                ("@pane_agent", "claude"),
+                ("@pane_status", "waiting"),
+                ("@pane_started_at", ps.as_str()),
+                ("@pane_session_id", pane_sid),
+            ];
+            pane_agent_at(&pane("%1", "node", &opts), now)
+                .unwrap()
+                .state
+                .status
+        };
+        // same session, home written at or after the sidebar's run start
+        assert_eq!(p(now - 5, "s1", now - 5, "s1"), Status::Running);
+        assert_eq!(p(now - 5, "s1", now - 6, "s1"), Status::Running);
+        // a second or two apart is the same event, not newer
+        assert_eq!(p(now - 5, "s1", now - 4, "s1"), Status::Running);
+        // the sidebar started a run well after home last wrote
+        assert_eq!(p(now - 600, "s1", now - 10, "s1"), Status::Waiting);
+        // sessions disagree: home loses once it has been quiet a while
+        assert_eq!(p(now - 600, "old", now - 900, "new"), Status::Waiting);
+        assert_eq!(p(now - 5, "old", now - 900, "new"), Status::Running);
+        // no @home_updated at all (written by nothing current): any
+        // sidebar run start is newer
+        let opts = [
+            ("@home_agent", "claude"),
+            ("@home_status", "running"),
+            ("@pane_agent", "claude"),
+            ("@pane_status", "idle"),
+            ("@pane_started_at", "1790000000"),
+        ];
+        assert_eq!(
+            pane_agent_at(&pane("%1", "node", &opts), now)
+                .unwrap()
+                .state
+                .status,
+            Status::Idle
         );
     }
 

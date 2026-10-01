@@ -15,14 +15,16 @@ pub enum Change {
 }
 
 /// What a hook needs to know about the pane before it writes: the parts
-/// of its state the precedence rules depend on.
+/// of its state the rules depend on.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Prior {
     /// `@home_subagents` (`Type:id,…`); non-empty while subagents run.
     pub subagents: String,
-    /// The live background shell's command, if one is known; see
-    /// `crate::hook::read_prior` for where it comes from.
-    pub bg_cmd: String,
+    /// tmux-agent-sidebar's `@pane_bg_cmd`: its PostToolUse hook's live
+    /// background shell, when the sidebar runs alongside.
+    pub sidebar_bg_cmd: String,
+    /// `@home_bg_cmd`: the background shell the last Stop reported.
+    pub home_bg_cmd: String,
 }
 
 pub trait AgentAdapter: Sync {
@@ -46,8 +48,7 @@ pub fn adapter(name: &str) -> Option<&'static dyn AgentAdapter> {
     ADAPTERS.iter().copied().find(|a| a.kind().name() == name)
 }
 
-/// Accumulates changes, tracking the subagent list as it changes so later
-/// guards in the same event see it.
+/// Accumulates changes, tracking the subagent list as it changes.
 pub struct Writes {
     pub changes: Vec<Change>,
     subagents: String,
@@ -89,13 +90,6 @@ impl Writes {
         &self.subagents
     }
 
-    /// The sidebar's subagent guard (`pane_writes_allowed`): subagents
-    /// share the parent's `$TMUX_PANE`, so while any run, per-session
-    /// metadata (and SessionEnd's teardown) is left alone.
-    pub fn writes_allowed(&self) -> bool {
-        self.subagents.is_empty()
-    }
-
     /// The sidebar's `set_status`: `running` and `idle` also clear
     /// attention.
     pub fn status(&mut self, s: &str) {
@@ -111,6 +105,15 @@ impl Writes {
             self.unset(k);
         }
     }
+}
+
+/// `changes`, stamped with `@home_updated = now` when they set anything
+/// (a pure teardown leaves no stamp behind).
+pub fn stamped(mut changes: Vec<Change>, now: u64) -> Vec<Change> {
+    if changes.iter().any(|c| matches!(c, Change::Set(..))) {
+        changes.push(Change::Set(Key::Updated, now.to_string()));
+    }
+    changes
 }
 
 /// The value of `changes` applied to an empty pane (or to `start`), for

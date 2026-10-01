@@ -9,13 +9,19 @@
 //! tmux unreachable, bad JSON) is a no-op, noted in `<state_dir>/hook.log`
 //! when the server (and so the state dir) is known.
 
-use crate::agent::adapter::{AgentAdapter, Change, Prior, adapter};
+use crate::agent::adapter::{AgentAdapter, Change, Prior, adapter, stamped};
 use crate::tmux::Tmux;
 use std::io::{Read, Write};
 use std::path::Path;
 
 /// `hook.log` is moved to `hook.log.1` once it reaches this size.
 pub const LOG_CAP: u64 = 64 << 10;
+
+// A panic must unwind into `main`'s catch_unwind: with `panic = "abort"`
+// it would kill the process with SIGABRT, which Claude Code reads as a
+// failed hook.
+#[cfg(panic = "abort")]
+compile_error!("tmux-home hook needs panic = \"unwind\"");
 
 /// The whole hook. Never panics outward and never prints.
 pub fn main(args: &[String]) -> i32 {
@@ -78,29 +84,28 @@ pub fn apply_event(
     now: u64,
 ) -> anyhow::Result<()> {
     let prior = read_prior(t, pane)?;
-    let changes = ad.on_hook(event, payload, &prior, now);
+    let changes = stamped(ad.on_hook(event, payload, &prior, now), now);
     write(t, pane, &changes)
 }
 
-/// The pane's subagent list and live background shell, in one call.
-///
-/// A background shell is known only from tmux-agent-sidebar's
-/// `@pane_bg_cmd` (which its PostToolUse hook sets and its refresh sweep
-/// clears): tmux-home's hooks stay off the tool-call path (spec §5), so
-/// they can't see one start. Without the sidebar it reads as none.
+/// The pane's subagent list and known background shells, in one call:
+/// tmux-agent-sidebar's `@pane_bg_cmd` (set by its PostToolUse hook,
+/// cleared by its refresh sweep; tmux-home stays off the tool-call path,
+/// spec §5) and `@home_bg_cmd` (from the last Stop's `background_tasks`).
 pub fn read_prior(t: &Tmux, pane: &str) -> anyhow::Result<Prior> {
     let out = t.run(&[
         "display-message",
         "-p",
         "-t",
         pane,
-        "#{@home_subagents}\x1f#{@pane_bg_cmd}",
+        "#{@home_subagents}\x1f#{@pane_bg_cmd}\x1f#{@home_bg_cmd}",
     ])?;
     let out = out.strip_suffix('\n').unwrap_or(&out);
-    let (subagents, bg) = out.split_once('\x1f').unwrap_or((out, ""));
+    let mut f = out.split('\x1f').map(|v| v.trim().to_string());
     Ok(Prior {
-        subagents: subagents.trim().to_string(),
-        bg_cmd: bg.trim().to_string(),
+        subagents: f.next().unwrap_or_default(),
+        sidebar_bg_cmd: f.next().unwrap_or_default(),
+        home_bg_cmd: f.next().unwrap_or_default(),
     })
 }
 
@@ -169,6 +174,20 @@ fn log(socket: &Path, msg: &str) {
 mod tests {
     use super::*;
     use crate::agent::home::Key;
+
+    #[test]
+    fn writes_are_stamped() {
+        use crate::agent::adapter::stamped;
+        let c = stamped(vec![Change::Unset(Key::Attention)], 7);
+        assert_eq!(
+            c,
+            [Change::Unset(Key::Attention)],
+            "a teardown leaves no stamp"
+        );
+        let c = stamped(vec![Change::Set(Key::Status, "idle".into())], 7);
+        assert_eq!(c.last(), Some(&Change::Set(Key::Updated, "7".into())));
+        assert!(stamped(vec![], 7).is_empty());
+    }
 
     #[test]
     fn write_args_chain_and_escape() {

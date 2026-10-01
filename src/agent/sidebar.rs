@@ -85,6 +85,12 @@ impl AgentSource for Sidebar {
     fn read(&self, pane: &Pane) -> Option<AgentState> {
         read_named(&NAMES, pane)
     }
+
+    /// The sidebar keeps no write time; the start of its current run is
+    /// the latest moment it is known to have written.
+    fn updated(&self, pane: &Pane) -> Option<u64> {
+        pane.agent_opts.get(NAMES.started)?.trim().parse().ok()
+    }
 }
 
 /// A pane's agent state from the options `n` names; `None` unless the
@@ -144,6 +150,8 @@ fn parse_reason(r: &str, status: Status) -> WaitReason {
     match r {
         "permission" | "permission_prompt" => WaitReason::Permission,
         "permission_denied" => WaitReason::PermissionDenied,
+        // tmux-home's hook records the denial's reason after a colon
+        r if r.starts_with("permission_denied:") => WaitReason::PermissionDenied,
         "elicitation_dialog" => WaitReason::Question,
         _ => {
             if let Some(rest) = r.strip_prefix("teammate_idle:") {

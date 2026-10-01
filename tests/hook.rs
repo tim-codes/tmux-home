@@ -171,28 +171,153 @@ fn a_session_from_start_to_end() {
     assert_eq!(derived(&s, &pane), None);
 }
 
-/// A subagent's SessionEnd must not wipe its parent; the parent's own
-/// SessionEnd, once its subagents are done, does.
+/// Subagents share the parent's pane: their events (carrying `agent_id`)
+/// leave the parent's session alone, and the parent's SessionEnd clears
+/// the pane even with subagents still listed.
 #[test]
-fn subagent_session_end_leaves_the_parent() {
+fn subagents_share_the_pane() {
     let (_env, s, pane) = setup();
     hook(&s, &pane, "SessionStart", "session_start");
     hook(&s, &pane, "UserPromptSubmit", "user_prompt_submit");
+    let sid = opt(&s, &pane, "@home_session_id");
     hook(&s, &pane, "SubagentStart", "subagent_start");
     assert_eq!(opt(&s, &pane, "@home_subagents"), "Explore:agent-0001");
-    hook(&s, &pane, "SessionEnd", "session_end");
-    hook(&s, &pane, "SessionEnd", "session_end_subagent");
+    hook(&s, &pane, "PermissionDenied", "permission_denied_subagent");
     let a = derived(&s, &pane).unwrap();
     assert_eq!(a.state.status, Status::Running, "parent still running");
     assert_eq!(a.state.subagents, ["Explore"]);
-    assert!(a.state.run_started.is_some());
+    assert_eq!(opt(&s, &pane, "@home_session_id"), sid);
     hook(&s, &pane, "SubagentStop", "subagent_stop");
     assert_eq!(opt(&s, &pane, "@home_subagents"), "");
-    assert_eq!(derived(&s, &pane).unwrap().state.status, Status::Running);
-    hook(&s, &pane, "Stop", "stop");
-    assert_eq!(derived(&s, &pane).unwrap().state.status, Status::Idle);
+    hook(&s, &pane, "SubagentStart", "subagent_start");
     hook(&s, &pane, "SessionEnd", "session_end");
-    assert_eq!(derived(&s, &pane), None);
+    assert_eq!(home_opts(&s, &pane), Vec::<String>::new());
+    assert_eq!(derived(&s, &pane), None, "no stale running");
+}
+
+/// Stop with Claude Code's `background_tasks`: background, no sidebar
+/// needed.
+#[test]
+fn background_tasks_without_the_sidebar() {
+    let (_env, s, pane) = setup();
+    hook(&s, &pane, "UserPromptSubmit", "user_prompt_submit");
+    let started = opt(&s, &pane, "@home_run_started");
+    hook(&s, &pane, "Stop", "stop_background");
+    let a = derived(&s, &pane).unwrap();
+    assert_eq!(a.state.status, Status::Background);
+    assert_eq!(a.state.bg_cmd.as_deref(), Some("npm run dev"));
+    assert_eq!(opt(&s, &pane, "@home_run_started"), started);
+    hook(&s, &pane, "Stop", "stop");
+    let a = derived(&s, &pane).unwrap();
+    assert_eq!(a.state.status, Status::Idle);
+    assert_eq!(a.state.bg_cmd, None);
+}
+
+/// Every write stamps `@home_updated`; a stale `@home_*` from an older
+/// session loses to the sidebar's fresher options.
+#[test]
+fn stale_home_options_lose_to_a_fresh_sidebar() {
+    let (_env, s, pane) = setup();
+    hook(&s, &pane, "SessionStart", "session_start");
+    let now = tmux_home::agent::now();
+    let stamp: u64 = opt(&s, &pane, "@home_updated").parse().unwrap();
+    assert!(stamp.abs_diff(now) <= 2, "{stamp} vs {now}");
+    // tmux-home's hooks go quiet for this pane; the sidebar's carry on
+    // with a new session
+    let old = (now - 3600).to_string();
+    s.tmux(&["set-option", "-p", "-t", &pane, "@home_updated", &old]);
+    for (k, v) in [
+        ("@pane_agent", "claude"),
+        ("@pane_status", "waiting"),
+        ("@pane_session_id", "another-session"),
+    ] {
+        s.tmux(&["set-option", "-p", "-t", &pane, k, v]);
+    }
+    assert_eq!(derived(&s, &pane).unwrap().state.status, Status::Waiting);
+    // tmux-home's hook fires again (same session as the sidebar): it wins
+    let p = r#"{"session_id": "another-session", "prompt": "go"}"#;
+    let out = hook_raw(
+        &["claude", "UserPromptSubmit"],
+        Some(&tmux_env(&s)),
+        Some(&pane),
+        p,
+    );
+    assert_silent_ok(&out);
+    assert_eq!(derived(&s, &pane).unwrap().state.status, Status::Running);
+}
+
+/// The README's hook commands, run the way Claude Code runs them
+/// (`sh -c`), exit 0 with nothing on stdout whatever is at the path: no
+/// binary, an old binary without `hook` (exit 2, which would block every
+/// prompt), or the real one.
+#[test]
+fn readme_commands_never_fail() {
+    let readme =
+        std::fs::read_to_string(format!("{}/README.md", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let json = readme
+        .split("```json\n")
+        .nth(1)
+        .and_then(|r| r.split("\n```").next())
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(json).unwrap();
+    let hooks = v["hooks"].as_object().unwrap();
+    let mut events: Vec<&str> = hooks.keys().map(String::as_str).collect();
+    events.sort();
+    let mut want = tmux_home::agent::claude::EVENTS.to_vec();
+    want.sort();
+    assert_eq!(events, want);
+    let cmds: Vec<(String, String)> = hooks
+        .iter()
+        .map(|(ev, entries)| {
+            let h = &entries[0]["hooks"][0];
+            assert_eq!(h["type"], "command");
+            assert_eq!(h["timeout"], 5, "{ev}");
+            let c = h["command"].as_str().unwrap().to_string();
+            assert!(c.contains(&format!(" hook claude {ev} ")), "{c}");
+            (ev.clone(), c)
+        })
+        .collect();
+
+    let (_env, s, pane) = setup();
+    let home = std::env::temp_dir().join(format!("th-home-{}", common::rand_suffix()));
+    let bin_dir = home.join(".tmux/plugins/tmux-home/target/release");
+    let bin = bin_dir.join("tmux-home");
+    let run_all = |what: &str| {
+        for (ev, c) in &cmds {
+            let mut child = Command::new("sh")
+                .args(["-c", c])
+                .env("HOME", &home)
+                .env("TMUX", tmux_env(&s))
+                .env("TMUX_PANE", &pane)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let _ = child.stdin.take().unwrap().write_all(b"{}");
+            let out = child.wait_with_output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{what}: {ev}");
+            assert!(out.stdout.is_empty(), "{what}: {ev}: {:?}", out.stdout);
+        }
+    };
+    // nothing at the path
+    run_all("missing binary");
+    // an old build: unknown subcommand, exit 2, noise on both streams
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\necho out; echo \"error: unrecognized subcommand 'hook'\" >&2; exit 2\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    run_all("old binary");
+    // the real one
+    std::fs::remove_file(&bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tmux-home"), &bin).unwrap();
+    run_all("this build");
+    assert_eq!(opt(&s, &pane, "@home_agent"), "claude");
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// With the sidebar's options alongside: `@home_*` wins for the pane, and
