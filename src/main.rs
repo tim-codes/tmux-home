@@ -25,6 +25,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// The full-window popup (run inside `display-popup -E`).
+    Popup {
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
+    /// Recreate the most recently closed window; prints its ID (exit 4 if none).
+    Reopen {
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
+    /// One status-line token: ● daemon up, ○ down (nothing outside tmux).
+    Status {
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
     /// R0 spike: measure control-mode side effects on a server and print a report.
     SpikeControl {
         #[arg(long)]
@@ -34,10 +49,20 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let cmd = match cli.cmd {
+        Cmd::Popup { socket } => return tmux_home::popup::run(socket),
+        Cmd::Status { socket } => return tmux_home::popup::status(socket),
+        Cmd::Reopen { socket } => {
+            let code = tmux_home::popup::reopen_cli(socket)?;
+            std::process::exit(code);
+        }
+        c => c,
+    };
     let rt = tokio::runtime::Runtime::new()?;
-    match cli.cmd {
+    match cmd {
         Cmd::Daemon { socket, source } => rt.block_on(tmux_home::daemon::run(socket, source)),
         Cmd::Query { socket, json: _ } => rt.block_on(tmux_home::client::query(socket)),
         Cmd::SpikeControl { socket } => rt.block_on(tmux_home::tmux::source::spike_control(socket)),
+        Cmd::Popup { .. } | Cmd::Status { .. } | Cmd::Reopen { .. } => unreachable!(),
     }
 }

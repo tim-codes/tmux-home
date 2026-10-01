@@ -37,6 +37,9 @@ pub struct Pane {
     pub current_command: String,
     pub current_path: String,
     pub title: String,
+    /// `@pane_role` (e.g. `sidebar`); sidebar panes are views, not work.
+    #[serde(default)]
+    pub role: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -56,7 +59,7 @@ const REC_END: &str = "\x1e\n";
 // Field separator is ASCII unit separator \x1f (not typeable at a prompt, so it
 // cannot appear in names tmux-home's users type in). Names are the *last* field
 // in each format so a stray separator elsewhere can't shift the other fields.
-const PANE_FMT: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
+const PANE_FMT: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{@pane_role}\x1f#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
 const CLIENT_FMT: &str = "#{client_name}\x1f#{client_tty}\x1f#{session_id}\x1f#{client_flags}\x1e";
 
 /// Reads a full snapshot of the tmux server and a hash of its contents.
@@ -115,8 +118,8 @@ struct PaneRec<'a> {
 }
 
 fn pane_record(rec: &str) -> Option<PaneRec<'_>> {
-    let f: Vec<&str> = rec.splitn(13, SEP).collect();
-    if f.len() != 13 {
+    let f: Vec<&str> = rec.splitn(14, SEP).collect();
+    if f.len() != 14 {
         return None;
     }
     Some(PaneRec {
@@ -145,7 +148,7 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
         if !s.sessions.iter().any(|x| x.id == sid) {
             s.sessions.push(Session {
                 id: sid.clone(),
-                name: f[10].to_string(),
+                name: f[11].to_string(),
                 attached: 0,
             });
         }
@@ -156,7 +159,7 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
                 index: window_index,
                 active: f[3] == "1",
                 automatic_rename: f[4] == "1",
-                name: f[12].to_string(),
+                name: f[13].to_string(),
             });
         }
         s.panes.push(Pane {
@@ -167,7 +170,8 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
             active: f[7] == "1",
             current_command: f[8].to_string(),
             current_path: f[9].to_string(),
-            title: f[11].to_string(),
+            title: f[12].to_string(),
+            role: f[10].to_string(),
         });
     }
     for rec in records(clients) {
