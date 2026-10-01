@@ -766,6 +766,164 @@ mod tests {
         assert!(a.notice.is_some());
     }
 
+    fn alt(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn one_row_per_window_with_ids_and_main_pane() {
+        let rows = build_rows(&snap(), Some("/dev/ttys1"), "/home/u");
+        assert_eq!(rows.len(), 4, "the sidebar pane adds no row");
+        let logs = rows.iter().find(|r| r.name == "logs").unwrap();
+        assert_eq!((logs.sid.as_str(), logs.wid.as_str()), ("$1", "@2"));
+        // the active pane is a sidebar: the row describes the main pane
+        assert_eq!(logs.pane.as_deref(), Some("%2"));
+        assert_eq!(logs.cmd, "fish");
+    }
+
+    #[test]
+    fn no_client_sessions_by_name_windows_by_index() {
+        let mut s = snap();
+        s.windows.reverse();
+        s.sessions.reverse();
+        let rows = build_rows(&s, None, "/home/u");
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| format!("{} {}", r.session, r.name))
+            .collect();
+        assert_eq!(
+            got,
+            ["alpha editor", "alpha win two", "beta logs", "beta build"]
+        );
+        assert!(rows.iter().all(|r| !r.current));
+    }
+
+    #[test]
+    fn header_follows_client_and_current_is_marked() {
+        let mut a = app();
+        assert_eq!(a.location, "beta ▸ 0");
+        let cur: Vec<_> = a
+            .rows
+            .iter()
+            .filter(|r| r.current)
+            .map(|r| &r.wid)
+            .collect();
+        assert_eq!(cur, ["@2"]);
+        // the client moves to alpha: header, order and marker follow
+        let mut s = snap();
+        s.clients[0].session_id = "$0".into();
+        a.set_rows(build_rows(&s, Some("/dev/ttys1"), "/home/u"));
+        assert_eq!(a.location, "alpha ▸ 0");
+        assert_eq!(names(&a), ["editor", "win two", "logs", "build"]);
+        assert!(a.rows[0].current);
+    }
+
+    #[test]
+    fn typing_filters_and_returns_to_top() {
+        let mut a = app();
+        a.key(key(KeyCode::Down));
+        a.key(key(KeyCode::Down));
+        typed(&mut a, "bui");
+        assert_eq!(names(&a), ["build"]);
+        assert_eq!(a.sel, 0);
+        // fzf-syntax characters are literal
+        let mut rows = build_rows(&snap(), Some("/dev/ttys1"), "/home/u");
+        rows[0].name = "renamed (x)+y, z".into();
+        rows[0].hay = "beta 0 renamed (x)+y, z fish ~/d/x".into();
+        a.set_rows(rows);
+        a.clear_filter();
+        typed(&mut a, "(x)+");
+        assert_eq!(names(&a), ["renamed (x)+y, z"]);
+    }
+
+    #[test]
+    fn alt_r_resets_selected() {
+        let mut a = app();
+        a.key(key(KeyCode::Down));
+        assert_eq!(
+            a.key(alt(KeyCode::Char('r'))),
+            Action::ResetName("@3".into())
+        );
+        assert_eq!(a.mode, Mode::List, "the popup stays in the list");
+    }
+
+    #[test]
+    fn ctrl_o_toggles_preview_and_help_returns_on_any_key() {
+        let mut a = app();
+        a.key(ctrl('o'));
+        assert!(a.preview_flip);
+        a.key(ctrl('o'));
+        assert!(!a.preview_flip);
+        for open in [key(KeyCode::F(1)), ctrl('/'), ctrl('7')] {
+            a.key(open);
+            assert_eq!(a.mode, Mode::Help);
+            assert_eq!(a.key(key(KeyCode::Char('q'))), Action::Redraw);
+            assert_eq!(a.mode, Mode::List);
+        }
+    }
+
+    #[test]
+    fn close_verdicts() {
+        use crate::ops::ClosePlan;
+        let mut a = app();
+        assert_eq!(a.key(ctrl('x')), Action::CloseStart("@2".into()));
+        // idle: closes at once
+        assert_eq!(
+            a.close_plan("@2", ClosePlan::Now),
+            Action::Close("@2".into())
+        );
+        // last window on the server: refused with a notice
+        assert_eq!(a.close_plan("@2", ClosePlan::Refuse), Action::Redraw);
+        assert!(a.footer().contains("last window on the server"));
+        // busy: the prompt asks; only y closes
+        for (k, want) in [
+            (key(KeyCode::Char('n')), Action::Redraw),
+            (key(KeyCode::Esc), Action::Redraw),
+            (key(KeyCode::Enter), Action::Redraw),
+            (ctrl('y'), Action::Redraw),
+            (key(KeyCode::Char('y')), Action::Close("@2".into())),
+        ] {
+            typed(&mut a, "lo");
+            a.close_plan("@2", ClosePlan::Ask("close \"logs\"? (y/N) ".into()));
+            assert!(matches!(a.mode, Mode::Confirm { .. }));
+            assert_eq!(a.footer(), FOOTER_CLOSE);
+            assert_eq!(a.key(k), want);
+            assert_eq!(a.mode, Mode::List);
+            assert_eq!(a.filter.as_string(), "lo", "the filter is kept");
+            a.clear_filter();
+        }
+    }
+
+    #[test]
+    fn notice_clears_once_you_type() {
+        let mut a = app();
+        assert_eq!(a.key(ctrl('t')), Action::Reopen);
+        a.notice = Some(" nothing to reopen".into());
+        a.key(key(KeyCode::Down));
+        assert!(a.footer().contains("nothing to reopen"), "moving keeps it");
+        typed(&mut a, "x");
+        assert!(!a.footer().contains("nothing to reopen"));
+    }
+
+    #[test]
+    fn alt_n_names_a_new_window_after_the_selection() {
+        let mut a = app();
+        a.key(alt(KeyCode::Char('n')));
+        assert!(matches!(&a.mode, Mode::NewWindow { after, .. } if after == "@2"));
+        assert_eq!(a.key(key(KeyCode::Esc)), Action::Redraw);
+        assert_eq!(a.mode, Mode::List);
+        a.key(alt(KeyCode::Char('n')));
+        typed(&mut a, "n #1");
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Action::NewWindow {
+                after: "@2".into(),
+                cwd: "/home/u/dev/x".into(),
+                name: "n #1".into()
+            }
+        );
+    }
+
     /// A snapshot read before a write (here: one without the window the
     /// popup just made and selected) lands after it; the selection comes
     /// back to that window with the next snapshot.

@@ -320,7 +320,7 @@ fn event_loop(
             dirty = true;
         }
         if dirty {
-            term.draw(|f| draw(f, app, rt))?;
+            term.draw(|f| draw(f, app, rt.live, &rt.preview.1))?;
             dirty = false;
         }
         if event::poll(Duration::from_millis(50))? {
@@ -361,7 +361,9 @@ fn preview_rect(area: Rect, flip: bool) -> (Rect, Option<Rect>, Direction) {
     (parts[0], Some(parts[1]), dir)
 }
 
-fn draw(f: &mut Frame, app: &mut App, rt: &Runtime) {
+/// Draws the popup; `live` is false in degraded mode, `preview` is the
+/// selected pane's captured text.
+fn draw(f: &mut Frame, app: &mut App, live: bool, preview: &str) {
     let area = f.area();
     let bg = Block::default().style(Style::default().bg(Color::Reset));
     f.render_widget(bg, area);
@@ -386,7 +388,7 @@ fn draw(f: &mut Frame, app: &mut App, rt: &Runtime) {
     if !app.location.is_empty() {
         h.push(Span::raw(format!("   {}", app.location)));
     }
-    if !rt.live {
+    if !live {
         h.push(Span::styled("   (direct)", dim));
     }
     f.render_widget(Paragraph::new(Line::from(h)), v[0]);
@@ -436,7 +438,7 @@ fn draw(f: &mut Frame, app: &mut App, rt: &Runtime) {
             .border_style(dim);
         let inner = block.inner(p);
         f.render_widget(block, p);
-        let lines: Vec<&str> = rt.preview.1.lines().collect();
+        let lines: Vec<&str> = preview.lines().collect();
         let skip = lines.len().saturating_sub(inner.height as usize);
         let body: Vec<Line> = lines[skip..].iter().map(|l| Line::raw(*l)).collect();
         f.render_widget(Paragraph::new(body), inner);
@@ -568,4 +570,149 @@ fn daemon_up(socket: &Path) -> bool {
             Ok(Ok(Some(Reply::Snapshot { .. })))
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tmux::snapshot::{Client, Pane, Session, Window};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    };
+
+    fn app() -> App {
+        let mut s = Snapshot::default();
+        s.sessions.push(Session {
+            id: "$0".into(),
+            name: "alpha".into(),
+            attached: 1,
+        });
+        for (i, name) in ["editor", "a much longer window name than fits"]
+            .into_iter()
+            .enumerate()
+        {
+            s.windows.push(Window {
+                id: format!("@{i}"),
+                session_id: "$0".into(),
+                index: i as u32,
+                name: name.into(),
+                automatic_rename: false,
+                active: i == 0,
+            });
+            s.panes.push(Pane {
+                id: format!("%{i}"),
+                window_id: format!("@{i}"),
+                session_id: "$0".into(),
+                index: 0,
+                active: true,
+                current_command: "sh".into(),
+                current_path: "/tmp".into(),
+                title: String::new(),
+                role: String::new(),
+            });
+        }
+        s.clients.push(Client {
+            name: "c".into(),
+            tty: "c".into(),
+            session_id: "$0".into(),
+        });
+        let mut a = App::new();
+        a.set_rows(app::build_rows(&s, Some("c"), ""));
+        a.select_current();
+        a
+    }
+
+    fn screen(a: &mut App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, a, true, "line one\nline two")).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn preview_layout_by_size() {
+        let at = |w, h, flip| {
+            let (_, p, d) = preview_rect(Rect::new(0, 0, w, h), flip);
+            (p.map(|r| (r.width, r.height)), d)
+        };
+        // >= 160 columns: right half
+        assert_eq!(at(200, 50, false), (Some((100, 50)), Direction::Horizontal));
+        // < 160 columns, >= 30 rows: bottom third
+        assert_eq!(at(150, 40, false).1, Direction::Vertical);
+        assert_eq!(at(150, 40, false).0.unwrap().0, 150);
+        assert!(at(150, 40, false).0.unwrap().1 <= 14);
+        // small: hidden until ^o, then the bottom half
+        assert_eq!(at(120, 20, false).0, None);
+        assert_eq!(at(120, 20, true), (Some((120, 10)), Direction::Vertical));
+        // ^o hides a shown preview
+        assert_eq!(at(200, 50, true).0, None);
+    }
+
+    #[test]
+    fn side_and_bottom_borders() {
+        let s = screen(&mut app(), 200, 50);
+        assert!(s.contains('│') && s.contains("line two"), "{s}");
+        let s = screen(&mut app(), 150, 40);
+        assert!(!s.contains('│'), "{s}");
+        assert!(
+            s.lines()
+                .any(|l| l.chars().count() == 150 && l.chars().all(|c| c == '─'))
+        );
+        let s = screen(&mut app(), 120, 20);
+        assert!(!s.contains("line two"), "hidden when small:\n{s}");
+    }
+
+    #[test]
+    fn tiny_terminals_do_not_panic() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        let plain = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        for (w, h) in [(20, 3), (10, 1), (1, 1), (3, 2), (200, 1)] {
+            for keys in [
+                vec![],
+                vec![ctrl('r')],
+                vec![alt('n')],
+                vec![ctrl('o')],
+                vec![plain(KeyCode::F(1))],
+                vec![plain(KeyCode::Char('z')), plain(KeyCode::Char('z'))],
+                vec![plain(KeyCode::PageDown), plain(KeyCode::PageUp)],
+            ] {
+                let mut a = app();
+                a.notice = Some(" a long notice that does not fit anywhere".into());
+                for k in keys {
+                    a.key(k);
+                }
+                screen(&mut a, w, h);
+                assert!(a.page >= 1);
+            }
+            let mut a = app();
+            a.close_plan(
+                "@0",
+                crate::ops::ClosePlan::Ask("close \"editor\"? (y/N) ".into()),
+            );
+            screen(&mut a, w, h);
+        }
+    }
+
+    /// PgDn moves by at least one row whatever the list height.
+    #[test]
+    fn page_keys_move_at_least_one_row() {
+        let mut a = app();
+        screen(&mut a, 40, 4);
+        a.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(a.sel, 1);
+        a.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(a.sel, 0);
+    }
 }
