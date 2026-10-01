@@ -51,6 +51,14 @@ pub struct TestServer {
     pub socket: PathBuf,
 }
 
+/// The cwd tmux commands run from, so sessions and windows created
+/// without `-c` start there: the temp dir, never a repository (the
+/// daemon's git task runs status on every window's repo, and the test's
+/// own cwd is this crate's checkout).
+pub fn neutral_cwd() -> PathBuf {
+    std::env::temp_dir().canonicalize().unwrap()
+}
+
 impl TestServer {
     /// A throwaway server with one detached 200x50 session "alpha" running /bin/sh.
     pub fn start() -> TestServer {
@@ -71,6 +79,7 @@ impl TestServer {
                 "50",
                 "/bin/sh",
             ])
+            .current_dir(neutral_cwd())
             .env_remove("TMUX")
             .output()
             .unwrap();
@@ -151,6 +160,7 @@ impl TestServer {
             .arg("-S")
             .arg(&self.socket)
             .args(args)
+            .current_dir(neutral_cwd())
             .env_remove("TMUX")
             .output()
             .unwrap();
@@ -502,4 +512,123 @@ pub fn fake_claude() -> String {
         bin.to_str().unwrap().to_string()
     })
     .clone()
+}
+
+/// Makes every git this test process starts — the test's own and the
+/// code under test's, and a tmux server's (started after this) — read no
+/// user or system config: no signing, no hooks, no fsmonitor from
+/// `~/.gitconfig`. The code under test's scrub keeps these two.
+pub fn git_env() {
+    // SAFETY: single-threaded tests (RUST_TEST_THREADS=1).
+    unsafe {
+        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        std::env::remove_var("TMUX_HOME_GIT");
+        std::env::remove_var("TMUX_HOME_GIT_TIMEOUT_MS");
+    }
+}
+
+/// Runs git in `dir` for test setup (writes allowed), hermetic: no user
+/// config, a fixed identity, no signing. Panics on failure.
+pub fn git_at(dir: &std::path::Path, args: &[&str]) -> String {
+    let mut c = Command::new("git");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            c.env_remove(k);
+        }
+    }
+    let out = c
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A throwaway directory for repos, removed on drop; canonical (on macOS
+/// the temp dir is behind the /var → /private/var symlink, and tmux and
+/// git report real paths).
+pub struct TempDir(pub PathBuf);
+
+impl TempDir {
+    pub fn new(tag: &str) -> TempDir {
+        let d = std::env::temp_dir().join(format!(
+            "th-git-{tag}-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        TempDir(d.canonicalize().unwrap())
+    }
+
+    /// A new repo `name` in this directory on branch `main` with one commit.
+    pub fn repo(&self, name: &str) -> PathBuf {
+        self.repo_in(name, "sha1")
+    }
+
+    /// `repo` with the given object format (`sha1`, `sha256`).
+    pub fn repo_in(&self, name: &str, format: &str) -> PathBuf {
+        let r = self.0.join(name);
+        std::fs::create_dir_all(&r).unwrap();
+        let fmt = format!("--object-format={format}");
+        git_at(&r, &["init", "-q", "-b", "main", &fmt]);
+        write(&r, "README", "hello\n");
+        commit_all(&r, "init");
+        r
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn write(dir: &std::path::Path, rel: &str, text: &str) {
+    let p = dir.join(rel);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(p, text).unwrap();
+}
+
+pub fn commit_all(dir: &std::path::Path, msg: &str) {
+    git_at(dir, &["add", "-A"]);
+    git_at(dir, &["commit", "-q", "-m", msg]);
+}
+
+/// A bare "remote" beside `repo`, added as `origin`, `main` pushed with
+/// upstream set and `origin/HEAD` recorded.
+pub fn with_origin(repo: &std::path::Path) -> PathBuf {
+    let bare = repo.with_extension("remote.git");
+    std::fs::create_dir_all(&bare).unwrap();
+    git_at(&bare, &["init", "-q", "--bare", "-b", "main"]);
+    git_at(repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git_at(repo, &["push", "-q", "-u", "origin", "main"]);
+    git_at(repo, &["remote", "set-head", "origin", "main"]);
+    bare
+}
+
+/// A stand-in for git (`TMUX_HOME_GIT`): a shell script with `body`,
+/// written to `dir`.
+pub fn fake_git(dir: &std::path::Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(format!("fake-git-{}", rand_suffix()));
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
 }

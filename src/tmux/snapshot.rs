@@ -10,6 +10,10 @@ pub struct Snapshot {
     pub windows: Vec<Window>,
     pub panes: Vec<Pane>,
     pub clients: Vec<Client>,
+    /// Git status of the repos the panes are in. Filled by the daemon's git
+    /// task (`daemon::git`); a direct read of tmux leaves it empty.
+    #[serde(default)]
+    pub git: crate::git::badge::GitSection,
 }
 
 /// One change-detection hash per snapshot section. The daemon pushes a
@@ -21,6 +25,8 @@ pub struct Snapshot {
 pub struct Sections {
     /// Sessions, windows, panes and clients.
     pub tmux: u64,
+    /// The git section (stable fields only; see `RepoStatus`).
+    pub git: u64,
 }
 
 impl Snapshot {
@@ -32,11 +38,22 @@ impl Snapshot {
             windows,
             panes,
             clients,
+            git,
         } = self;
         let mut h = DefaultHasher::new();
         (sessions, windows, panes, clients).hash(&mut h);
-        Sections { tmux: h.finish() }
+        Sections {
+            tmux: h.finish(),
+            git: git_hash(git),
+        }
     }
+}
+
+/// The change-detection hash of a git section.
+pub fn git_hash(git: &crate::git::badge::GitSection) -> u64 {
+    let mut h = DefaultHasher::new();
+    git.hash(&mut h);
+    h.finish()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]

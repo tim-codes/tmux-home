@@ -11,7 +11,8 @@ where to go.
 > awareness (pass 4: status, NEEDS YOU, `^g`, filter tokens, agent card) from
 > [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s pane
 > options, and (pass 5a) from tmux-home's own Claude Code hooks, which run
-> alongside the sidebar's. Git badges and the sidebar come in later milestones; see
+> alongside the sidebar's, and (pass 5b) git badges on window rows from the
+> daemon. The repos view and the sidebar come in later milestones; see
 > [`docs/superpowers/specs/2026-09-29-rust-daemon-design.md`](docs/superpowers/specs/2026-09-29-rust-daemon-design.md) §13.
 
 ## Why
@@ -83,7 +84,7 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 
 | Key | Action |
 | --- | --- |
-| type | filter (session, index, name, command, path, agent kind; agent prompts word by word) and tokens, below |
+| type | filter (session, index, name, command, path, agent kind, git branch; agent prompts word by word) and tokens, below |
 | `↑` `↓` `^p` `^n` `^k` `^j` | move (wraps) |
 | `PgUp` `PgDn` | page |
 | `←` `→` `Home` `End` `^a` `^e` `^u` `^w` | edit the filter |
@@ -124,6 +125,60 @@ behind: Claude counts as alive only while its pane runs its versioned binary,
 `claude` or `node`; other agents while it isn't a shell) is **stale**: dimmed with `(ended?)`, never pinned or
 counted. With neither set of hooks, windows are listed as before, with no
 agent column.
+
+### Git badges
+
+Each window row ends in a compact badge for the git repo its pane is in
+(an agent window: the repo, or linked worktree, its lead agent works in, in
+place of the hook's `(wt) <branch>`), e.g. `main +!? ⇡2 ⇣1 $1 ⚠2 ↻`. The
+preview of a window in a repo gets a git card spelling it out: branch →
+upstream, ahead/behind, changes, operation in progress, stashes, stray
+branches by name, worktree (linked, main, locked…) and the default branch.
+
+| Symbol | Meaning |
+| --- | --- |
+| `main` | branch (the short commit when detached) |
+| `(wt)` | a linked worktree (`git worktree add`) |
+| `+` `!` `?` | staged, modified, untracked files |
+| `✘` | conflicts |
+| `⇡n` `⇣n` | commits ahead of / behind the upstream |
+| `\|` | in sync with the upstream |
+| `$n` | stashes |
+| `⚠n` | stray branches: commits on no remote, no upstream (or a gone one), not merged into the default branch; in a repo with no remote, every branch other than the default one that isn't merged into it |
+| `↻` | merge, rebase, cherry-pick, revert or bisect in progress |
+| `⊟` `⊞` `⊘` `⚑` | worktree prunable, locked, detached, branch/path mismatch |
+| `⊗` | limited: the repo's config names a command under a key that can't be switched off; only HEAD is shown, no status runs |
+| `~` | stale: the last check timed out or failed (the values are older) |
+
+`F1` shows the same legend. The symbols follow worktrunk's `wt list`;
+`↑↓` are reserved for "vs default branch" (later).
+
+The daemon computes badges in a task of its own, off the tmux poll's path,
+keyed by repo root (windows in one repo share one status). A repo is
+re-checked when a window's directory changes, when one of its windows gains
+focus, when git itself changes it (the index, HEAD, reflogs, packed refs,
+`FETCH_HEAD`: watched by `stat` once a second), and otherwise every
+`max(10 s, 20 × its last status time)`. Each check is fast-first: the branch
+from `.git/HEAD` (no git process), then one `git status`, then three
+small reads (`for-each-ref`, a few config keys, `worktree list`) whose
+result is memoised — unpushed counts, stray detection and the default
+branch are recomputed only when a ref or that config changed.
+At most 4 git processes run at once, each with a 10 s timeout
+(`TMUX_HOME_GIT_TIMEOUT_MS` overrides it); badges reach the popup at most
+once a second. Git runs read-only and runs nothing a repo or your config
+names: `--no-optional-locks`, no fetch or any transport, no config
+written, fsmonitor off (no hook, no `fsmonitor--daemon`), no hooks, no
+clean/process filters, textconv or external diff (every such key in the
+repo's config, whatever its name, is overridden to nothing, and attributes
+are read from the empty tree), inherited `GIT_DIR`-style variables removed,
+`LC_ALL=C`, each call in its own process group, and never into a
+submodule (`--ignore-submodules=all`: a submodule's own config and
+attributes could name a filter), so **changes inside a submodule don't
+show** — the superproject's badge counts it as unchanged. One consequence: a
+stat-dirty LFS or `text=auto` file can show as modified (`!`) until your
+own git refreshes the index.
+Badges need the daemon: a popup reading tmux directly (`(direct)`) shows
+none.
 
 ### Claude Code hooks
 
@@ -333,15 +388,20 @@ cargo test
 The integration and end-to-end tests run against throwaway servers only
 (`tmux -L th-test-*`, plus `th-outer-*`, whose pane runs a real client so the
 popup's binding can be pressed and the popup read back with `capture-pane`),
-with temporary state and runtime dirs. They never touch your tmux server.
+with temporary state and runtime dirs, and start every window in the temp
+dir. They never touch your tmux server. Git tests use throwaway repos and
+run git with `GIT_CONFIG_GLOBAL=/dev/null` (no signing, no hooks).
 [`docs/superpowers/notes/r1-parity.md`](docs/superpowers/notes/r1-parity.md)
 maps each check of the retired bash suite to the test that replaced it.
 
 ## Requirements
 
-tmux ≥ 3.3 (developed on 3.7c) and a Rust toolchain to build
-(`rust-toolchain.toml`).
+tmux ≥ 3.3 (developed on 3.7c), git for the badges (developed on 2.50), and a
+Rust toolchain to build (`rust-toolchain.toml`).
 
 ## Licence
 
-MIT
+MIT. The git layer is vendored from
+[stray](https://github.com/tim-codes/stray) (MIT) and borrows ideas from
+[worktrunk](https://github.com/max-sixty/worktrunk) (MIT OR Apache-2.0); see
+[`NOTICE`](NOTICE).

@@ -1,10 +1,13 @@
+pub mod git;
+
 use crate::{
     BUILD_ID,
+    git::badge::GitSection,
     ipc::{Reply, Request, read_msg, write_msg},
     paths::Paths,
     tmux::{
         Tmux,
-        snapshot::{Sections, Snapshot, read_snapshot_async},
+        snapshot::{Sections, Snapshot, git_hash, read_snapshot_async},
         source::{self, SourceEvent, SourceKind},
     },
 };
@@ -59,6 +62,26 @@ impl Model {
         self.seq += 1;
         Offer::Changed(self.seq)
     }
+
+    /// Offers a new git section (by hash): the seq to publish it under, if
+    /// it changed. Before the first tmux read nothing is published; that
+    /// read carries the section.
+    pub fn offer_git(&mut self, git: u64) -> Option<u64> {
+        let s = self.sections.as_mut()?;
+        if s.git == git {
+            return None;
+        }
+        s.git = git;
+        self.seq += 1;
+        Some(self.seq)
+    }
+}
+
+/// The model and the git section the next publish carries, under one lock.
+#[derive(Default)]
+struct Inner {
+    model: Model,
+    git: GitSection,
 }
 
 /// State shared by the daemon's main loop and its connections.
@@ -66,7 +89,7 @@ struct Shared {
     epoch: u64,
     version: String,
     tmux: Tmux,
-    model: Mutex<Model>,
+    model: Mutex<Inner>,
     latest: watch::Sender<Published>,
     restart: Notify,
 }
@@ -75,10 +98,40 @@ impl Shared {
     /// Offers a read that started at `at`; publishes it if it changed
     /// something. The model and the watch are updated under one lock, so
     /// subscribers see seqs in order.
-    fn offer(&self, snap: Snapshot, at: Instant) {
+    fn offer(&self, mut snap: Snapshot, at: Instant) {
         let mut m = self.model.lock().unwrap_or_else(|e| e.into_inner());
-        if let Offer::Changed(seq) = m.offer(snap.sections(), at) {
+        snap.git = m.git.clone();
+        if let Offer::Changed(seq) = m.model.offer(snap.sections(), at) {
             self.latest.send_replace(Some((seq, snap)));
+        }
+    }
+
+    /// Marks every repo in the published git section stale (the git task
+    /// died and is restarting): the badges keep their values, dimmed `~`.
+    fn mark_git_stale(&self, why: &str) {
+        let mut git = {
+            let m = self.model.lock().unwrap_or_else(|e| e.into_inner());
+            m.git.clone()
+        };
+        for st in git.repos.values_mut() {
+            st.stale = true;
+            st.error = Some(why.to_string());
+        }
+        self.offer_git(git);
+    }
+
+    /// Publishes a new git section over the latest tmux read, if it
+    /// changed; tmux reads offered later carry it too.
+    fn offer_git(&self, git: GitSection) {
+        let mut m = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = m.model.offer_git(git_hash(&git));
+        m.git = git;
+        if let Some(seq) = seq {
+            let snap = self.latest.borrow().as_ref().map(|(_, s)| s.clone());
+            if let Some(mut snap) = snap {
+                snap.git = m.git.clone();
+                self.latest.send_replace(Some((seq, snap)));
+            }
         }
     }
 
@@ -127,6 +180,16 @@ pub async fn run_with_version(
     kind: SourceKind,
     version: impl Into<String>,
 ) -> anyhow::Result<()> {
+    run_with(tmux_socket, kind, version, git::Config::default()).await
+}
+
+/// `run_with_version` with the git task's timings given (tests shrink them).
+pub async fn run_with(
+    tmux_socket: PathBuf,
+    kind: SourceKind,
+    version: impl Into<String>,
+    git_cfg: git::Config,
+) -> anyhow::Result<()> {
     let version = version.into();
     let paths = Paths::for_socket(&tmux_socket)?;
     let len = paths.sock.as_os_str().len();
@@ -160,11 +223,14 @@ pub async fn run_with_version(
         epoch: new_epoch(),
         version,
         tmux: Tmux::new(tmux_socket.clone()),
-        model: Mutex::new(Model::default()),
+        model: Mutex::new(Inner::default()),
         latest: watch::channel(None).0,
         restart: Notify::new(),
     });
     let mut events = source::start(kind, Tmux::new(tmux_socket));
+    // git badges: a task of its own, fed by the published snapshots, so no
+    // git work ever sits on the tmux poll's path
+    let git_task = git::spawn(shared.clone(), git_cfg);
     // tmux kills `run-shell -b` jobs on kill-server: on these signals, exit
     // through the normal cleanup below (remove the socket, release the lock).
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -190,6 +256,7 @@ pub async fn run_with_version(
             _ = sigint.recv() => break Ok(()),
         }
     };
+    git_task.abort();
     let _ = std::fs::remove_file(&paths.sock);
     drop(lock);
     result
@@ -262,11 +329,26 @@ async fn send(
 }
 
 #[cfg(test)]
+impl Shared {
+    /// A `Shared` for unit tests (its tmux socket is never used).
+    pub(crate) fn for_test() -> Shared {
+        Shared {
+            epoch: 1,
+            version: "test".into(),
+            tmux: Tmux::new(PathBuf::from("/nonexistent")),
+            model: Mutex::new(Inner::default()),
+            latest: watch::channel(None).0,
+            restart: Notify::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn sections(tmux: u64) -> Sections {
-        Sections { tmux }
+        Sections { tmux, git: 0 }
     }
 
     #[test]
@@ -308,6 +390,44 @@ mod tests {
         assert_eq!(m.offer(sections(2), at(20)), Offer::Changed(2));
         assert_eq!(m.offer(sections(1), at(10)), Offer::Stale);
         assert_eq!(m.offer(sections(2), at(20)), Offer::Unchanged(2));
+    }
+
+    /// A git section publishes under a new seq only when it changed, and
+    /// only once a tmux read has been published (which then carries it).
+    #[test]
+    fn git_offers_bump_the_seq_only_on_change() {
+        let mut m = Model::default();
+        assert_eq!(m.offer_git(7), None, "nothing published yet");
+        assert_eq!(m.offer(sections(1), Instant::now()), Offer::Changed(1));
+        assert_eq!(m.offer_git(0), None, "same as the published one");
+        assert_eq!(m.offer_git(7), Some(2));
+        assert_eq!(m.offer_git(7), None);
+        // a tmux read carrying the same git section is unchanged
+        let s = Sections { tmux: 1, git: 7 };
+        assert_eq!(m.offer(s, Instant::now()), Offer::Unchanged(2));
+    }
+
+    /// A restarting git task leaves the badges, marked stale.
+    #[test]
+    fn mark_git_stale_keeps_values() {
+        use crate::git::badge::RepoStatus;
+        let sh = Shared::for_test();
+        sh.offer(Snapshot::default(), Instant::now());
+        let mut g = GitSection::default();
+        g.repos.insert(
+            "/r".into(),
+            RepoStatus {
+                branch: "main".into(),
+                ..RepoStatus::default()
+            },
+        );
+        sh.offer_git(g);
+        sh.mark_git_stale("git task restarted");
+        let (_, snap) = sh.latest.borrow().clone().unwrap();
+        let st = &snap.git.repos["/r"];
+        assert_eq!(st.branch, "main");
+        assert!(st.stale);
+        assert_eq!(st.badge_text(), "main ~");
     }
 
     /// Change detection sees only the tmux section's content.

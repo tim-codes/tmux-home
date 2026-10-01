@@ -108,6 +108,9 @@ fire inside it; tmux-home receives those keys.
   name), windows in index order. Row: index, name, then either the active
   pane's command + short path + git branch, or — for agent windows — status
   icon + word + run elapsed + agent count. `(wt)` marks a worktree, `✚` dirty.
+  *Implemented (pass 5b):* the git part is a compact badge at the row's end
+  (`main +!? ⇡2 ⇣1 $1 ⚠2 ↻`; symbols in the README and `F1`), computed by
+  the daemon; see the design spec §6.
 - **Panes** hidden by default; `M-→` / `M-←` expand / collapse a window.
   Windows with more than one agent pane show a `×N` count. Sidebar panes
   (`@pane_role=sidebar`) are never listed or counted.
@@ -314,6 +317,11 @@ this section, and §7, §8, §10 and §13 where they conflict.
 - Sidebar panes (`@pane_role=sidebar`) are never the row's pane, never
   previewed, never close-checked and never part of a reopen shape. A job
   stopped with `^z` makes its pane busy.
+- Git badges (pass 5b) come from the daemon's git task (`src/daemon/git.rs`)
+  over a vendored copy of stray's git layer (`src/git/`), published as the
+  snapshot's `git` section: repo root → status, pane cwd → root. Git runs
+  read-only, with a timeout and at most 4 at once; nothing git-related runs
+  on the tmux poll's path.
 
 **Install:** a TPM plugin. `tmux-home.tmux` binds `@home-keys` (default `.`)
 and starts the daemon; without a built binary the key shows a one-line

@@ -263,6 +263,99 @@ defined in the help legend: `$n` stashes, `⚠n` stray branches (unpushed,
 no upstream or gone, not integrated). `↑↓` stay reserved for "vs default
 branch" (later).
 
+**Implementation note (pass 5b, 2026-10-01).** Badges are in; the repos
+view, density cycling and items 9–10 are not. Where the code settled
+details this section leaves open, or departs from it:
+
+- *Layout:* `src/git/` (vendored `model`/`status`/`scan`/`ignore` plus
+  `exec`, `repo`, `refs`, `badge`) and `src/daemon/git.rs` (the task). The
+  snapshot gains `git: { paths: cwd → root, repos: root → RepoStatus }`,
+  hashed as its own section (`Sections.git`), so git never forces a tmux
+  push and a tmux push always carries the latest git section.
+- *Targets:* every window's row pane cwd and every agent pane's cwd (the
+  agent row's badge is the lead agent's repo — its worktree when it runs in
+  one). cwd → root is a walk up for `.git` (no fork), re-checked every 10 s.
+- *Triggers:* cwd change, focus (a client's session's active window), the
+  adaptive interval, **plus a change stamp** not in the spec: once a second
+  the task `stat`s the index, HEAD and its reflog, `packed-refs`,
+  `FETCH_HEAD`, the stash reflog, the operation state files and the
+  worktree registry, and refreshes a repo whose stamp moved. Git commands
+  run in a pane show within ~1 s; plain file edits wait for the interval or
+  a focus change (no fsmonitor).
+- *Publishing:* each stage lands in the task's state as it completes; the
+  task publishes the section when it changed, at most once per second.
+  A timed-out status keeps its values with `stale` (badge `~`); a failure
+  also records `error` (shown on the card). A timeout counts as the
+  status's duration, so a hung repo backs off to `20 × 10 s`.
+- *Item 1:* the scrub removes every inherited `GIT_*` variable except
+  `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`/`GIT_CONFIG_NOSYSTEM` (they pick
+  user config files, not a repo). Review fix: no call runs a command a
+  repo or user config names — `core.fsmonitor=false` always (badges
+  included: a hook script would run, `true` starts a resident daemon),
+  `core.hooksPath=/dev/null`, `protocol.allow=never`,
+  `GIT_NO_LAZY_FETCH=1`, empty `credential.helper` and `diff.external`,
+  `--no-ext-diff --no-textconv` on diffs, and attributes from the empty
+  tree (`--attr-source`, sha1 or sha256) with global/system attributes
+  off. Re-review fix: the primary layer doesn't parse attributes at all —
+  before a repo's calls, one `config -z --get-regexp` (every scope, the
+  same scrubbed env) lists every `filter|diff|merge.<any>.<command
+  key>` and `credential.<url>.helper`, and each is overridden by its exact
+  name (`-c <key>=`, `filter.<x>.required=false`); a key `-c` can't carry
+  (an `=` in it, an unparseable record) fails closed: HEAD-only badge
+  `⊗` (limited), no status or diff checks, logged once. That read also
+  carries item 7's keys, so it replaces the refs stage's config fork (no
+  extra fork) and is part of the memo key. Re-review 3: nothing recurses into
+  submodules (`--ignore-submodules=all` on status/diff/diff-tree, plus
+  `diff.ignoreSubmodules=all`, `status.submoduleSummary=false`,
+  `submodule.recurse=false`, `fetch.recurseSubmodules=false`): the status
+  child in a submodule read the submodule's own config and ran its filter.
+  A submodule now always reads as unchanged. The guard is re-read right
+  before status, both under one permit (`Git::run_fresh`): the residual
+  window for config written between the two is one fork's start-up. Driver names in
+  `info/attributes` are overridden too, as a second layer. So no
+  clean/process filter or textconv runs (trade-off: a stat-dirty LFS or
+  `text=auto` file can read as modified). Each call runs in its own
+  process group, killed as a whole on timeout. Also `color.ui=false`,
+  `log.showSignature=false`, `GIT_TERMINAL_PROMPT=0`. `$TMUX_HOME_GIT`
+  replaces the binary (tests).
+- *Item 4:* the probe is `for-each-ref
+  %(refname)%00%(objectname)%00%(symref)%00%(upstream)%00%(upstream:track)`;
+  its key also covers the config keys item 7 reads (read every refresh),
+  and `worktree list` runs every refresh outside the memo (a lock or a
+  switch inside a linked worktree moves no ref). A branch whose tip is
+  a remote ref's commit has 0 unpushed without a fork. Stashes are the
+  lines of `logs/refs/stash` (no fork; also right after `stash drop
+  stash@{1}`, which leaves `refs/stash` alone).
+- *Item 6:* `⚑` is a branch checked out in two worktrees, or a linked
+  worktree whose directory isn't the branch and doesn't end in
+  `.<branch>`/`-<branch>` (the branch sanitised as worktrunk does: `/`,
+  `\` → `-`) — a stand-in for worktrunk's path template, which tmux-home
+  doesn't know.
+- *Item 7:* one `config -z --get-regexp` fork reads
+  `worktrunk.default-branch`, `init.defaultBranch` and the remotes;
+  `<remote>/HEAD` comes from the probe's `%(symref)`.
+- *Item 8 in badges, not only the scan:* stray (`⚠`) means unpushed > 0,
+  no upstream or a gone one, and not integrated (in a repo with no remote,
+  where every commit is on none, any non-default branch not merged into
+  the default branch); the cheap tiers run only
+  for those candidates, memoised by (branch SHA, target SHA), so they are
+  cheap enough for badges. Targets: the default branch and its upstream.
+- *Badge order* (as the pass brief's example): `branch (wt) +!?✘ ⇡n ⇣n |
+  $n ⚠n ↻⊟⊞⊘⚑ ~`; `|` only once a status has landed, no arrows for a gone
+  upstream.
+- *Measured* (release build, fsmonitor off, 8 repos under `~/dev`,
+  warm cache, after the review fixes): HEAD stage 20–40 µs; `git status`
+  8–15 ms; the refs stage 23–32 ms when nothing changed (3 forks: probe,
+  config, worktree list). The first refs pass is 3–7 forks / 23–125 ms for
+  most repos, and 49–67 forks / 0.6–1.5 s for the two with 20–30
+  stray-candidate branches (one `log` and up to a few integration forks
+  each, memoised afterwards). Steady state per repo: ~35–45 ms of git per
+  refresh, every 10 s.
+- *Generations:* each tracking of a root is a generation; a dropped
+  root's refresh is aborted and late messages from an older generation
+  are ignored. A refresh that panics resets its root (stale); a panicking
+  task marks every badge stale and is restarted by a supervisor.
+
 ## 7. Popup (Rust)
 
 Launched as today (`display-popup -E -B -w 100% -h 100%`, invoking client
