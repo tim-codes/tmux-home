@@ -32,3 +32,68 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+------------------------------------------------------------------------
+stray — https://github.com/tim-codes/stray (v0.3.0)
+Copyright (c) 2026 Tim O'Connell
+MIT License
+
+Vendored (adapted): src/git.rs, src/model.rs, src/scan.rs and
+src/ignore.rs into src/git/status.rs, src/git/model.rs, src/git/scan.rs and
+src/git/ignore.rs, each with a header naming its origin and its changes
+(async over src/git/exec.rs, rayon replaced by capped tokio tasks,
+`--untracked-files=normal`, one `log` fork per branch for unpushed
+commits, the extra `worktree list` attributes). Its unit and temp-repo
+tests are carried over into src/git/status.rs and tests/git.rs.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------
+worktrunk — https://github.com/max-sixty/worktrunk (v0.79.0)
+Copyright (c) 2025 Maximilian Roos
+Dual-licensed MIT OR Apache-2.0; used here under the MIT License.
+
+Ideas reimplemented, no function copied verbatim: the GIT_* path
+variable scrub and read-only invocation (src/shell_exec.rs) in
+src/git/exec.rs; `status --untracked-files=normal`
+(git/repository/working_tree.rs); operation-in-progress detection from
+git's state files (working_tree.rs::operation_in_progress) in
+src/git/repo.rs; the refs snapshot memo (ref_snapshot.rs, sha_cache.rs),
+read-only default-branch detection (git/repository/config.rs::
+default_branch) and the cheap integration tiers (git/mod.rs::
+check_integration, integration.rs::integration_targets) in
+src/git/refs.rs; the badge symbol vocabulary of `wt list`.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

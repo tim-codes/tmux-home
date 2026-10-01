@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod client;
 pub mod daemon;
+pub mod git;
 pub mod hook;
 pub mod ipc;
 pub mod ops;
