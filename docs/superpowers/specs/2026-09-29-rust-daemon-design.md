@@ -176,6 +176,14 @@ UserPromptSubmit, Stop, StopFailure, Notification, PermissionDenied,
 SessionEnd, SubagentStart, SubagentStop. Not PostToolUse / Task* — kept off
 the tool-call path. Payload on stdin, pane from `$TMUX_PANE`.
 
+> **Amended (pass 5b).** PostToolUse and PostToolUseFailure are handled,
+> only to end a permission (or elicitation) wait: Claude Code fires no hook
+> on the user's answer, and the approved tool finishing is the first sign.
+> They take a fast path (stdin drained unparsed, one `display-message`
+> read, nothing written unless the pane is waiting on a prompt), about
+> 6 ms p50 in release. The wait is ended pane-wide, from any context: the
+> Notification that starts it carries no `agent_id`. Still no Task*.
+
 > **As built (pass 5a).** The trait is `agent::adapter::AgentAdapter`:
 > `kind()`, `events()` and `on_hook(event, payload, prior, now) ->
 > Vec<Change>`, pure; `prior` is the pane state the rules need (subagent

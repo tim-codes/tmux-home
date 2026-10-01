@@ -12,8 +12,27 @@
 //! Precedence: `running > permission > background > waiting > idle`.
 //! Handled: SessionStart, UserPromptSubmit, Stop, StopFailure,
 //! Notification, PermissionDenied, SessionEnd, SubagentStart,
-//! SubagentStop. Not PostToolUse or Task* (daemon spec §5: kept off the
-//! tool-call path); so no activity log and no TaskCompleted attention.
+//! SubagentStop, and (pass 5b) PostToolUse / PostToolUseFailure, only to
+//! end a prompt wait. Not Task* and no activity log (daemon spec §5).
+//!
+//! Ending a permission wait (pass 5b). Claude Code 2.1.284 fires no hook
+//! when the user answers a permission dialog: `PermissionRequest` fires as
+//! the dialog opens, `Notification permission_prompt` 6 s later (a timer
+//! the answer cancels), `PermissionDenied` only for auto mode's
+//! classifier. The first event after an approval is the approved tool's
+//! `PostToolUse` (or `PostToolUseFailure`), as it finishes; `PreToolUse`
+//! only comes with the next call, later still. So those two end the wait,
+//! on a fast path: the pane's state is read in one tmux call (the payload
+//! is drained, never parsed) and nothing more happens unless the pane is
+//! `waiting` on a prompt (`is_prompt_wait`).
+//!
+//! That ending is pane-wide, from any context, `agent_id` or not: the
+//! Notification that started the wait carries no `agent_id` (Claude Code
+//! sends it for the session even when a subagent asked), so a wait a
+//! subagent raised can only be ended by that subagent's own tool use, and
+//! a subagent working after the parent's approval means the parent moved
+//! on too. The cost: a sibling agent finishing a tool while another
+//! agent's dialog is still open ends the wait early.
 //!
 //! Subagents share their parent's `$TMUX_PANE`. A payload from inside a
 //! subagent carries `agent_id` (and only then); SessionStart, SessionEnd
@@ -38,7 +57,12 @@ pub const EVENTS: &[&str] = &[
     "SessionEnd",
     "SubagentStart",
     "SubagentStop",
+    "PostToolUse",
+    "PostToolUseFailure",
 ];
+
+/// The per-tool-call events: fast path, payload unused.
+pub const TOOL_EVENTS: &[&str] = &["PostToolUse", "PostToolUseFailure"];
 
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(Value::as_str).unwrap_or("")
@@ -82,6 +106,15 @@ pub fn is_permission_wait_reason(r: &str) -> bool {
             | "permission_denied"
             | "elicitation_dialog"
             | "elicitation_url_dialog"
+    )
+}
+
+/// Waits on a dialog that a tool call raised and that its completion
+/// ends: a permission prompt or an MCP elicitation.
+pub fn is_prompt_wait(r: &str) -> bool {
+    matches!(
+        r,
+        "permission_prompt" | "elicitation_dialog" | "elicitation_url_dialog"
     )
 }
 
@@ -168,6 +201,10 @@ impl AgentAdapter for Claude {
 
     fn events(&self) -> &'static [&'static str] {
         EVENTS
+    }
+
+    fn payload_unused(&self, event: &str) -> bool {
+        TOOL_EVENTS.contains(&event)
     }
 
     fn on_hook(&self, event: &str, p: &Value, prior: &Prior, now: u64) -> Vec<Change> {
@@ -258,12 +295,23 @@ impl AgentAdapter for Claude {
                 meta(&mut w, p);
                 let reason = s(p, "notification_type");
                 if notification_waits(reason) {
-                    let bg_live = !prior.sidebar_bg_cmd.is_empty() || !prior.home_bg_cmd.is_empty();
+                    // `@home_bg_cmd` is what the last Stop reported, so it
+                    // only stands while that Stop's `background` does:
+                    // once a run (or a wait) has moved the status on, it
+                    // is stale and must not shadow `waiting`
+                    let home_bg = prior.status == "background" && !prior.home_bg_cmd.is_empty();
+                    let bg_live = !prior.sidebar_bg_cmd.is_empty() || home_bg;
                     w.status(notification_status(reason, bg_live));
                     w.set(Key::Attention, "notification");
                     w.set(Key::WaitReason, reason);
+                } else if matches!(reason, "elicitation_response" | "elicitation_complete")
+                    && prior.wait_reason.starts_with("elicitation_")
+                {
+                    // the MCP elicitation was answered
+                    end_prompt_wait(&mut w, prior);
                 }
             }
+            "PostToolUse" | "PostToolUseFailure" => end_prompt_wait(&mut w, prior),
             "PermissionDenied" => {
                 // The model carries on after a denial (auto mode), so the
                 // status stays as it is (the sidebar sets `waiting`); the
@@ -314,6 +362,15 @@ impl AgentAdapter for Claude {
             _ => {}
         }
         w.changes
+    }
+}
+
+/// A pane `waiting` on a prompt goes back to `running`: attention and the
+/// reason cleared, the run's start kept. Anything else: no change.
+fn end_prompt_wait(w: &mut Writes, prior: &Prior) {
+    if prior.status == "waiting" && is_prompt_wait(&prior.wait_reason) {
+        w.status("running"); // clears attention too
+        w.unset(Key::WaitReason);
     }
 }
 
@@ -369,6 +426,9 @@ mod tests {
             subagents: find(Key::Subagents),
             sidebar_bg_cmd: sidebar_bg.into(),
             home_bg_cmd: find(Key::BgCmd),
+            status: find(Key::Status),
+            attention: find(Key::Attention),
+            wait_reason: find(Key::WaitReason),
         };
         apply(start, &Claude.on_hook(event, payload, &prior, NOW))
     }
@@ -676,7 +736,12 @@ mod tests {
         );
         // a background shell the last Stop reported counts too
         let p = json!({"notification_type": "agent_needs_input"});
-        let m = run(&[(Key::BgCmd, "npm run dev")], "", "Notification", &p);
+        let m = run(
+            &[(Key::Status, "background"), (Key::BgCmd, "npm run dev")],
+            "",
+            "Notification",
+            &p,
+        );
         assert_eq!(get(&m, Key::Status), Some("background"));
     }
 
@@ -833,7 +898,15 @@ mod tests {
 
     #[test]
     fn unknown_events_change_nothing() {
-        for e in ["PostToolUse", "TaskCompleted", "TaskCreated", "Bogus", ""] {
+        for e in [
+            "PreToolUse",
+            "PostToolBatch",
+            "PermissionRequest",
+            "TaskCompleted",
+            "TaskCreated",
+            "Bogus",
+            "",
+        ] {
             assert!(
                 Claude
                     .on_hook(e, &fixture!("stop"), &Prior::default(), NOW)
@@ -841,6 +914,165 @@ mod tests {
                 "{e}"
             );
         }
+    }
+
+    /// A permission prompt answered: the approved tool's PostToolUse (or
+    /// PostToolUseFailure) puts the pane back to running, attention and
+    /// reason cleared, the run's start kept.
+    #[test]
+    fn tool_use_ends_a_prompt_wait() {
+        for ev in TOOL_EVENTS {
+            for reason in [
+                "permission_prompt",
+                "elicitation_dialog",
+                "elicitation_url_dialog",
+            ] {
+                let start = [
+                    (Key::Agent, "claude"),
+                    (Key::Status, "waiting"),
+                    (Key::Attention, "notification"),
+                    (Key::WaitReason, reason),
+                    (Key::RunStarted, "123"),
+                    (Key::SessionId, "parent"),
+                ];
+                let m = run(&start, "", ev, &json!({}));
+                assert_eq!(get(&m, Key::Status), Some("running"), "{ev} {reason}");
+                assert_eq!(get(&m, Key::Attention), None);
+                assert_eq!(get(&m, Key::WaitReason), None);
+                assert_eq!(get(&m, Key::RunStarted), Some("123"));
+                assert_eq!(get(&m, Key::SessionId), Some("parent"));
+                let a = derived(&m).unwrap();
+                assert!(!a.needs_you() && a.state.run_started == Some(123));
+            }
+        }
+    }
+
+    /// The fast path's no-ops: not waiting, or waiting on something a tool
+    /// finishing doesn't answer. Nothing is written (no stamp either).
+    #[test]
+    fn tool_use_leaves_everything_else() {
+        let cases: &[&[(Key, &str)]] = &[
+            &[],
+            &[(Key::Status, "running")],
+            &[(Key::Status, "idle")],
+            &[(Key::Status, "background"), (Key::BgCmd, "npm run dev")],
+            &[
+                (Key::Status, "waiting"),
+                (Key::Attention, "notification"),
+                (Key::WaitReason, "agent_needs_input"),
+            ],
+            &[(Key::Status, "error"), (Key::WaitReason, "rate_limit")],
+            // a denial leaves the status running; the record stays
+            &[
+                (Key::Status, "running"),
+                (Key::Attention, "notification"),
+                (Key::WaitReason, "permission_denied:classifier"),
+            ],
+        ];
+        for start in cases {
+            let find = |k| {
+                start
+                    .iter()
+                    .find(|(x, _)| *x == k)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default()
+            };
+            let prior = Prior {
+                status: find(Key::Status),
+                attention: find(Key::Attention),
+                wait_reason: find(Key::WaitReason),
+                home_bg_cmd: find(Key::BgCmd),
+                ..Prior::default()
+            };
+            for ev in TOOL_EVENTS {
+                assert!(
+                    Claude.on_hook(ev, &json!({}), &prior, NOW).is_empty(),
+                    "{ev} {start:?}"
+                );
+            }
+        }
+        assert!(Claude.payload_unused("PostToolUse"));
+        assert!(!Claude.payload_unused("Stop"));
+    }
+
+    /// The wait is the pane's: a subagent's tool use (payload with
+    /// `agent_id`) ends it too, since the Notification that started it
+    /// can't say whose dialog it was, and a subagent's prompt is only
+    /// ever ended by that subagent's own tool use.
+    #[test]
+    fn a_subagents_tool_use_ends_the_panes_wait() {
+        let start = [
+            (Key::Status, "waiting"),
+            (Key::Attention, "notification"),
+            (Key::WaitReason, "permission_prompt"),
+            (Key::RunStarted, "123"),
+            (Key::SessionId, "parent"),
+            (Key::Subagents, "Explore:agent-0001"),
+        ];
+        let p = json!({"agent_id": "agent-0001", "agent_type": "Explore", "session_id": "child"});
+        let m = run(&start, "", "PostToolUse", &p);
+        assert_eq!(get(&m, Key::Status), Some("running"));
+        assert_eq!(get(&m, Key::Attention), None);
+        assert_eq!(get(&m, Key::SessionId), Some("parent"));
+        assert_eq!(get(&m, Key::Subagents), Some("Explore:agent-0001"));
+    }
+
+    /// An answered MCP elicitation's own notification ends its wait; it
+    /// doesn't end a permission wait.
+    #[test]
+    fn elicitation_response_ends_an_elicitation_wait() {
+        for t in ["elicitation_response", "elicitation_complete"] {
+            let p = json!({"notification_type": t, "message": "m"});
+            let start = [
+                (Key::Status, "waiting"),
+                (Key::Attention, "notification"),
+                (Key::WaitReason, "elicitation_dialog"),
+                (Key::RunStarted, "9"),
+            ];
+            let m = run(&start, "", "Notification", &p);
+            assert_eq!(get(&m, Key::Status), Some("running"), "{t}");
+            assert_eq!(get(&m, Key::Attention), None);
+            assert_eq!(get(&m, Key::WaitReason), None);
+            assert_eq!(get(&m, Key::RunStarted), Some("9"));
+            let start = [
+                (Key::Status, "waiting"),
+                (Key::WaitReason, "permission_prompt"),
+            ];
+            let m = run(&start, "", "Notification", &p);
+            assert_eq!(get(&m, Key::Status), Some("waiting"), "{t}");
+        }
+    }
+
+    /// `@home_bg_cmd` from an earlier Stop doesn't shadow `waiting` once
+    /// the status has moved off `background`; while it is `background`
+    /// it still counts.
+    #[test]
+    fn a_stale_bg_cmd_does_not_shadow_waiting() {
+        let p = json!({"notification_type": "agent_needs_input"});
+        for status in ["running", "idle", "waiting", ""] {
+            let m = run(
+                &[(Key::Status, status), (Key::BgCmd, "npm run dev")],
+                "",
+                "Notification",
+                &p,
+            );
+            assert_eq!(get(&m, Key::Status), Some("waiting"), "{status}");
+        }
+        let m = run(
+            &[(Key::Status, "background"), (Key::BgCmd, "npm run dev")],
+            "",
+            "Notification",
+            &p,
+        );
+        assert_eq!(get(&m, Key::Status), Some("background"));
+        // the sidebar's live shell counts whatever the status
+        let m = run(
+            &[(Key::Status, "running")],
+            "npm run dev",
+            "Notification",
+            &p,
+        );
+        assert_eq!(get(&m, Key::Status), Some("background"));
     }
 
     /// running > permission > background > waiting > idle.
@@ -889,6 +1121,8 @@ mod tests {
                 } else {
                     String::new()
                 },
+                status: "waiting".into(),
+                wait_reason: "permission_prompt".into(),
                 ..Prior::default()
             };
             assert!(!Claude.on_hook(e, &p, &prior, NOW).is_empty(), "{e}");

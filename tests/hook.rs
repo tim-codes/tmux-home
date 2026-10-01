@@ -171,6 +171,38 @@ fn a_session_from_start_to_end() {
     assert_eq!(derived(&s, &pane), None);
 }
 
+/// A permission prompt, then the approved tool's PostToolUse (or
+/// PostToolUseFailure, or a subagent's PostToolUse): back to running, no
+/// attention, the run's start kept. On a pane that isn't waiting the
+/// events write nothing at all (not even `@home_updated`).
+#[test]
+fn a_permission_prompt_answered() {
+    for (ev, fx) in [
+        ("PostToolUse", "post_tool_use"),
+        ("PostToolUseFailure", "post_tool_use_failure"),
+        ("PostToolUse", "post_tool_use_subagent"),
+    ] {
+        let (_env, s, pane) = setup();
+        hook(&s, &pane, "SessionStart", "session_start");
+        hook(&s, &pane, "UserPromptSubmit", "user_prompt_submit");
+        let started = opt(&s, &pane, "@home_run_started");
+        hook(&s, &pane, "Notification", "notification_permission");
+        assert!(derived(&s, &pane).unwrap().needs_you());
+        hook(&s, &pane, ev, fx);
+        assert_eq!(opt(&s, &pane, "@home_status"), "running", "{fx}");
+        assert_eq!(opt(&s, &pane, "@home_attention"), "", "{fx}");
+        assert_eq!(opt(&s, &pane, "@home_wait_reason"), "", "{fx}");
+        assert_eq!(opt(&s, &pane, "@home_run_started"), started, "{fx}");
+        let a = derived(&s, &pane).unwrap();
+        assert_eq!(a.state.status, Status::Running);
+        assert!(!a.state.attention && !a.needs_you(), "{fx}");
+        // running now: the next tool's event is a no-op
+        s.tmux(&["set", "-p", "-t", &pane, "@home_updated", "1"]);
+        hook(&s, &pane, ev, fx);
+        assert_eq!(opt(&s, &pane, "@home_updated"), "1", "{fx}: wrote");
+    }
+}
+
 /// Subagents share the parent's pane: their events (carrying `agent_id`)
 /// leave the parent's session alone, and the parent's SessionEnd clears
 /// the pane even with subagents still listed.
@@ -446,23 +478,95 @@ fn timing() {
     let (_env, s, pane) = setup();
     let t = tmux_env(&s);
     let (a, b) = (fixture("user_prompt_submit"), fixture("stop"));
+    let d = time_runs(|i| {
+        let (ev, p) = if i % 2 == 0 {
+            ("UserPromptSubmit", &a)
+        } else {
+            ("Stop", &b)
+        };
+        hook_raw(&["claude", ev], Some(&t), Some(&pane), p)
+    });
+    report("hook", &d);
+    assert_eq!(opt(&s, &pane, "@home_status"), "idle");
+    assert!(d[49] < Duration::from_millis(100), "p50 {:?}", d[49]);
+}
+
+/// The per-tool-call fast path: PostToolUse on a pane that isn't waiting
+/// (one tmux read, nothing written), with a sizeable tool output on
+/// stdin; and the transition (a permission wait set, then ended).
+#[test]
+fn timing_tool_events() {
+    let (_env, s, pane) = setup();
+    let t = tmux_env(&s);
+    hook(&s, &pane, "UserPromptSubmit", "user_prompt_submit");
+    // a 256 KiB tool response: drained, never parsed
+    let big = fixture("post_tool_use").replace(
+        "\"stdout\": \"example\"",
+        &format!("\"stdout\": \"{}\"", "x".repeat(256 << 10)),
+    );
+    let noop = time_runs(|_| hook_raw(&["claude", "PostToolUse"], Some(&t), Some(&pane), &big));
+    report("PostToolUse no-op", &noop);
+    assert_eq!(opt(&s, &pane, "@home_status"), "running");
+    let set_wait = [
+        "set",
+        "-p",
+        "-t",
+        &pane,
+        "@home_status",
+        "waiting",
+        ";",
+        "set",
+        "-p",
+        "-t",
+        &pane,
+        "@home_wait_reason",
+        "permission_prompt",
+        ";",
+        "set",
+        "-p",
+        "-t",
+        &pane,
+        "@home_attention",
+        "notification",
+    ];
+    let small = fixture("post_tool_use");
+    let mut d: Vec<Duration> = (0..100)
+        .map(|_| {
+            s.tmux(&set_wait);
+            let t0 = Instant::now();
+            let out = hook_raw(&["claude", "PostToolUse"], Some(&t), Some(&pane), &small);
+            let el = t0.elapsed();
+            assert_eq!(out.status.code(), Some(0));
+            assert_eq!(opt(&s, &pane, "@home_status"), "running");
+            el
+        })
+        .collect();
+    d.sort();
+    report("PostToolUse transition", &d);
+    assert!(noop[49] < Duration::from_millis(100), "p50 {:?}", noop[49]);
+    assert!(d[49] < Duration::from_millis(100), "p50 {:?}", d[49]);
+}
+
+/// 100 runs of `f`, each asserted exit 0; the sorted wall times.
+fn time_runs(mut f: impl FnMut(usize) -> Output) -> Vec<Duration> {
     let mut d: Vec<Duration> = (0..100)
         .map(|i| {
-            let (ev, p) = if i % 2 == 0 {
-                ("UserPromptSubmit", &a)
-            } else {
-                ("Stop", &b)
-            };
             let t0 = Instant::now();
-            let out = hook_raw(&["claude", ev], Some(&t), Some(&pane), p);
+            let out = f(i);
             let el = t0.elapsed();
             assert_eq!(out.status.code(), Some(0));
             el
         })
         .collect();
     d.sort();
-    let (p50, p95) = (d[49], d[94]);
-    eprintln!("hook timing over 100 runs: p50 {p50:?}, p95 {p95:?}");
-    assert_eq!(opt(&s, &pane, "@home_status"), "idle");
-    assert!(p50 < Duration::from_millis(100), "p50 {p50:?}");
+    d
+}
+
+fn report(what: &str, d: &[Duration]) {
+    eprintln!(
+        "{what} timing over {} runs: p50 {:?}, p95 {:?}",
+        d.len(),
+        d[d.len() / 2 - 1],
+        d[d.len() * 95 / 100 - 1]
+    );
 }
