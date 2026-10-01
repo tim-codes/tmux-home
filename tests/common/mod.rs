@@ -327,9 +327,19 @@ impl Outer {
 
 impl Drop for Outer {
     fn drop(&mut self) {
+        let socket = Command::new("tmux")
+            .args(["-L", &self.name, "display", "-p", "#{socket_path}"])
+            .env_remove("TMUX")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
         let _ = Command::new("tmux")
             .args(["-L", &self.name, "kill-server"])
             .output();
+        // tmux leaves its socket file behind after kill-server.
+        if !socket.is_empty() {
+            let _ = std::fs::remove_file(socket);
+        }
     }
 }
 
