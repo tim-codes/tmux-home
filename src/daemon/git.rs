@@ -180,7 +180,6 @@ async fn run(shared: Arc<Shared>, cfg: Config) {
     let git = Git {
         timeout: cfg.timeout,
         gate: Some(Arc::new(Semaphore::new(cfg.permits))),
-        no_fsmonitor: false,
     };
     let mut t = Task {
         cfg,

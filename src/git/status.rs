@@ -33,7 +33,18 @@ pub async fn file_diff(git: &Git, root: &Path, code: &str, path: &str) -> String
         // Untracked: diff against /dev/null so the whole file shows as added.
         // --no-index exits 1 when the files differ, so read stdout directly.
         return match git
-            .output(root, &["diff", "--no-index", "--", "/dev/null", path])
+            .output(
+                root,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-index",
+                    "--",
+                    "/dev/null",
+                    path,
+                ],
+            )
             .await
         {
             Ok((_, o)) => o,
@@ -43,16 +54,41 @@ pub async fn file_diff(git: &Git, root: &Path, code: &str, path: &str) -> String
 
     // HEAD..worktree covers staged and unstaged changes in one view; fall back
     // for repos with no commits yet.
-    match git.run(root, &["diff", "HEAD", "--", path]).await {
+    match git
+        .run(
+            root,
+            &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", path],
+        )
+        .await
+    {
         Ok(o) if !o.is_empty() => o,
         Ok(_) => git
-            .run(root, &["diff", "--", path])
+            .run(
+                root,
+                &["diff", "--no-ext-diff", "--no-textconv", "--", path],
+            )
             .await
             .unwrap_or_default(),
-        Err(_) => match git.run(root, &["diff", "--cached", "--", path]).await {
+        Err(_) => match git
+            .run(
+                root,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--cached",
+                    "--",
+                    path,
+                ],
+            )
+            .await
+        {
             Ok(o) => o,
             Err(_) => git
-                .run(root, &["diff", "--", path])
+                .run(
+                    root,
+                    &["diff", "--no-ext-diff", "--no-textconv", "--", path],
+                )
                 .await
                 .unwrap_or_else(|e| e.to_string()),
         },

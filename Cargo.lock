@@ -1604,6 +1604,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "nucleo-matcher",
  "ratatui",
  "regex",

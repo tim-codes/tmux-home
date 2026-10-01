@@ -187,7 +187,19 @@ async fn integrated(git: &Git, dir: &std::path::Path, b: &str, t: &str) -> Resul
         return Ok(false); // no common history
     }
     let (st, _) = git
-        .output(dir, &["diff-tree", "--quiet", "-r", mb.trim(), b, "--"])
+        .output(
+            dir,
+            &[
+                "diff-tree",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--quiet",
+                "-r",
+                mb.trim(),
+                b,
+                "--",
+            ],
+        )
         .await?;
     if st.success() {
         return Ok(true);

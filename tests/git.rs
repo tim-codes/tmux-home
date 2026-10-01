@@ -77,10 +77,7 @@ async fn scan_finds_and_collects_repos_and_worktrees() {
     let _b = t.repo("nested/b");
     write(&a, "dirty.txt", "x\n");
     git_at(&a, &["worktree", "add", "-q", "../a-wt", "-b", "wt"]);
-    let git = Git {
-        no_fsmonitor: true,
-        ..Git::with_timeout(tmux_home::git::exec::SCAN_TIMEOUT)
-    };
+    let git = Git::with_timeout(tmux_home::git::exec::SCAN_TIMEOUT);
     let repos = scan::inventory(&git, &t.0, 8).await;
     let names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
     // the worktree is listed under its main repo, not on its own
@@ -475,4 +472,145 @@ async fn stages_fill_the_status_in_order() {
     assert_eq!(st.phase, Phase::Refs);
     assert_eq!(st.default_branch.as_deref(), Some("main"));
     assert!(st.has_remote);
+}
+
+// ---- review fixes: no repo-configured command ever runs ----------------------
+
+/// Stops any fsmonitor daemon a failing test may have left in `dir`.
+struct StopFsmonitor(std::path::PathBuf);
+
+impl Drop for StopFsmonitor {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("git")
+            .args(["-C", self.0.to_str().unwrap(), "fsmonitor--daemon", "stop"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output();
+    }
+}
+
+fn fsmonitor_daemons(dir: &Path) -> usize {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "command="])
+        .output()
+        .unwrap();
+    let _ = dir;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("fsmonitor--daemon"))
+        .count()
+}
+
+#[tokio::test]
+async fn fsmonitor_hooks_and_daemons_never_run() {
+    git_env();
+    let t = TempDir::new("fsmon");
+    let root = t.repo("r");
+    let _stop = StopFsmonitor(root.clone());
+    let marker = t.0.join("fsmonitor-ran");
+    let hook = fake_git(&t.0, &format!("touch '{}'", marker.display()));
+    git_at(&root, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+    write(&root, "README", "edited\n");
+    let st = full(&root).await;
+    assert_eq!(st.modified, 1, "{st:?}");
+    assert!(!marker.exists(), "the fsmonitor hook ran");
+    // the builtin daemon: never started
+    let before = fsmonitor_daemons(&root);
+    git_at(&root, &["config", "core.fsmonitor", "true"]);
+    full(&root).await;
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !root.join(".git/fsmonitor--daemon").exists(),
+        "an fsmonitor daemon started"
+    );
+    assert_eq!(fsmonitor_daemons(&root), before);
+}
+
+#[tokio::test]
+async fn clean_filters_and_textconv_never_run() {
+    git_env();
+    let t = TempDir::new("filter");
+    let root = t.repo("r");
+    write(&root, "data.txt", "one\n");
+    commit_all(&root, "data");
+    let marker = t.0.join("filter-ran");
+    let script = fake_git(&t.0, &format!("touch '{}'; cat", marker.display()));
+    let conv = fake_git(&t.0, &format!("touch '{}'; cat \"$1\"", marker.display()));
+    write(&root, ".gitattributes", "*.txt filter=mark diff=mark\n");
+    commit_all(&root, "attrs");
+    let s = script.to_str().unwrap();
+    git_at(&root, &["config", "filter.mark.clean", s]);
+    git_at(&root, &["config", "filter.mark.process", s]);
+    git_at(
+        &root,
+        &["config", "diff.mark.textconv", conv.to_str().unwrap()],
+    );
+    git_at(&root, &["config", "diff.external", s]);
+    // stat-dirty and content-changed: status must re-read it
+    std::thread::sleep(Duration::from_millis(20));
+    write(&root, "data.txt", "two\n");
+    let _ = std::fs::remove_file(&marker);
+    let st = full(&root).await;
+    assert_eq!(st.modified, 1, "{st:?}");
+    let diff = file_diff(&Git::default(), &root, " M", "data.txt").await;
+    assert!(diff.contains("+two"), "{diff}");
+    assert!(!marker.exists(), "a filter, textconv or external diff ran");
+    // a driver named only in .git/info/attributes
+    write(&root, ".git/info/attributes", "*.txt filter=local\n");
+    git_at(&root, &["config", "filter.local.clean", s]);
+    git_at(&root, &["config", "filter.local.required", "true"]);
+    std::thread::sleep(Duration::from_millis(20));
+    write(&root, "data.txt", "three\n");
+    let st = full(&root).await;
+    assert!(!st.stale, "{st:?}");
+    assert_eq!(st.modified, 1, "{st:?}");
+    assert!(!marker.exists(), "the info/attributes filter ran");
+}
+
+#[tokio::test]
+async fn a_timeout_kills_the_whole_process_group() {
+    git_env();
+    let t = TempDir::new("pgrp");
+    let pid = t.0.join("child-pid");
+    let fake = fake_git(
+        &t.0,
+        &format!("sleep 30 & echo $! > '{}'; wait", pid.display()),
+    );
+    unsafe { std::env::set_var("TMUX_HOME_GIT", &fake) };
+    let r = Git::with_timeout(Duration::from_millis(300))
+        .run(&t.0, &["status"])
+        .await;
+    unsafe { std::env::remove_var("TMUX_HOME_GIT") };
+    assert_eq!(r, Err(GitError::Timeout));
+    let pid = std::fs::read_to_string(&pid).unwrap();
+    wait_until("git's child to be killed too", || {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        stat.trim().is_empty() || stat.trim().starts_with('Z')
+    });
+}
+
+#[tokio::test]
+async fn no_lazy_fetch_and_no_transport() {
+    git_env();
+    let t = TempDir::new("nolazy");
+    let log = t.0.join("env.log");
+    let fake = fake_git(
+        &t.0,
+        &format!("{{ env; echo ARGS \"$@\"; }} > '{}'", log.display()),
+    );
+    unsafe { std::env::set_var("TMUX_HOME_GIT", &fake) };
+    let _ = Git::default().run(&t.0, &["status"]).await;
+    unsafe { std::env::remove_var("TMUX_HOME_GIT") };
+    let seen = std::fs::read_to_string(&log).unwrap();
+    for want in [
+        "GIT_NO_LAZY_FETCH=1",
+        "core.fsmonitor=false",
+        "protocol.allow=never",
+        "core.hooksPath=/dev/null",
+    ] {
+        assert!(seen.contains(want), "{want} missing:\n{seen}");
+    }
 }

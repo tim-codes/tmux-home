@@ -129,7 +129,7 @@ pub fn looks_bare(dir: &Path) -> bool {
 }
 
 /// Scan for repos and collect full status for each, `SCAN_PERMITS` at a
-/// time. `git` should have `no_fsmonitor` set and the scan timeout.
+/// time. `git` should have the scan timeout (fsmonitor is always off).
 pub async fn inventory(git: &Git, root: &Path, max_depth: usize) -> Vec<Repo> {
     let found = {
         let root = root.to_path_buf();
