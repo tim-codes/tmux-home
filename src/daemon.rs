@@ -8,7 +8,12 @@ use crate::{
         source::{self, SourceEvent, SourceKind},
     },
 };
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
+use std::{
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::BufReader,
     net::{UnixListener, UnixStream},
@@ -17,10 +22,23 @@ use tokio::{
 
 type Latest = watch::Receiver<Option<(u64, Snapshot)>>;
 
+/// Backoff after a transient `accept()` error, to avoid a hot loop under a
+/// persistent failure (e.g. the process is out of file descriptors).
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Timeout on reading a connection's initial request, so a client that
+/// connects and never writes doesn't hold a `serve` task forever.
+const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub async fn run(tmux_socket: PathBuf, kind: SourceKind) -> anyhow::Result<()> {
     let paths = Paths::for_socket(&tmux_socket)?;
     let dir = paths.sock.parent().expect("socket has a parent");
-    std::fs::create_dir_all(dir)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    // DirBuilder only applies `mode` to directories it creates; if `dir`
+    // already existed with wider permissions, enforce 0700 explicitly.
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -44,10 +62,13 @@ pub async fn run(tmux_socket: PathBuf, kind: SourceKind) -> anyhow::Result<()> {
                 Some(SourceEvent::Snapshot(s)) => { seq += 1; let _ = tx.send(Some((seq, s))); }
                 Some(SourceEvent::Gone) | None => break Ok(()),
             },
-            conn = listener.accept() => {
-                let (stream, _) = conn?;
-                tokio::spawn(serve(stream, latest.clone(), restart.clone()));
-            }
+            conn = listener.accept() => match conn {
+                Ok((stream, _)) => { tokio::spawn(serve(stream, latest.clone(), restart.clone())); }
+                Err(e) => {
+                    eprintln!("tmux-home: accept error: {e:#}");
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
+            },
             _ = restart.notified() => break Ok(()),
         }
     };
@@ -59,7 +80,9 @@ pub async fn run(tmux_socket: PathBuf, kind: SourceKind) -> anyhow::Result<()> {
 async fn serve(stream: UnixStream, mut latest: Latest, restart: Arc<Notify>) {
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
-    let Ok(Some(req)) = read_msg::<_, Request>(&mut r).await else {
+    let Ok(Ok(Some(req))) =
+        tokio::time::timeout(INITIAL_REQUEST_TIMEOUT, read_msg::<_, Request>(&mut r)).await
+    else {
         return;
     };
     if req.version() != VERSION {

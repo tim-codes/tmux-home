@@ -121,4 +121,5 @@ async fn version_mismatch_restarts() {
         .expect("daemon exits after restart")
         .unwrap()
         .unwrap();
+    assert!(!p.sock.exists());
 }
