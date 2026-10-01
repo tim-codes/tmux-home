@@ -154,10 +154,11 @@ async fn badges_follow_windows_and_git_changes() {
     git_at(&repo, &["commit", "-q", "-m", "notes"]);
     let snap = sub
         .until(Duration::from_secs(3), "the new branch", |x| {
-            status(x, &repo).is_some_and(|g| g.branch == "feat" && !g.dirty())
+            status(x, &repo).is_some_and(|g| g.branch == "feat" && !g.dirty() && g.stray == 1)
         })
         .await;
-    assert_eq!(status(&snap, &repo).unwrap().badge_text(), "feat");
+    // no remote: `feat`, not merged into main, is stray
+    assert_eq!(status(&snap, &repo).unwrap().badge_text(), "feat ⚠1");
 
     // the window goes: so does the repo
     s.tmux(&["kill-window", "-t", "=alpha:app"]);
