@@ -27,6 +27,8 @@ CLOSED=$TMUX_HOME_STATE_DIR/closed
 TMUX_HOME_RUNTIME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tmux-home-test-run.XXXXXX")
 export TMUX_HOME_RUNTIME_DIR
 export TMUX_HOME_TMUX="tmux -L tmux-home-test"
+# this suite tests the bash popup even when the Rust one is built
+export TMUX_HOME_POPUP=bash
 export SHELL=/bin/sh # predictable, fast pane shells
 export LC_ALL=en_US.UTF-8
 
@@ -254,11 +256,10 @@ eq 'layout: small -> hidden' 'change-preview-window(down,50%,border-top,follow,h
 echo '# tmux-home.tmux'
 T set-option -g @home-keys ''
 "$ROOT/tmux-home.tmux"
-check "@home-keys '' binds nothing" bash -c '! tmux -L tmux-home-test list-keys -T prefix | grep -E "prefix +w .*tmux-home"'
+check "@home-keys '' binds nothing" bash -c '! tmux -L tmux-home-test list-keys -T prefix | grep -E "prefix +\\. .*tmux-home"'
 T set-option -gu @home-keys
 "$ROOT/tmux-home.tmux"
-check 'default binds prefix w' bash -c 'tmux -L tmux-home-test list-keys -T prefix | grep -Eq "prefix +w +run-shell -b .*display-popup .*TMUX_HOME_CLIENT=#{q:client_name}"'
-check 'default binds prefix f' bash -c 'tmux -L tmux-home-test list-keys -T prefix | grep -Eq "prefix +f .*tmux-home"'
+check 'default binds prefix .' bash -c 'tmux -L tmux-home-test list-keys -T prefix | grep -Eq "prefix +\\. +run-shell -b .*display-popup .*TMUX_HOME_CLIENT=#{q:client_name}.*bin/tmux-home"'
 
 # --------------------------------------------------------- interactive
 echo '# interactive (client attached inside tmux-home-test-outer)'
@@ -268,8 +269,8 @@ client=$(T list-clients -F '#{client_name}' | head -1)
 check 'client attached to test server' test -n "$client"
 
 open_popup() {
-	keys C-b w
-	wait_for "${1:-popup opens via prefix w}" '^> .*[0-9]+/[0-9]+'
+	keys C-b .
+	wait_for "${1:-popup opens via prefix .}" '^> .*[0-9]+/[0-9]+'
 }
 
 open_popup
