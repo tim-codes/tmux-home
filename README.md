@@ -7,8 +7,10 @@ where to go.
 > **Status: R1.** A Rust popup (ratatui) on top of a per-server daemon:
 > grouped window list, type-first fuzzy filter, preview, `⏎` switch, inline
 > `^r` rename, `M-r` auto-name, `^x` close with an inline confirm, `^t`
-> reopen, `M-↑`/`M-↓` reorder and `M-n` new window. Agent state and the
-> sidebar come in later milestones; see
+> reopen, `M-↑`/`M-↓` reorder and `M-n` new window, plus read-only agent
+> awareness (pass 4: status, NEEDS YOU, `^g`, filter tokens, agent card) from
+> [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s pane
+> options. tmux-home's own hooks and the sidebar come in later milestones; see
 > [`docs/superpowers/specs/2026-09-29-rust-daemon-design.md`](docs/superpowers/specs/2026-09-29-rust-daemon-design.md) §13.
 
 ## Why
@@ -80,11 +82,12 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 
 | Key | Action |
 | --- | --- |
-| type | filter (session, index, name, command, path) |
+| type | filter (session, index, name, command, path, agent kind; agent prompts word by word) and tokens, below |
 | `↑` `↓` `^p` `^n` `^k` `^j` | move (wraps) |
 | `PgUp` `PgDn` | page |
 | `←` `→` `Home` `End` `^a` `^e` `^u` `^w` | edit the filter |
 | `⏎` | switch to the window and close |
+| `^g` | jump to the next window that needs you (cycles through NEEDS YOU) |
 | `Esc` | clear the filter; close when it is already empty |
 | `^r` | rename inline (`⏎` saves; `Esc` or an empty name cancels) |
 | `M-r` | back to the automatic name |
@@ -95,11 +98,36 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | `^o` | toggle the preview |
 | `F1` `^/` | help |
 
+Filter tokens combine with text: `@attn` (needs you), `@agent` (any agent
+window, stale ones included), `@running`, `@waiting`, `@idle`, `@error`
+(either of the statuses given), `s:<session>` (session name prefix, any
+case). For example `@waiting s:main api`.
+
+### Agents
+
+When [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s
+hooks are installed, tmux-home reads the `@pane_*` options they publish
+(read-only: it never writes or clears them). An agent window's row shows
+status icon **and** word, the current run's elapsed time and the agent kind
+(`● running  12m  claude ×2` for two agents), in place of command and path.
+Windows whose agent is waiting, errored or has a pending notification are
+also pinned in a **NEEDS YOU** group above the sessions, with the reason;
+the header carries a tally (`agents: 1 waiting · 2 running`). The preview of
+an agent window starts with an agent card: status, run time, wait reason,
+subagents, background command, worktree, permission mode and the prompt (or
+last reply), then the pane's last lines.
+
+An agent whose pane is back at its shell prompt (the agent crashed and left
+its options behind) is **stale**: dimmed with `(ended?)`, never pinned or
+counted. Without the sidebar, windows are listed as before, with no agent
+column.
+
 `^x` closes at once when every pane in the window is idle at a shell prompt
 (bash, zsh, fish, sh, …; sidebar panes don't count). Otherwise it asks
 inline, for example `close "api"? running: nvim, node (y/N)`, and only `y`
 closes; any other key, `⏎` or `Esc` cancels and keeps the filter. A job
-stopped with `^z` counts as running (`vim (stopped)`). A job running in the
+stopped with `^z` counts as running (`vim (stopped)`). A running or waiting
+agent says so: `close "api"? agent still working — running: claude (y/N)`. A job running in the
 background (`make &`) does not: the pane sits at its prompt, so `^x` closes it
 without asking and the job dies with the window. (Shells and prompt helpers
 keep their own background processes on the terminal, so tmux-home can't tell
