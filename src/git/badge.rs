@@ -217,7 +217,8 @@ pub const LEGEND: &str = "  git badge       branch (wt) +!?✘ ⇡n⇣n | $n ⚠
                   ? untracked   ✘ conflicts   ⇡n ⇣n ahead/behind upstream
                   | in sync with upstream   $n stashes
                   ⚠n stray branches: unpushed, no upstream (or gone),
-                     not merged into the default branch
+                     not merged into the default branch (no remote:
+                     any branch not merged into the default branch)
                   ↻ merge/rebase/cherry-pick/revert/bisect in progress
                   ⊟ prunable  ⊞ locked  ⊘ detached  ⚑ branch/path mismatch
                   ~ stale: the last check timed out or failed";

@@ -65,6 +65,8 @@ pub struct BranchInfo {
 impl BranchInfo {
     /// A stray branch (`⚠`): commits that are on no remote, no upstream (or
     /// a gone one) to push them to, and not merged into the default branch.
+    /// In a repo with no remote every commit is on none: there it is any
+    /// non-default branch not merged into the default branch.
     pub fn stray(&self) -> bool {
         self.unpushed > 0 && (self.upstream.is_none() || self.gone) && !self.integrated
     }
@@ -326,15 +328,22 @@ impl RefsMemo {
                     .to_string()
             });
             // commits on no remote: none when the tip is itself a remote
-            // ref's commit; else from the memo, else one fork
+            // ref's commit; else from the memo, else one fork. With no
+            // remote at all every commit is on none (stray's count), and
+            // only non-default branches are candidates
             let mut n = 0;
-            if has_remote && !remote_shas.contains(r.sha.as_str()) {
+            let candidate = if has_remote {
+                !remote_shas.contains(r.sha.as_str())
+            } else {
+                default.as_deref() != Some(name.as_str())
+            };
+            if candidate {
                 let k = (r.sha.clone(), remotes_key);
                 n = match self.unpushed.get(&k) {
                     Some(n) => *n,
                     None => {
                         forks += 1;
-                        match unpushed(git, dir, &r.name, true).await {
+                        match unpushed(git, dir, &r.name, has_remote).await {
                             Ok((n, _, _)) => n,
                             Err(GitError::Timeout) => return Err(GitError::Timeout),
                             Err(_) => 0,

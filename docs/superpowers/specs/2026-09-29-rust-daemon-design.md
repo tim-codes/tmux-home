@@ -306,7 +306,9 @@ details this section leaves open, or departs from it:
   `worktrunk.default-branch`, `init.defaultBranch` and the remotes;
   `<remote>/HEAD` comes from the probe's `%(symref)`.
 - *Item 8 in badges, not only the scan:* stray (`⚠`) means unpushed > 0,
-  no upstream or a gone one, and not integrated; the cheap tiers run only
+  no upstream or a gone one, and not integrated (in a repo with no remote,
+  where every commit is on none, any non-default branch not merged into
+  the default branch); the cheap tiers run only
   for those candidates, memoised by (branch SHA, target SHA), so they are
   cheap enough for badges. Targets: the default branch and its upstream.
 - *Badge order* (as the pass brief's example): `branch (wt) +!?✘ ⇡n ⇣n |

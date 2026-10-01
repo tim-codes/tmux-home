@@ -144,7 +144,7 @@ branches by name, worktree (linked, main, locked…) and the default branch.
 | `⇡n` `⇣n` | commits ahead of / behind the upstream |
 | `\|` | in sync with the upstream |
 | `$n` | stashes |
-| `⚠n` | stray branches: commits on no remote, no upstream (or a gone one), not merged into the default branch |
+| `⚠n` | stray branches: commits on no remote, no upstream (or a gone one), not merged into the default branch; in a repo with no remote, every branch other than the default one that isn't merged into it |
 | `↻` | merge, rebase, cherry-pick, revert or bisect in progress |
 | `⊟` `⊞` `⊘` `⚑` | worktree prunable, locked, detached, branch/path mismatch |
 | `~` | stale: the last check timed out or failed (the values are older) |

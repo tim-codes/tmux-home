@@ -315,7 +315,8 @@ async fn merge_conflict_shows_conflicts_and_the_operation() {
     let st = full(&root).await;
     assert_eq!(st.operation, Some(Operation::Merge));
     assert_eq!(st.conflicts, 1);
-    assert_eq!(st.badge_text(), "main ✘ ↻");
+    // `other` is unmerged in a repo with no remote: stray too
+    assert_eq!(st.badge_text(), "main ✘ ⚠1 ↻");
 }
 
 #[tokio::test]
@@ -666,4 +667,32 @@ async fn worktree_and_config_changes_show_without_a_ref_moving() {
     git_at(&root, &["config", "worktrunk.default-branch", "other"]);
     again(&mut memo, &mut st).await;
     assert_eq!(st.default_branch.as_deref(), Some("other"));
+}
+
+// ---- review fix: ⚠ in a repo with no remote ----------------------------------
+
+/// No remote: every commit is "unpushed to nowhere" (as stray counts
+/// them); `⚠` counts the non-default branches not merged into the default
+/// branch.
+#[tokio::test]
+async fn stray_without_a_remote_is_unmerged_non_default_branches() {
+    git_env();
+    let t = TempDir::new("noremote");
+    let root = t.repo("r");
+    git_at(&root, &["branch", "same"]); // at main: integrated
+    git_at(&root, &["switch", "-q", "-c", "merged"]);
+    write(&root, "m", "m");
+    commit_all(&root, "m");
+    git_at(&root, &["switch", "-q", "main"]);
+    git_at(&root, &["merge", "-q", "--ff-only", "merged"]);
+    git_at(&root, &["switch", "-q", "-c", "spike"]);
+    write(&root, "s", "s");
+    commit_all(&root, "s1");
+    write(&root, "s", "s2");
+    commit_all(&root, "s2");
+    git_at(&root, &["switch", "-q", "main"]);
+    let st = full(&root).await;
+    assert!(!st.has_remote);
+    assert_eq!(st.stray_names, ["spike"], "{st:?}");
+    assert_eq!(st.badge_text(), "main ⚠1");
 }
