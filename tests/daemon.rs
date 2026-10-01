@@ -123,3 +123,45 @@ async fn version_mismatch_restarts() {
         .unwrap();
     assert!(!p.sock.exists());
 }
+
+/// A server with no sessions yet (TPM runs tmux-home.tmux from tmux.conf,
+/// before the first session exists) must not make the daemon exit: it serves
+/// an empty snapshot and pushes the first session when it appears.
+#[tokio::test]
+async fn serves_server_without_sessions() {
+    let _env = common::TestEnv::new();
+    let s = common::TestServer::start_empty();
+    let p = Paths::for_socket(&s.socket).unwrap();
+    let d = tokio::spawn(tmux_home::daemon::run(s.socket.clone(), SourceKind::Control));
+    let (r, mut w) = connect(&p).await.into_split();
+    let mut r = BufReader::new(r);
+    write_msg(
+        &mut w,
+        &Request::Subscribe {
+            v: v(),
+            client: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let Some(Reply::Snapshot { data, .. }) = read_msg(&mut r).await.unwrap() else {
+        panic!("no initial snapshot")
+    };
+    assert!(data.sessions.is_empty());
+    s.tmux(&["new-session", "-d", "-s", "first", "/bin/sh"]);
+    let got = tokio::time::timeout(Duration::from_secs(2), read_msg::<_, Reply>(&mut r))
+        .await
+        .expect("first session not pushed")
+        .unwrap()
+        .unwrap();
+    let Reply::Snapshot { data, .. } = got else {
+        panic!()
+    };
+    assert!(data.sessions.iter().any(|x| x.name == "first"));
+    s.tmux(&["kill-server"]);
+    tokio::time::timeout(Duration::from_secs(5), d)
+        .await
+        .expect("daemon should exit with its server")
+        .unwrap()
+        .unwrap();
+}

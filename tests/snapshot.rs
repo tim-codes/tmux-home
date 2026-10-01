@@ -85,3 +85,10 @@ fn unparseable_record_is_skipped() {
     assert_eq!(snap.panes.len(), 1);
     assert!(snap.clients.is_empty());
 }
+
+#[tokio::test]
+async fn server_without_sessions_is_an_empty_snapshot() {
+    let s = common::TestServer::start_empty();
+    let (snap, _) = read_snapshot(&Tmux::new(s.socket.clone())).await.unwrap();
+    assert_eq!(snap, tmux_home::tmux::snapshot::Snapshot::default());
+}

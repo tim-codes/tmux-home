@@ -92,6 +92,16 @@ impl TestServer {
         TestServer { name, socket }
     }
 
+    /// A throwaway server that stays up with zero sessions (`exit-empty off`,
+    /// then its only session killed) — the state a server is in while
+    /// tmux.conf, and so TPM's run of tmux-home.tmux, executes.
+    pub fn start_empty() -> TestServer {
+        let s = TestServer::start();
+        s.tmux(&["set-option", "-g", "exit-empty", "off"]);
+        s.tmux(&["kill-session", "-t", "alpha"]);
+        s
+    }
+
     /// Polls `list-panes -a` until two consecutive reads of
     /// `pane_current_command`, `pane_current_path`, `pane_title` and
     /// `window_name` all agree, to ride out the brief churn a freshly

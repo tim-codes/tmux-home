@@ -136,8 +136,18 @@ async fn assert_sees_new_window(
     session: &str,
     name: &str,
 ) {
+    assert_sees_new_window_within(s, rx, session, name, Duration::from_millis(300)).await;
+}
+
+async fn assert_sees_new_window_within(
+    s: &common::TestServer,
+    rx: &mut tokio::sync::mpsc::Receiver<SourceEvent>,
+    session: &str,
+    name: &str,
+    within: Duration,
+) {
     s.tmux(&["new-window", "-d", "-t", session, "-n", name]);
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let deadline = tokio::time::Instant::now() + within;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(SourceEvent::Snapshot(snap))) => {
@@ -146,7 +156,7 @@ async fn assert_sees_new_window(
                 }
             }
             Ok(Some(SourceEvent::Gone)) | Ok(None) => panic!("source Gone"),
-            Err(_) => panic!("window {name} in {session} not seen within 300 ms"),
+            Err(_) => panic!("window {name} in {session} not seen within {within:?}"),
         }
     }
 }
@@ -182,4 +192,57 @@ async fn control_survives_being_detached() {
     let _ = last_snap_no_gone(&mut rx, Duration::from_secs(1)).await;
     assert_eq!(control_client_session(&s), "alpha");
     assert_sees_new_window(&s, &mut rx, "alpha", "after-detach").await;
+}
+
+/// A server with no sessions (tmux.conf time, or after the last session is
+/// killed under `exit-empty off`) is alive: the source reports an empty
+/// snapshot, then pushes the first session once it exists.
+async fn check_empty_server(kind: SourceKind, max_latency: Duration) {
+    let s = common::TestServer::start_empty();
+    let mut rx = start(kind, Tmux::new(s.socket.clone()));
+    let Some(SourceEvent::Snapshot(first)) = next_snap(&mut rx, Duration::from_secs(2)).await
+    else {
+        panic!("no initial snapshot from a server without sessions")
+    };
+    assert!(first.sessions.is_empty() && first.panes.is_empty());
+    s.tmux(&["new-session", "-d", "-s", "late", "/bin/sh"]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SourceEvent::Snapshot(snap)))
+                if snap.sessions.iter().any(|x| x.name == "late") =>
+            {
+                break;
+            }
+            Ok(Some(SourceEvent::Snapshot(_))) => continue,
+            Ok(Some(SourceEvent::Gone)) | Ok(None) => panic!("source Gone on a live server"),
+            Err(_) => panic!("new session not pushed"),
+        }
+    }
+    // and the source keeps tracking afterwards (control: now attached)
+    assert_sees_new_window_within(&s, &mut rx, "late", "after-empty", max_latency).await;
+    // last session gone again, server still up: back to an empty snapshot
+    s.tmux(&["kill-session", "-t", "late"]);
+    let snap = last_snap_no_gone(&mut rx, Duration::from_secs(1))
+        .await
+        .expect("no snapshot after the last session was killed");
+    assert!(snap.sessions.is_empty());
+    s.tmux(&["kill-server"]);
+    loop {
+        match next_snap(&mut rx, Duration::from_secs(3)).await {
+            Some(SourceEvent::Gone) => break,
+            Some(SourceEvent::Snapshot(_)) => continue,
+            None => panic!("source did not report Gone"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn poll_source_empty_server() {
+    check_empty_server(SourceKind::Poll, Duration::from_millis(1200)).await;
+}
+
+#[tokio::test]
+async fn control_source_empty_server() {
+    check_empty_server(SourceKind::Control, Duration::from_millis(300)).await;
 }

@@ -1,6 +1,6 @@
 use super::{
     Tmux,
-    snapshot::{Snapshot, read_snapshot},
+    snapshot::{Snapshot, read_snapshot, session_count},
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -65,15 +65,22 @@ const REATTACH_AFTER: Duration = Duration::from_millis(100);
 
 /// Control-mode source. The control client can end while the server lives on
 /// (`detach-client`, `attach -d` from another client on the same session), so
-/// it is re-attached until the server itself is gone.
+/// it is re-attached until the server itself is gone. A server with no
+/// sessions has nothing to attach to; it is polled until a session appears.
 async fn control(tmux: Tmux, tx: mpsc::Sender<SourceEvent>) -> anyhow::Result<()> {
     let mut last = None;
     loop {
-        last = Some(control_attached(&tmux, &tx, last).await?);
-        if tmux.run(&["has-session"]).await.is_err() {
-            return Ok(()); // server gone (or has no sessions left to attach to)
+        match session_count(&tmux).await {
+            Err(_) => return Ok(()), // server gone
+            Ok(0) => {
+                last = Some(refresh(&tmux, &tx, last).await?);
+                tokio::time::sleep(POLL_EVERY).await;
+            }
+            Ok(_) => {
+                last = Some(control_attached(&tmux, &tx, last).await?);
+                tokio::time::sleep(REATTACH_AFTER).await;
+            }
         }
-        tokio::time::sleep(REATTACH_AFTER).await;
     }
 }
 
@@ -103,9 +110,12 @@ async fn control_attached(
         .spawn()?;
     let mut stdin = child.stdin.take().expect("piped");
     let mut lines = BufReader::new(child.stdout.take().expect("piped")).lines();
-    stdin
+    // A failed write means the client already exited (e.g. the last session
+    // went away between `session_count` and the attach); the EOF below then
+    // ends this attachment normally, so it is not an error here.
+    let _ = stdin
         .write_all(b"refresh-client -B 'th-panes:%*:#{pane_current_command}#{pane_current_path}#{pane_title}'\n")
-        .await?;
+        .await;
 
     let mut last = refresh(tmux, tx, last).await?;
     let mut dirty = false;

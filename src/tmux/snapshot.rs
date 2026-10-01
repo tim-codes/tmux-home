@@ -65,13 +65,39 @@ const CLIENT_FMT: &str = "#{client_name}\x1f#{client_tty}\x1f#{session_id}\x1f#{
 /// `list-clients` output includes tmux-home's own control-mode client, which
 /// `parse` filters out. Hashing the raw output would therefore report changes
 /// that no user-visible state actually underwent.
+///
+/// A server with no sessions is alive and yields an *empty* snapshot: tmux
+/// answers `list-panes -a`/`list-clients` there with "no current target",
+/// and that is exactly the state the server is in while tmux.conf (and so
+/// TPM's run of tmux-home.tmux) executes. An error is returned only when the
+/// server itself can't be reached (`list-sessions` fails too).
 pub async fn read_snapshot(t: &Tmux) -> anyhow::Result<(Snapshot, u64)> {
-    let panes = t.run(&["list-panes", "-a", "-F", PANE_FMT]).await?;
-    let clients = t.run(&["list-clients", "-F", CLIENT_FMT]).await?;
-    let snapshot = parse(&panes, &clients);
+    let snapshot = match read_parsed(t).await {
+        Ok(s) => s,
+        Err(e) => match session_count(t).await {
+            Err(_) => return Err(e), // server unreachable
+            Ok(0) => Snapshot::default(),
+            // a session appeared between the two reads: read once more
+            Ok(_) => read_parsed(t).await?,
+        },
+    };
     let mut h = std::collections::hash_map::DefaultHasher::new();
     serde_json::to_vec(&snapshot)?.hash(&mut h);
     Ok((snapshot, h.finish()))
+}
+
+async fn read_parsed(t: &Tmux) -> anyhow::Result<Snapshot> {
+    let panes = t.run(&["list-panes", "-a", "-F", PANE_FMT]).await?;
+    let clients = t.run(&["list-clients", "-F", CLIENT_FMT]).await?;
+    Ok(parse(&panes, &clients))
+}
+
+/// Number of sessions on the server; an error means the server is
+/// unreachable (unlike `has-session`/`list-panes`, `list-sessions` succeeds
+/// on a live server with no sessions).
+pub async fn session_count(t: &Tmux) -> anyhow::Result<usize> {
+    let out = t.run(&["list-sessions", "-F", "#{session_id}"]).await?;
+    Ok(out.lines().filter(|l| !l.is_empty()).count())
 }
 
 /// Splits tmux output into records (see `REC_END`). A last record that

@@ -129,3 +129,22 @@ async fn restart_reply_does_not_race_old_daemon_exit() {
     assert!(ok, "replacement daemon never came up after Restart");
     s.tmux(&["kill-server"]);
 }
+
+#[test]
+fn query_cli_on_server_without_sessions() {
+    let _env = common::TestEnv::new();
+    let s = common::TestServer::start_empty();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tmux-home"))
+        .args(["query", "--socket"])
+        .arg(&s.socket)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["sessions"], serde_json::json!([]));
+    s.tmux(&["kill-server"]);
+}
