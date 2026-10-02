@@ -127,10 +127,25 @@ fn rebuild_at_the_same_version_replaces_the_daemon() {
     s.tmux(&["kill-server"]);
 }
 
-/// Runs `tmux-home status` (a debug build) with `respawn` as
+/// Runs `tmux-home status` (a dev build) with `respawn` as
 /// TMUX_HOME_STATUS_RESPAWN (unset if `None`).
+///
+/// It runs from a copy outside `target/`: `status` decides from its own
+/// path whether it is the plugin's build (`…/target/release/tmux-home`),
+/// and under `cargo test --release` the test binary is exactly that.
 fn status(s: &common::TestServer, respawn: Option<&str>) -> String {
-    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_tmux-home"));
+    use std::sync::OnceLock;
+    static DEV: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let dev = DEV.get_or_init(|| {
+        let d = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dev-build");
+        std::fs::create_dir_all(&d).unwrap();
+        let tmp = d.join(format!("tmux-home.{}", std::process::id()));
+        std::fs::copy(env!("CARGO_BIN_EXE_tmux-home"), &tmp).unwrap();
+        let bin = d.join("tmux-home");
+        std::fs::rename(&tmp, &bin).unwrap();
+        bin
+    });
+    let mut c = std::process::Command::new(dev);
     c.args(["status", "--socket"]).arg(&s.socket);
     match respawn {
         Some(v) => c.env("TMUX_HOME_STATUS_RESPAWN", v),

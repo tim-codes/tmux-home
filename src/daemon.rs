@@ -1,4 +1,5 @@
 pub mod git;
+pub mod sidebars;
 
 use crate::{
     BUILD_ID,
@@ -158,6 +159,10 @@ fn new_epoch() -> u64 {
 /// persistent failure (e.g. the process is out of file descriptors).
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
+/// How long a starting daemon waits for the lock before deciding another
+/// daemon serves the server.
+const LOCK_WAIT: Duration = Duration::from_millis(1000);
+
 /// Timeout on reading a connection's initial request, so a client that
 /// connects and never writes doesn't hold a `serve` task forever.
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -213,8 +218,16 @@ pub async fn run_with(
         .truncate(false)
         .write(true)
         .open(&paths.lock)?;
-    if lock.try_lock().is_err() {
-        return Ok(()); // another daemon serves this server
+    // Another daemon serves this server: exit. A daemon spawned as an old
+    // build exits (after its `Restart` reply) finds the lock held for the
+    // moment between that one removing its socket and releasing the lock,
+    // so it retries briefly before giving up.
+    let deadline = Instant::now() + LOCK_WAIT;
+    while lock.try_lock().is_err() {
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let _ = std::fs::remove_file(&paths.sock);
     let listener = UnixListener::bind(&paths.sock)?;
@@ -231,6 +244,8 @@ pub async fn run_with(
     // git badges: a task of its own, fed by the published snapshots, so no
     // git work ever sits on the tmux poll's path
     let git_task = git::spawn(shared.clone(), git_cfg);
+    // sidebars: auto-create, cleanup and dedupe, from the same snapshots
+    let sidebar_task = sidebars::spawn(shared.clone());
     // tmux kills `run-shell -b` jobs on kill-server: on these signals, exit
     // through the normal cleanup below (remove the socket, release the lock).
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -257,6 +272,7 @@ pub async fn run_with(
         }
     };
     git_task.abort();
+    sidebar_task.abort();
     let _ = std::fs::remove_file(&paths.sock);
     drop(lock);
     result

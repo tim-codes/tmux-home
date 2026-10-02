@@ -436,6 +436,7 @@ pub(crate) mod tests {
             current_path: "/".into(),
             title: String::new(),
             role: String::new(),
+            home_role: String::new(),
             agent_opts: opts
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

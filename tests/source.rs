@@ -269,3 +269,29 @@ async fn poll_source_empty_server() {
 async fn control_source_empty_server() {
     check_empty_server(SourceKind::Control, Duration::from_millis(300)).await;
 }
+
+/// tmux-continuum skips its auto-restore when it sees another process whose
+/// command line starts with `tmux` (`ps -o "command pid" | grep "^tmux"`):
+/// the tmux commands tmux-home runs show their absolute path instead.
+#[test]
+fn tmux_commands_do_not_look_like_another_tmux_to_continuum() {
+    let s = common::TestServer::start();
+    let t = Tmux::new(s.socket.clone());
+    assert!(t.socket.is_absolute());
+    assert!(tmux_home::tmux::tmux_bin().is_absolute());
+    let chan = format!("th-wait-{}", common::rand_suffix());
+    // the command `Tmux` runs, kept running
+    let mut c = t.base();
+    c.args(["wait-for", &chan]);
+    let mut child = c.spawn().unwrap();
+    let ps = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &child.id().to_string()])
+        .output()
+        .unwrap();
+    let line = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+    s.tmux(&["wait-for", "-S", &chan]);
+    child.wait().unwrap();
+    assert!(line.starts_with('/'), "{line}");
+    assert!(!line.starts_with("tmux"), "continuum would count {line:?}");
+    assert!(line.contains("/tmux -u -S "), "{line}");
+}

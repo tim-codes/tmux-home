@@ -62,8 +62,15 @@ pub fn neutral_cwd() -> PathBuf {
 impl TestServer {
     /// A throwaway server with one detached 200x50 session "alpha" running /bin/sh.
     pub fn start() -> TestServer {
+        TestServer::start_with(&[])
+    }
+
+    /// `start`, with these environment variables set for the server (and
+    /// so for its panes and run-shell jobs), e.g. an isolated `HOME`.
+    pub fn start_with(env: &[(&str, &std::ffi::OsStr)]) -> TestServer {
         let name = format!("th-test-{}-{}", std::process::id(), rand_suffix());
         let out = Command::new("tmux")
+            .envs(env.iter().map(|(k, v)| (*k, *v)))
             .args([
                 "-L",
                 &name,
@@ -358,6 +365,7 @@ pub fn install_binding(s: &TestServer) {
     let out = Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tmux-home.tmux"))
         .env("TMUX_HOME_TMUX", format!("tmux -S {}", s.socket.display()))
         .env("TMUX_HOME_BIN", env!("CARGO_BIN_EXE_tmux-home"))
+        .env("TMUX_HOME_DAEMON_DELAY", "0")
         .env_remove("TMUX")
         .output()
         .unwrap();

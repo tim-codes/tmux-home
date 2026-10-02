@@ -2,13 +2,19 @@
 # TPM entry point: binds the tmux-home popup and starts the daemon.
 #
 #   set -g @home-keys '.'     # prefix keys to bind (default "."; '' = none)
+#   set -g @home-sidebar-keys 'e E'  # prefix keys: toggle the sidebar in the
+#                             # window, then in every window of the session
+#                             # (default "e E"; '' = none; '-' skips one)
 #
 # The popup and daemon are the Rust binary, target/release/tmux-home. If it
 # isn't built yet, the key says so and loading the plugin starts
 # `cargo build --release` in the background (one at a time: a reload while
 # it runs starts nothing; output in target/build.log).
 #
-# Environment (tests): TMUX_HOME_TMUX  tmux command, word-split (default: tmux)
+# Environment (tests): TMUX_HOME_TMUX  tmux command, word-split (default:
+#                                      the server's own tmux binary)
+#                      TMUX_HOME_DAEMON_DELAY  seconds before the daemon
+#                                      starts (default 10)
 #                      TMUX_HOME_BIN   the Rust binary (default:
 #                                      target/release/tmux-home); when set, a
 #                                      missing one is not built
@@ -18,7 +24,33 @@ set -euo pipefail
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_BIN="${TMUX_HOME_BIN:-$CURRENT_DIR/target/release/tmux-home}"
 
+# tmux by absolute path, never PATH alone: at login (launchd) PATH may lack
+# Homebrew's bin, and a bare `tmux` then binds nothing and starts no daemon.
+# The running server's own binary first ($TMUX's 2nd field is its pid; tmux
+# sets $TMUX for run-shell children), then the usual places, then PATH.
+resolve_tmux() {
+	local pid exe c
+	pid=${TMUX:-}
+	pid=${pid#*,}
+	pid=${pid%%,*}
+	if [[ $pid =~ ^[0-9]+$ ]]; then
+		exe=$(readlink "/proc/$pid/exe" 2>/dev/null || /bin/ps -o comm= -p "$pid" 2>/dev/null || true)
+		exe=${exe## }
+		if [[ $exe == /* && ${exe##*/} == tmux && -x $exe ]]; then
+			printf '%s' "$exe"
+			return
+		fi
+	fi
+	for c in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux; do
+		if [[ -x $c ]]; then
+			printf '%s' "$c"
+			return
+		fi
+	done
+	command -v tmux || printf tmux
+}
 read -r -a TMUX_CMD <<<"${TMUX_HOME_TMUX:-tmux}"
+[[ ${TMUX_CMD[0]} == /* ]] || TMUX_CMD[0]=$(resolve_tmux)
 t() { "${TMUX_CMD[@]}" "$@"; }
 
 # Unset → default; explicitly set to '' → bind nothing.
@@ -61,7 +93,6 @@ fi
 # display-popup does not expand formats in -e, so the binding goes through
 # run-shell, which expands #{client_name} for the client that pressed the key.
 # The popup is pinned to that client (-c) and told its name.
-[[ ${TMUX_CMD[0]} == */* ]] || TMUX_CMD[0]=$(command -v "${TMUX_CMD[0]}")
 tmux_q=
 for w in "${TMUX_CMD[@]}"; do tmux_q+="$(q "$w") "; done
 popup="${tmux_q}display-popup -c #{q:client_name} -E -B -w 100% -h 100%"
@@ -75,10 +106,40 @@ for key in $keys; do
 	t bind-key "$key" run-shell -b "$cmd"
 done
 
+# Sidebar toggles: the first key toggles the window's sidebar, the second
+# every window of the session. The window is named by session and window
+# ID, as run-shell expands them for the client that pressed the key.
+if [[ -n $(t show-options -gq @home-sidebar-keys) ]]; then
+	sidebar_keys=$(t show-options -gqv @home-sidebar-keys)
+else
+	sidebar_keys='e E'
+fi
+read -r -a sk <<<"$sidebar_keys"
+toggle="$rust_q sidebar-toggle --socket #{q:socket_path} --window #{q:session_id}:#{q:window_id}"
+sidebar_cmd() {
+	printf '%s' "if [ -x $rust_q ]; then $toggle$1; else ${tmux_q}display-message -c #{q:client_name} $(q "$missing"); fi"
+}
+if [[ -n ${sk[0]:-} && ${sk[0]} != - ]]; then
+	t bind-key "${sk[0]}" run-shell -b "$(sidebar_cmd '')"
+fi
+if [[ -n ${sk[1]:-} && ${sk[1]} != - ]]; then
+	t bind-key "${sk[1]}" run-shell -b "$(sidebar_cmd ' --session')"
+fi
+
 if [[ -x $RUST_BIN ]]; then
 	# The daemon: one per server; a second start is a no-op (lock), and it
 	# exits with the server.
-	t run-shell -b "$rust_q daemon --socket #{q:socket_path}"
+	# Started TMUX_HOME_DAEMON_DELAY seconds (default 10) after the config
+	# loads: tmux-continuum skips its auto-restore if, as the server starts,
+	# it sees another process whose command line starts with `tmux`. A popup
+	# opened sooner starts the daemon itself.
+	delay=${TMUX_HOME_DAEMON_DELAY:-10}
+	[[ $delay =~ ^[0-9]+$ ]] || delay=10
+	if ((delay > 0)); then
+		t run-shell -b "sleep $delay; exec $rust_q daemon --socket #{q:socket_path}"
+	else
+		t run-shell -b "exec $rust_q daemon --socket #{q:socket_path}"
+	fi
 elif [[ -n $cargo ]]; then
 	# First load without a build (spec section 10): build in the background.
 	mkdir -p "$CURRENT_DIR/target"
@@ -88,7 +149,7 @@ elif [[ -n $cargo ]]; then
 		# yet) unless that start is over a minute old (its job never ran).
 		pid=$(cat "$BUILD_LOCK/pid" 2>/dev/null || true)
 		start=$(cat "$BUILD_LOCK/start" 2>/dev/null || true)
-		if [[ -n $pid && -n $start && $(ps -o lstart= -p "$pid" 2>/dev/null) == "$start" ]]; then
+		if [[ -n $pid && -n $start && $(/bin/ps -o lstart= -p "$pid" 2>/dev/null) == "$start" ]]; then
 			exit 0
 		elif [[ -z $start && -z $(find "$BUILD_LOCK" -maxdepth 0 -mmin +1) ]]; then
 			exit 0
@@ -97,5 +158,5 @@ elif [[ -n $cargo ]]; then
 		mkdir "$BUILD_LOCK" 2>/dev/null || exit 0
 	fi
 	lock_q=$(q "$BUILD_LOCK")
-	t run-shell -b "echo \$\$ >$lock_q/pid; ps -o lstart= -p \$\$ >$lock_q/start; cd $(q "$CURRENT_DIR") && $(q "$cargo") build --release >$(q "$BUILD_LOG") 2>&1; rm -rf $lock_q"
+	t run-shell -b "echo \$\$ >$lock_q/pid; /bin/ps -o lstart= -p \$\$ >$lock_q/start; cd $(q "$CURRENT_DIR") && $(q "$cargo") build --release >$(q "$BUILD_LOG") 2>&1; rm -rf $lock_q"
 fi

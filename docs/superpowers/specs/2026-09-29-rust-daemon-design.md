@@ -401,6 +401,30 @@ version and its 143-check test suite, which is the parity checklist.
   records which windows had a sidebar (in the store) and, on start, replaces
   restored shells in those positions with fresh sidebars — validated in R4.
 
+**Amendment (pass 6, as built).**
+- Resurrect: no store record. The sidebar process sets `@home_role=sidebar`
+  on its own `$TMUX_PANE`, and the user adds `"~tmux-home sidebar"` to
+  `@resurrect-processes`. The pane runs `/bin/sh -c '"$0" sidebar; exit'
+  <bin>`, because resurrect's `ps` strategy saves the pane process's
+  children; a binary that is the pane process itself is saved as nothing.
+  `q` kills its pane (a restored sidebar runs inside a shell).
+- Auto-create comes from snapshots, not `%window-add`: a window is decided
+  once, when first seen, and only once auto-create is allowed: the server
+  ≥ 30 s old, its structure unchanged for 5 s, and with `@continuum-restore
+  on` resurrect's post-restore hook having set `@home_restore_done` (or
+  60 s passed). Windows existing then never get one: a mid-restore sidebar
+  shifts the pane indexes resurrect selects and types into. A sidebar never
+  starts the daemon in the server's first 15 s. Panes tmux-home makes run
+  `sidebar --managed` (marks, `q` closes the pane); a hand-run one doesn't. The daemon also removes all
+  but the oldest of several tmux-home sidebars in one window (an auto-created
+  one plus a restored one), and closes sidebars left alone in a window.
+- Only `@home_role=sidebar` panes are created or killed. The snapshot's
+  `role` is `@home_role`, else `@pane_role`, so tmux-agent-sidebar's panes
+  are still excluded everywhere during the migration.
+- The daemon starts 10 s after the config loads, and every tmux command uses
+  an absolute path: tmux-continuum skips its auto-restore if it sees another
+  process starting with `tmux` at server start.
+
 ## 9. Persistence
 
 `${XDG_STATE_HOME:-~/.local/state}/tmux-home/` (dir per `sha1(socket_path)`

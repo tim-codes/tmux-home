@@ -10,6 +10,7 @@ fn run_plugin(s: &TestServer, bin: &str) {
     let out = Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tmux-home.tmux"))
         .env("TMUX_HOME_TMUX", format!("tmux -S {}", s.socket.display()))
         .env("TMUX_HOME_BIN", bin)
+        .env("TMUX_HOME_DAEMON_DELAY", "0")
         .env_remove("TMUX")
         .output()
         .unwrap();
@@ -36,6 +37,7 @@ fn empty_home_keys_binds_nothing() {
     let _env = TestEnv::new();
     let s = TestServer::start();
     s.tmux(&["set-option", "-g", "@home-keys", ""]);
+    s.tmux(&["set-option", "-g", "@home-sidebar-keys", ""]);
     run_plugin(&s, BIN);
     assert_eq!(binding(&s, "."), None);
     assert!(
@@ -141,6 +143,7 @@ fn run_copy(s: &TestServer, dir: &std::path::Path, path: &str) {
             format!("{} -S {}", tmux_path(), s.socket.display()),
         )
         .env("PATH", path)
+        .env("TMUX_HOME_DAEMON_DELAY", "0")
         .env_remove("TMUX_HOME_BIN")
         .env_remove("TMUX")
         .output()
@@ -263,4 +266,121 @@ fn hash_in_the_binary_path() {
     o.open_popup();
     o.keys(&["Escape"]);
     o.wait_gone("F1 help");
+}
+
+#[test]
+fn sidebar_keys_default_to_e_and_shift_e() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    run_plugin(&s, BIN);
+    let e = binding(&s, "e").expect("prefix e bound");
+    assert!(e.contains(&format!("{BIN} sidebar-toggle")), "{e}");
+    assert!(e.contains("--window #{q:session_id}:#{q:window_id}"), "{e}");
+    assert!(!e.contains("--session"), "{e}");
+    let big = binding(&s, "E").expect("prefix E bound");
+    assert!(big.contains("--session"), "{big}");
+}
+
+#[test]
+fn sidebar_keys_are_configurable() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    s.tmux(&["set-option", "-g", "@home-sidebar-keys", "- S"]);
+    run_plugin(&s, BIN);
+    assert_eq!(binding(&s, "e"), None);
+    assert_eq!(binding(&s, "E"), None);
+    assert!(binding(&s, "S").expect("prefix S").contains("--session"));
+}
+
+/// The daemon starts TMUX_HOME_DAEMON_DELAY seconds after the plugin
+/// loads (tmux-continuum's restore check runs meanwhile).
+#[test]
+fn the_daemon_start_is_delayed() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    let out = Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tmux-home.tmux"))
+        .env("TMUX_HOME_TMUX", format!("tmux -S {}", s.socket.display()))
+        .env("TMUX_HOME_BIN", BIN)
+        .env("TMUX_HOME_DAEMON_DELAY", "2")
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let sock = tmux_home::paths::Paths::for_socket(&s.socket).unwrap().sock;
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    assert!(!sock.exists(), "not yet");
+    wait_until("daemon socket", || {
+        std::os::unix::net::UnixStream::connect(&sock).is_ok()
+    });
+}
+
+/// At login PATH may lack the directory tmux lives in: run the way TPM
+/// runs it (run-shell, inside a server started with a bare PATH), the
+/// plugin still finds tmux, binds its keys and starts the daemon.
+#[test]
+fn a_bare_path_still_binds_and_starts_the_daemon() {
+    let env = TestEnv::new();
+    let name = format!("th-test-{}-{}", std::process::id(), rand_suffix());
+    let bare = "/usr/bin:/bin:/usr/sbin:/sbin";
+    let out = Command::new(tmux_path())
+        .env_clear()
+        .env("PATH", bare)
+        .env("HOME", std::env::var("HOME").unwrap())
+        .env("TMUX_HOME_RUNTIME_DIR", &env.runtime)
+        .env("TMUX_HOME_STATE_DIR", &env.state)
+        .args([
+            "-L",
+            &name,
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "/bin/sh",
+        ])
+        .current_dir(neutral_cwd())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let socket = Command::new("tmux")
+        .args(["-L", &name, "display", "-p", "#{socket_path}"])
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    let s = TestServer {
+        name,
+        socket: std::path::PathBuf::from(String::from_utf8(socket.stdout).unwrap().trim()),
+    };
+    assert_eq!(
+        s.tmux(&["show-environment", "-g", "PATH"]).trim(),
+        format!("PATH={bare}")
+    );
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tmux-home.tmux");
+    let r = s.tmux(&[
+        "run-shell",
+        &format!("TMUX_HOME_BIN='{BIN}' TMUX_HOME_DAEMON_DELAY=0 '{script}' 2>&1; echo rc=$?"),
+    ]);
+    assert!(r.contains("rc=0"), "{r}");
+    let b = binding(&s, ".").expect("prefix . bound");
+    assert!(
+        b.contains("/tmux display-popup"),
+        "tmux by absolute path: {b}"
+    );
+    assert!(binding(&s, "e").is_some(), "prefix e bound");
+    let sock = tmux_home::paths::Paths::for_socket(&s.socket).unwrap().sock;
+    wait_until("daemon socket", || {
+        std::os::unix::net::UnixStream::connect(&sock).is_ok()
+    });
+    // the daemon's own tmux calls work with that PATH, and with no locale
+    // set (no LANG/LC_*): it serves, and its records parse
+    let (snap, live) =
+        tmux_home::client::snapshot(&s.socket, std::time::Duration::from_millis(500)).unwrap();
+    assert!(live);
+    assert_eq!(snap.windows.len(), 1, "{snap:?}");
+    assert_eq!(snap.sessions[0].name, "alpha");
 }
