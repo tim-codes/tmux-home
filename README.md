@@ -35,6 +35,7 @@ With [TPM](https://github.com/tmux-plugins/tpm):
 ```tmux
 set -g @plugin 'tim-codes/tmux-home'
 # set -g @home-keys '.'   # prefix keys to bind (default); '' binds nothing
+# set -g @home-preview-history 2000   # scrollback lines the preview captures
 ```
 
 Or clone it and add `run-shell ~/path/to/tmux-home/tmux-home.tmux`.
@@ -87,6 +88,10 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | type | filter (session, index, name, command, path, agent kind, git branch; agent prompts word by word) and tokens, below |
 | `↑` `↓` `^p` `^n` `^k` `^j` | move (wraps) |
 | `PgUp` `PgDn` | page |
+| `S-↑` `S-↓` | scroll the preview a line (the list stays put) |
+| `S-PgUp` `S-PgDn` | scroll the preview half a page |
+| mouse wheel | scroll the preview, 3 lines a notch, wherever the pointer is; never the list |
+| click | select the row clicked |
 | `←` `→` `Home` `End` `^a` `^e` `^u` `^w` | edit the filter |
 | `⏎` | switch to the window and close (an agent window: also focus the agent's pane) |
 | `^g` | jump to the next window that needs you (cycles through NEEDS YOU) |
@@ -99,6 +104,20 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | `M-n` | new window after the selection, named inline (empty: automatic name) |
 | `^o` | toggle the preview |
 | `F1` `^/` | help |
+
+### Preview
+
+The preview shows the selected window's pane in its own colours and
+attributes (bold, dim, italic, underline, reverse), captured with
+`capture-pane -e` together with up to `@home-preview-history` lines of its
+scrollback (default 2000; `0` captures only the visible screen). It opens at
+the latest output; the wheel, `S-↑`/`S-↓` and `S-PgUp`/`S-PgDn` scroll back
+through the history, a `↑n` tag in its top-right corner says how far, and
+moving the selection returns to the latest output. Lines are clipped at the
+preview's edge, not wrapped, so one pane line is one preview row and a TUI's
+columns stay lined up. The selected pane is captured again every second, and
+only once the selection has rested on it for 60 ms, so holding `↓` doesn't
+capture every pane passed; a 2000-line capture and parse takes about 16 ms.
 
 Filter tokens combine with text: `@attn` (needs you), `@agent` (any agent
 window, stale ones included), `@running`, `@waiting`, `@background`,
