@@ -91,11 +91,13 @@ impl Tmux {
         Tmux { socket }
     }
 
-    /// `tmux -S <socket>` (absolute `tmux_bin()`, `$TMUX` removed), to add
+    /// `tmux -u -S <socket>` (absolute `tmux_bin()`, `$TMUX` removed), to add
     /// arguments to.
     pub fn base(&self) -> std::process::Command {
         let mut c = std::process::Command::new(tmux_bin());
-        c.arg("-S").arg(&self.socket).env_remove("TMUX");
+        // -u: UTF-8 output whatever the locale; without it (no LANG/LC_*,
+        // as under launchd) tmux prints the \x1f field separators as `_`
+        c.arg("-u").arg("-S").arg(&self.socket).env_remove("TMUX");
         c
     }
 

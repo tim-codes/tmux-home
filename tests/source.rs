@@ -293,5 +293,5 @@ fn tmux_commands_do_not_look_like_another_tmux_to_continuum() {
     child.wait().unwrap();
     assert!(line.starts_with('/'), "{line}");
     assert!(!line.starts_with("tmux"), "continuum would count {line:?}");
-    assert!(line.contains("/tmux -S "), "{line}");
+    assert!(line.contains("/tmux -u -S "), "{line}");
 }

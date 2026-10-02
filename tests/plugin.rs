@@ -376,10 +376,11 @@ fn a_bare_path_still_binds_and_starts_the_daemon() {
     wait_until("daemon socket", || {
         std::os::unix::net::UnixStream::connect(&sock).is_ok()
     });
-    // the daemon's own tmux calls work with that PATH too: it serves
-    assert!(
-        tmux_home::client::snapshot(&s.socket, std::time::Duration::from_millis(500))
-            .unwrap()
-            .1
-    );
+    // the daemon's own tmux calls work with that PATH, and with no locale
+    // set (no LANG/LC_*): it serves, and its records parse
+    let (snap, live) =
+        tmux_home::client::snapshot(&s.socket, std::time::Duration::from_millis(500)).unwrap();
+    assert!(live);
+    assert_eq!(snap.windows.len(), 1, "{snap:?}");
+    assert_eq!(snap.sessions[0].name, "alpha");
 }
