@@ -30,6 +30,23 @@ enum Cmd {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
     },
+    /// The read-only sidebar (run in its own pane; `sidebar-toggle` makes
+    /// one). `q` closes it; it ignores every other key.
+    Sidebar {
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
+    /// Add or remove a sidebar in a window (default: $TMUX_PANE's).
+    SidebarToggle {
+        /// Every window of the window's session: on if any lacks one, else off.
+        #[arg(long)]
+        session: bool,
+        /// The window (any tmux target, e.g. `$1:@3`).
+        #[arg(long)]
+        window: Option<String>,
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
     /// Recreate the most recently closed window; prints its ID (exit 4 if none).
     Reopen {
         #[arg(long)]
@@ -68,6 +85,12 @@ fn main() -> anyhow::Result<()> {
     let cmd = match cli.cmd {
         Cmd::Popup { socket } => return tmux_home::popup::run(socket),
         Cmd::Status { socket } => return tmux_home::client::status(socket),
+        Cmd::Sidebar { socket } => return tmux_home::sidebar::run(socket),
+        Cmd::SidebarToggle {
+            session,
+            window,
+            socket,
+        } => return tmux_home::sidebar::toggle(socket, session, window),
         Cmd::Query { socket, json: _ } => return tmux_home::client::query(socket),
         Cmd::Reopen { socket } => {
             let code = tmux_home::popup::reopen_cli(socket)?;
@@ -83,6 +106,8 @@ fn main() -> anyhow::Result<()> {
         | Cmd::Status { .. }
         | Cmd::Reopen { .. }
         | Cmd::Query { .. }
+        | Cmd::Sidebar { .. }
+        | Cmd::SidebarToggle { .. }
         | Cmd::Hook { .. } => {
             unreachable!()
         }

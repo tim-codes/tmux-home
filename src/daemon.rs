@@ -1,4 +1,5 @@
 pub mod git;
+pub mod sidebars;
 
 use crate::{
     BUILD_ID,
@@ -231,6 +232,8 @@ pub async fn run_with(
     // git badges: a task of its own, fed by the published snapshots, so no
     // git work ever sits on the tmux poll's path
     let git_task = git::spawn(shared.clone(), git_cfg);
+    // sidebars: auto-create, cleanup and dedupe, from the same snapshots
+    let sidebar_task = sidebars::spawn(shared.clone());
     // tmux kills `run-shell -b` jobs on kill-server: on these signals, exit
     // through the normal cleanup below (remove the socket, release the lock).
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -257,6 +260,7 @@ pub async fn run_with(
         }
     };
     git_task.abort();
+    sidebar_task.abort();
     let _ = std::fs::remove_file(&paths.sock);
     drop(lock);
     result

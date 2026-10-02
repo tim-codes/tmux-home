@@ -10,6 +10,10 @@ use std::{path::PathBuf, process::Command};
 
 const US: char = '\x1f';
 
+/// A pane's role in a format: tmux-home's `@home_role`, else
+/// tmux-agent-sidebar's `@pane_role` (either marks a sidebar `sidebar`).
+pub const ROLE_FMT: &str = "#{?#{@home_role},#{@home_role},#{@pane_role}}";
+
 /// tmux format-expands names and paths given to `rename-window`,
 /// `new-window -n/-c`, `new-session -s/-c` and `split-window -c` (so `#(…)`
 /// would even run a shell command); doubling `#` makes them literal.
@@ -293,7 +297,7 @@ impl Tx {
                 "-t",
                 wid,
                 "-F",
-                "#{pane_active}\x1f#{@pane_role}\x1f#{pane_current_path}",
+                &format!("#{{pane_active}}\x1f{ROLE_FMT}\x1f#{{pane_current_path}}"),
             ])?
             .lines()
         {

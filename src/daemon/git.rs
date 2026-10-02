@@ -695,6 +695,7 @@ mod tests {
             current_path: path.into(),
             title: String::new(),
             role: String::new(),
+            home_role: String::new(),
             agent_opts: Default::default(),
             tty: String::new(),
         }

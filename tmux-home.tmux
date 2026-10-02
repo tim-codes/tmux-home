@@ -2,6 +2,9 @@
 # TPM entry point: binds the tmux-home popup and starts the daemon.
 #
 #   set -g @home-keys '.'     # prefix keys to bind (default "."; '' = none)
+#   set -g @home-sidebar-keys 'e E'  # prefix keys: toggle the sidebar in the
+#                             # window, then in every window of the session
+#                             # (default "e E"; '' = none; '-' skips one)
 #
 # The popup and daemon are the Rust binary, target/release/tmux-home. If it
 # isn't built yet, the key says so and loading the plugin starts
@@ -74,6 +77,26 @@ cmd="if [ -x $rust_q ]; then $popup$rust_q popup; else ${tmux_q}display-message 
 for key in $keys; do
 	t bind-key "$key" run-shell -b "$cmd"
 done
+
+# Sidebar toggles: the first key toggles the window's sidebar, the second
+# every window of the session. The window is named by session and window
+# ID, as run-shell expands them for the client that pressed the key.
+if [[ -n $(t show-options -gq @home-sidebar-keys) ]]; then
+	sidebar_keys=$(t show-options -gqv @home-sidebar-keys)
+else
+	sidebar_keys='e E'
+fi
+read -r -a sk <<<"$sidebar_keys"
+toggle="$rust_q sidebar-toggle --socket #{q:socket_path} --window #{q:session_id}:#{q:window_id}"
+sidebar_cmd() {
+	printf '%s' "if [ -x $rust_q ]; then $toggle$1; else ${tmux_q}display-message -c #{q:client_name} $(q "$missing"); fi"
+}
+if [[ -n ${sk[0]:-} && ${sk[0]} != - ]]; then
+	t bind-key "${sk[0]}" run-shell -b "$(sidebar_cmd '')"
+fi
+if [[ -n ${sk[1]:-} && ${sk[1]} != - ]]; then
+	t bind-key "${sk[1]}" run-shell -b "$(sidebar_cmd ' --session')"
+fi
 
 if [[ -x $RUST_BIN ]]; then
 	# The daemon: one per server; a second start is a no-op (lock), and it

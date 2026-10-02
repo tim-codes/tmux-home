@@ -33,9 +33,9 @@ use std::{
 };
 
 /// Snapshots from the daemon (live) or direct reads (degraded).
-struct Feed {
-    snap: Snapshot,
-    stamp: Stamp,
+pub(crate) struct Feed {
+    pub snap: Snapshot,
+    pub stamp: Stamp,
 }
 
 const DEGRADED_EVERY: Duration = Duration::from_secs(1);
@@ -56,19 +56,20 @@ const RESPAWN_EVERY: Duration = Duration::from_secs(5);
 /// The feed thread: plain blocking I/O, no async runtime. It subscribes to
 /// the daemon and forwards its pushes; when there is no daemon it uses the
 /// shared degraded path (`client::revive`, then a direct read) every second.
-fn spawn_feed(socket: PathBuf) -> mpsc::Receiver<Feed> {
+/// `client` names the subscriber in the daemon's requests.
+pub(crate) fn spawn_feed(socket: PathBuf, client: &'static str) -> mpsc::Receiver<Feed> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || feed_loop(socket, tx));
+    std::thread::spawn(move || feed_loop(socket, client, tx));
     rx
 }
 
-fn feed_loop(socket: PathBuf, tx: mpsc::Sender<Feed>) {
+fn feed_loop(socket: PathBuf, client: &'static str, tx: mpsc::Sender<Feed>) {
     let tmux = crate::tmux::Tmux::new(socket.clone());
     let mut last_spawn: Option<Instant> = None;
     loop {
         // live: subscribe until the daemon goes away
         let since = Instant::now();
-        let restart = match client::ask(&socket, &client::subscribe_req("popup"), SUBSCRIBE_BUDGET)
+        let restart = match client::ask(&socket, &client::subscribe_req(client), SUBSCRIBE_BUDGET)
         {
             Answer::Snapshot {
                 epoch,
@@ -289,7 +290,7 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     let tx = Tx::new(socket.clone());
     let client = tx.home_client();
     let store = Store::for_socket(&socket)?;
-    let feed = spawn_feed(socket.clone());
+    let feed = spawn_feed(socket.clone(), "popup");
     let history = tx
         .run(&["show-options", "-gqv", "@home-preview-history"])
         .ok()
@@ -731,6 +732,7 @@ mod tests {
                 current_path: "/tmp".into(),
                 title: String::new(),
                 role: String::new(),
+                home_role: String::new(),
                 agent_opts: Default::default(),
                 tty: String::new(),
             });

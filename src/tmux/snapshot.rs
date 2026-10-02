@@ -83,9 +83,15 @@ pub struct Pane {
     pub current_command: String,
     pub current_path: String,
     pub title: String,
-    /// `@pane_role` (e.g. `sidebar`); sidebar panes are views, not work.
+    /// The pane's role: tmux-home's own `@home_role`, else
+    /// tmux-agent-sidebar's `@pane_role` (both mark a sidebar `sidebar`);
+    /// sidebar panes are views, not work.
     #[serde(default)]
     pub role: String,
+    /// `@home_role` alone: `sidebar` marks a tmux-home sidebar, the only
+    /// sidebar panes tmux-home itself ever creates or kills.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub home_role: String,
     /// The pane's agent options (`crate::agent::OPTIONS`), the non-empty
     /// ones only. Raw: `crate::agent` turns them into agent state. They
     /// change on agent events, never by the clock (a run's start time is
@@ -117,10 +123,10 @@ const REC_END: &str = "\x1e\n";
 // The agent options sit between the fixed fields and the names; a prompt is
 // stored with newlines and `|` replaced, but a literal \x1f in one would
 // shift the fields after it (the record is then misread, not lost).
-const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{@pane_role}\x1f#{pane_tty}\x1f";
+const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{?#{@home_role},#{@home_role},#{@pane_role}}\x1f#{pane_tty}\x1f#{@home_role}\x1f";
 const PANE_TAIL: &str = "#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
 /// Fields before the agent options.
-const HEAD_FIELDS: usize = 12;
+const HEAD_FIELDS: usize = 13;
 /// Fields in a `list-panes` record.
 fn pane_fields() -> usize {
     HEAD_FIELDS + crate::agent::OPTIONS.len() + 3
@@ -269,6 +275,7 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
             title: title.to_string(),
             role: f[10].to_string(),
             tty: f[11].to_string(),
+            home_role: f[12].to_string(),
             agent_opts: agent_opts_from(&f[HEAD_FIELDS..n - 3]),
         });
     }

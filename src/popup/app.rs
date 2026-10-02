@@ -904,6 +904,7 @@ mod tests {
                 current_path: "/home/u/dev/x".into(),
                 title: String::new(),
                 role: String::new(),
+                home_role: String::new(),
                 agent_opts: Default::default(),
                 tty: String::new(),
             });
@@ -919,6 +920,7 @@ mod tests {
             current_path: "/".into(),
             title: String::new(),
             role: "sidebar".into(),
+            home_role: String::new(),
             agent_opts: Default::default(),
             tty: String::new(),
         });
