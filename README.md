@@ -12,7 +12,8 @@ where to go.
 > [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s pane
 > options, and (pass 5a) from tmux-home's own Claude Code hooks, which run
 > alongside the sidebar's, and (pass 5b) git badges on window rows from the
-> daemon. The repos view and the sidebar come in later milestones; see
+> daemon, and (pass 6) a read-only sidebar on `prefix e`/`E`. The repos
+> view comes in a later milestone; see
 > [`docs/superpowers/specs/2026-09-29-rust-daemon-design.md`](docs/superpowers/specs/2026-09-29-rust-daemon-design.md) §13.
 
 ## Why
@@ -36,7 +37,16 @@ With [TPM](https://github.com/tmux-plugins/tpm):
 set -g @plugin 'tim-codes/tmux-home'
 # set -g @home-keys '.'   # prefix keys to bind (default); '' binds nothing
 # set -g @home-preview-history 2000   # scrollback lines the preview captures
+# set -g @home-sidebar-keys 'e E'     # sidebar: window, session ('' = none)
+# set -g @home-sidebar-width 32       # columns, or a percentage (20%)
+# set -g @home-sidebar-side left      # or right
+# set -g @home-sidebar-auto off       # on: a sidebar in every new window
+# set -g @home-sidebar-exclude ''     # sessions auto-create skips (space-separated)
 ```
+
+The plugin finds tmux by absolute path (the running server's own binary,
+then `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, then `PATH`), so it
+works from a login with a minimal `PATH`.
 
 Or clone it and add `run-shell ~/path/to/tmux-home/tmux-home.tmux`.
 
@@ -56,8 +66,12 @@ naming that log instead of the popup; without `cargo` on `PATH` no build is
 started and the message says so. A build that finishes later is picked up on
 the next key press, with no reload. Rebuild after pulling an update.
 
-Loading the plugin also starts the daemon, one per tmux server; it exits
-with the server. The popup subscribes to it for live updates. If the daemon
+Loading the plugin also starts the daemon, one per tmux server, 10 seconds
+later (`TMUX_HOME_DAEMON_DELAY`); it exits with the server. The delay is for
+tmux-continuum, which skips its auto-restore if, as the server starts, it
+sees any process whose command line starts with `tmux`; tmux-home also runs
+tmux by its absolute path, so its commands never look like that. A popup or
+sidebar opened sooner starts the daemon itself. The popup subscribes to it for live updates. If the daemon
 is down, the popup reads tmux itself (the header shows `(direct)`) and starts
 a new daemon in the background. The daemon's errors go to
 `<state root>/<server key>/daemon.log` (see below), moved to `daemon.log.1`
@@ -397,6 +411,65 @@ is gone. The popup stays open with the cursor on it. The stack lives in
 `${XDG_STATE_HOME:-~/.local/state}/tmux-home` (override with
 `TMUX_HOME_STATE_DIR`). A `closed.json` that can't be read is renamed to
 `closed.json.corrupt.<timestamp>` and the stack starts empty.
+
+## Sidebar
+
+`prefix e` toggles a sidebar in the current window; `prefix E` toggles one
+in every window of the current session (on in every window lacking one if
+any does, else off everywhere; other sessions are never touched). From a
+shell or your own binding: `tmux-home sidebar-toggle [--session] [--window
+<target>]`.
+
+The sidebar is a narrow, read-only pane (`@home-sidebar-width`, default 32
+columns, at the `@home-sidebar-side` edge, full height):
+
+```
+─ NEEDS YOU ───────────────────
+ ◐ main:1 api
+   permission
+─ main ────────────────────────
+ ◐ 1 api
+▌  2 web  main ! ⇡1
+ ● 3 editor  feat/x +?
+ 2s 7w · 1 waiting · 1 running
+```
+
+Windows that need you, server-wide, with the reason; then the windows of
+its own session, each with its agent status icon, index, name and git
+badge (whole pieces dropped as the width shrinks), the window it lives in
+highlighted; a tally at the bottom (sessions, windows, live agents by
+status; `○` while it reads tmux directly, without the daemon). It updates
+live from the daemon. It never takes focus and never captures the mouse;
+it ignores every key except `q`, which closes it. Sidebar panes are marked
+`@home_role=sidebar` and left out of the popup's rows, `^x`'s close check
+and `^t`'s reopen snapshot (as are tmux-agent-sidebar's `@pane_role`
+panes).
+
+With `@home-sidebar-auto on`, the daemon adds a sidebar to each new window,
+except in sessions named in `@home-sidebar-exclude` (e.g. `scratch`). Each
+window is decided once, when the daemon first sees it, so closing one with
+`prefix e` sticks; windows that were there before the daemon started don't
+count as new unless the server itself has just started. When a window's last
+other pane exits, the daemon closes its sidebar, so no window is left holding
+only a sidebar; a window with two tmux-home sidebars keeps the older one.
+
+### tmux-resurrect
+
+Add the sidebar to the processes resurrect restores:
+
+```tmux
+set -g @resurrect-processes '"~tmux-home sidebar"'
+```
+
+(append it to any list you already have). The sidebar pane runs
+`/bin/sh -c '"$0" sidebar; exit' <path>/tmux-home`; resurrect's default
+`ps` strategy saves the command lines of a pane process's children, so it
+saves `<path>/tmux-home sidebar`, which `~tmux-home sidebar` (a substring
+match) restores by typing it into the restored shell. The sidebar marks its
+own pane at start, so nothing else is needed; `q` on a restored one closes
+the whole pane. With auto-create on, a restored window can briefly get a
+second, new sidebar before the restored one starts; the daemon then removes
+the newer one.
 
 ## Tests
 
