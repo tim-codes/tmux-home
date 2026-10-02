@@ -445,31 +445,52 @@ it ignores every key except `q`, which closes it. Sidebar panes are marked
 and `^t`'s reopen snapshot (as are tmux-agent-sidebar's `@pane_role`
 panes).
 
-With `@home-sidebar-auto on`, the daemon adds a sidebar to each new window,
-except in sessions named in `@home-sidebar-exclude` (e.g. `scratch`). Each
-window is decided once, when the daemon first sees it, so closing one with
-`prefix e` sticks; windows that were there before the daemon started don't
-count as new unless the server itself has just started. When a window's last
-other pane exits, the daemon closes its sidebar, so no window is left holding
-only a sidebar; a window with two tmux-home sidebars keeps the older one.
+With `@home-sidebar-auto on`, the daemon adds a sidebar to each window
+created from then on, except in sessions named in `@home-sidebar-exclude`
+(e.g. `scratch`). Each window is decided once, when the daemon first sees
+it, so closing one with `prefix e` sticks. Auto-create starts only once the
+server is past its start-up: at least 30 seconds old, its windows and panes
+unchanged for 5 seconds, and, with `@continuum-restore on`, the restore done
+(see below; at most 60 seconds' wait). Windows that exist at that moment
+never get one. (A restore creates windows and later selects panes and types
+commands into them by index; a sidebar added in between would shift them.)
+A sidebar first seen by the daemon (a restored one keeps its saved width) is
+set to `@home-sidebar-width`. When a window's last other pane exits, the
+daemon closes its sidebar, so no window is left holding only a sidebar; a
+window with two tmux-home sidebars keeps the older one.
+
+A sidebar never starts the daemon in the server's first 15 seconds (the
+plugin starts it at 10): until the daemon is up it reads tmux itself, shown
+by `○`, then subscribes. `tmux-home sidebar` run by hand in a pane of yours
+marks nothing, and `q` just exits it; the panes tmux-home makes run
+`tmux-home sidebar --managed`.
 
 ### tmux-resurrect
 
-Add the sidebar to the processes resurrect restores:
+Add the sidebar to the processes resurrect restores, and tell tmux-home
+when a restore has finished:
 
 ```tmux
 set -g @resurrect-processes '"~tmux-home sidebar"'
+set -g @resurrect-hook-post-restore-all 'tmux set -g @home_restore_done 1'
 ```
 
-(append it to any list you already have). The sidebar pane runs
-`/bin/sh -c '"$0" sidebar; exit' <path>/tmux-home`; resurrect's default
-`ps` strategy saves the command lines of a pane process's children, so it
-saves `<path>/tmux-home sidebar`, which `~tmux-home sidebar` (a substring
-match) restores by typing it into the restored shell. The sidebar marks its
-own pane at start, so nothing else is needed; `q` on a restored one closes
-the whole pane. With auto-create on, a restored window can briefly get a
-second, new sidebar before the restored one starts; the daemon then removes
-the newer one.
+(append the first to any list you already have). The sidebar pane runs
+`/bin/sh -c '"$0" sidebar --managed; exit' <path>/tmux-home`; resurrect's
+default `ps` strategy saves the command lines of a pane process's children,
+so it saves `<path>/tmux-home sidebar --managed`, which `~tmux-home sidebar`
+(a substring match) restores by typing it into the restored shell. The
+sidebar then marks its own pane, so nothing else is needed; `q` on a
+restored one closes the whole pane.
+
+### Moving from tmux-agent-sidebar
+
+Its keys and hooks override tmux-home's: remove its `@plugin` line, any
+`bind E …` of your own that runs its toggle (e.g. a session-scoped
+`tmux-sidebar-session` script), and any `after-new-window` /
+`after-new-session` hooks that run `toggle --create-only`; those bound after
+TPM win over the `e`/`E` tmux-home binds. Then set `@home-sidebar-auto on`
+and `@home-sidebar-exclude` instead.
 
 ## Tests
 
