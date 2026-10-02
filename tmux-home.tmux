@@ -149,7 +149,7 @@ elif [[ -n $cargo ]]; then
 		# yet) unless that start is over a minute old (its job never ran).
 		pid=$(cat "$BUILD_LOCK/pid" 2>/dev/null || true)
 		start=$(cat "$BUILD_LOCK/start" 2>/dev/null || true)
-		if [[ -n $pid && -n $start && $(ps -o lstart= -p "$pid" 2>/dev/null) == "$start" ]]; then
+		if [[ -n $pid && -n $start && $(/bin/ps -o lstart= -p "$pid" 2>/dev/null) == "$start" ]]; then
 			exit 0
 		elif [[ -z $start && -z $(find "$BUILD_LOCK" -maxdepth 0 -mmin +1) ]]; then
 			exit 0
@@ -158,5 +158,5 @@ elif [[ -n $cargo ]]; then
 		mkdir "$BUILD_LOCK" 2>/dev/null || exit 0
 	fi
 	lock_q=$(q "$BUILD_LOCK")
-	t run-shell -b "echo \$\$ >$lock_q/pid; ps -o lstart= -p \$\$ >$lock_q/start; cd $(q "$CURRENT_DIR") && $(q "$cargo") build --release >$(q "$BUILD_LOG") 2>&1; rm -rf $lock_q"
+	t run-shell -b "echo \$\$ >$lock_q/pid; /bin/ps -o lstart= -p \$\$ >$lock_q/start; cd $(q "$CURRENT_DIR") && $(q "$cargo") build --release >$(q "$BUILD_LOG") 2>&1; rm -rf $lock_q"
 fi
