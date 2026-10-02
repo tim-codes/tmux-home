@@ -358,6 +358,7 @@ pub fn install_binding(s: &TestServer) {
     let out = Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tmux-home.tmux"))
         .env("TMUX_HOME_TMUX", format!("tmux -S {}", s.socket.display()))
         .env("TMUX_HOME_BIN", env!("CARGO_BIN_EXE_tmux-home"))
+        .env("TMUX_HOME_DAEMON_DELAY", "0")
         .env_remove("TMUX")
         .output()
         .unwrap();

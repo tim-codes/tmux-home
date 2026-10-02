@@ -498,7 +498,7 @@ pub fn stopped_jobs(tty: &str) -> Vec<String> {
     if tty.is_empty() {
         return vec![];
     }
-    let Ok(out) = Command::new("ps")
+    let Ok(out) = Command::new("/bin/ps")
         .args(["-o", "stat=,comm=", "-t", tty])
         .output()
     else {

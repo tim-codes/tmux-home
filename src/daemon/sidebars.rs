@@ -29,9 +29,10 @@ use std::{
 };
 use tokio::task::JoinHandle;
 
-/// A server younger than this when the daemon starts is starting up: the
+/// A server younger than this when the daemon starts is starting up (the
+/// plugin starts the daemon 10 s after the config loads): the
 /// windows in the daemon's first snapshot count as new.
-pub const FRESH_SERVER: Duration = Duration::from_secs(15);
+pub const FRESH_SERVER: Duration = Duration::from_secs(30);
 
 /// A window seen for the first time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,7 +170,9 @@ impl Planner {
 fn server_age(t: &Tmux) -> Option<Duration> {
     let out = t.run(&["display-message", "-p", "#{start_time}"]).ok()?;
     let start: u64 = out.trim().parse().ok()?;
-    Some(Duration::from_secs(crate::agent::now().saturating_sub(start)))
+    Some(Duration::from_secs(
+        crate::agent::now().saturating_sub(start),
+    ))
 }
 
 /// Carries out a plan (blocking: tmux commands). Failures are logged: a
@@ -180,8 +183,8 @@ fn execute(t: &Tmux, plan: Plan) {
             eprintln!("tmux-home: sidebar cleanup: {e:#}");
         }
     }
-    let place = (!plan.resize.is_empty() || !plan.new_windows.is_empty())
-        .then(|| Placement::read(t));
+    let place =
+        (!plan.resize.is_empty() || !plan.new_windows.is_empty()).then(|| Placement::read(t));
     for p in &plan.resize {
         let w = place.as_ref().map(|p| p.width.clone()).unwrap_or_default();
         let _ = t.run(&["resize-pane", "-t", p, "-x", &w]);
@@ -323,7 +326,13 @@ mod tests {
         let mut old = pane("%4", "@4", ROLE, false);
         old.session_id = "$1".into();
         let s = snap(
-            &[("@1", "$1"), ("@2", "$2"), ("@3", "$1"), ("@4", "$1"), ("@5", "$1")],
+            &[
+                ("@1", "$1"),
+                ("@2", "$2"),
+                ("@3", "$1"),
+                ("@4", "$1"),
+                ("@5", "$1"),
+            ],
             vec![
                 real("%1", "@1"),
                 real("%2", "@2"),
@@ -384,7 +393,12 @@ mod tests {
         let mut p = Planner::new(false);
         let s = snap(
             &[("@1", "$1"), ("@1", "$2")],
-            vec![real("%1", "@1"), side("%2", "@1"), real("%1", "@1"), side("%2", "@1")],
+            vec![
+                real("%1", "@1"),
+                side("%2", "@1"),
+                real("%1", "@1"),
+                side("%2", "@1"),
+            ],
         );
         assert_eq!(p.observe(&s), Plan::default());
     }
