@@ -159,6 +159,10 @@ fn new_epoch() -> u64 {
 /// persistent failure (e.g. the process is out of file descriptors).
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
+/// How long a starting daemon waits for the lock before deciding another
+/// daemon serves the server.
+const LOCK_WAIT: Duration = Duration::from_millis(1000);
+
 /// Timeout on reading a connection's initial request, so a client that
 /// connects and never writes doesn't hold a `serve` task forever.
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -214,8 +218,16 @@ pub async fn run_with(
         .truncate(false)
         .write(true)
         .open(&paths.lock)?;
-    if lock.try_lock().is_err() {
-        return Ok(()); // another daemon serves this server
+    // Another daemon serves this server: exit. A daemon spawned as an old
+    // build exits (after its `Restart` reply) finds the lock held for the
+    // moment between that one removing its socket and releasing the lock,
+    // so it retries briefly before giving up.
+    let deadline = Instant::now() + LOCK_WAIT;
+    while lock.try_lock().is_err() {
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let _ = std::fs::remove_file(&paths.sock);
     let listener = UnixListener::bind(&paths.sock)?;
