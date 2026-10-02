@@ -89,12 +89,13 @@ pub fn sidebar_bin() -> PathBuf {
 /// at its left (or right) edge, without taking focus, printing the new
 /// pane's ID.
 ///
-/// The pane runs `/bin/sh -c '"$0" sidebar; exit' <bin>`, not the binary
+/// The pane runs `/bin/sh -c '"$0" sidebar --managed; exit' <bin>`, not the binary
 /// itself: tmux-resurrect saves a pane's command as the full command line
 /// of the pane process's *children* (`ps -ao ppid,args`, its default `ps`
 /// strategy), so a binary that was the pane process would be saved as
-/// nothing. With the shell in between it is saved as `<bin> sidebar`,
-/// which `"~tmux-home sidebar"` in `@resurrect-processes` matches. The
+/// nothing. With the shell in between it is saved as `<bin> sidebar
+/// --managed`, which `"~tmux-home sidebar"` in `@resurrect-processes`
+/// matches (and restores managed: marked, `q` closes the pane). The
 /// `; exit` keeps `sh` from exec'ing the binary in its place.
 pub fn split_args(window: &str, p: &Placement, bin: &Path) -> Vec<String> {
     let mut a: Vec<String> = ["split-window", "-d", "-f", "-h"].map(String::from).into();
@@ -106,7 +107,7 @@ pub fn split_args(window: &str, p: &Placement, bin: &Path) -> Vec<String> {
     }
     a.push("/bin/sh".into());
     a.push("-c".into());
-    a.push("\"$0\" sidebar; exit".into());
+    a.push("\"$0\" sidebar --managed; exit".into());
     a.push(bin.to_string_lossy().into_owned());
     a
 }
@@ -245,10 +246,22 @@ pub fn toggle(
 /// How often the sidebar looks for input and snapshots.
 const TICK: Duration = Duration::from_millis(100);
 
-/// `tmux-home sidebar`: marks its own pane and renders until `q` (which
-/// closes its pane) or until its server goes. It never asks for the mouse
-/// and ignores every other key.
-pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
+/// Seconds after the server starts before a sidebar starts a daemon
+/// (`TMUX_HOME_SIDEBAR_REVIVE_AGE`, default 15): restored sidebars start
+/// early in a restore, and the plugin starts the daemon later on purpose.
+pub fn revive_age() -> u64 {
+    std::env::var("TMUX_HOME_SIDEBAR_REVIVE_AGE")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(15)
+}
+
+/// `tmux-home sidebar [--managed]`: renders until `q` or until its server
+/// goes. It never asks for the mouse and ignores every other key.
+/// `--managed` (the pane `sidebar-toggle` or auto-create made, or that
+/// resurrect restored) marks its pane `@home_role=sidebar`, and `q` then
+/// closes the pane; run by hand, it marks nothing and `q` just exits.
+pub fn run(socket: Option<PathBuf>, managed: bool) -> anyhow::Result<()> {
     let socket = client::current_socket(socket)
         .ok_or_else(|| anyhow::anyhow!("not inside tmux and no --socket"))?;
     let me = std::env::var("TMUX_PANE")
@@ -256,9 +269,15 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
         .filter(|p| !p.is_empty())
         .ok_or_else(|| anyhow::anyhow!("not in a tmux pane ($TMUX_PANE is unset)"))?;
     let t = Tmux::new(socket.clone());
-    mark(&t, &me)?;
+    if managed {
+        mark(&t, &me)?;
+    }
     let home = std::env::var("HOME").unwrap_or_default();
-    let feed = spawn_feed(socket, "sidebar");
+    let start: Option<u64> = t
+        .run(&["display-message", "-p", "#{start_time}"])
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let feed = spawn_feed(socket, "sidebar", start.map(|s| s + revive_age()));
     let mut term = ratatui::init();
     let result = (|| -> anyhow::Result<()> {
         let mut m = model::Model::default();
@@ -297,7 +316,9 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
                     {
                         // the pane, not just this process: a pane
                         // resurrect restored runs us in a shell
-                        let _ = t.run(&["kill-pane", "-t", &me]);
+                        if managed {
+                            let _ = t.run(&["kill-pane", "-t", &me]);
+                        }
                         return Ok(());
                     }
                     Event::Resize(..) => dirty = true,
@@ -384,7 +405,7 @@ mod tests {
                 "#{pane_id}",
                 "/bin/sh",
                 "-c",
-                "\"$0\" sidebar; exit",
+                "\"$0\" sidebar --managed; exit",
                 "/p/tmux-home"
             ]
         );

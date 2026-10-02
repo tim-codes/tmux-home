@@ -35,6 +35,10 @@ enum Cmd {
     Sidebar {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
+        /// A pane tmux-home made (or resurrect restored): mark it as a
+        /// sidebar, and let `q` close the pane.
+        #[arg(long)]
+        managed: bool,
     },
     /// Add or remove a sidebar in a window (default: $TMUX_PANE's).
     SidebarToggle {
@@ -85,7 +89,9 @@ fn main() -> anyhow::Result<()> {
     let cmd = match cli.cmd {
         Cmd::Popup { socket } => return tmux_home::popup::run(socket),
         Cmd::Status { socket } => return tmux_home::client::status(socket),
-        Cmd::Sidebar { socket } => return tmux_home::sidebar::run(socket),
+        Cmd::Sidebar { socket, managed } => {
+            return tmux_home::sidebar::run(socket, managed);
+        }
         Cmd::SidebarToggle {
             session,
             window,

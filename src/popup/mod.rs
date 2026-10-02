@@ -56,14 +56,26 @@ const RESPAWN_EVERY: Duration = Duration::from_secs(5);
 /// The feed thread: plain blocking I/O, no async runtime. It subscribes to
 /// the daemon and forwards its pushes; when there is no daemon it uses the
 /// shared degraded path (`client::revive`, then a direct read) every second.
-/// `client` names the subscriber in the daemon's requests.
-pub(crate) fn spawn_feed(socket: PathBuf, client: &'static str) -> mpsc::Receiver<Feed> {
+/// `client` names the subscriber in the daemon's requests. Without a
+/// daemon it starts one, but not before Unix time `revive_from` (the
+/// sidebar: not while the server is starting up); meanwhile it reads tmux
+/// directly and keeps trying to subscribe.
+pub(crate) fn spawn_feed(
+    socket: PathBuf,
+    client: &'static str,
+    revive_from: Option<u64>,
+) -> mpsc::Receiver<Feed> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || feed_loop(socket, client, tx));
+    std::thread::spawn(move || feed_loop(socket, client, revive_from, tx));
     rx
 }
 
-fn feed_loop(socket: PathBuf, client: &'static str, tx: mpsc::Sender<Feed>) {
+fn feed_loop(
+    socket: PathBuf,
+    client: &'static str,
+    revive_from: Option<u64>,
+    tx: mpsc::Sender<Feed>,
+) {
     let tmux = crate::tmux::Tmux::new(socket.clone());
     let mut last_spawn: Option<Instant> = None;
     loop {
@@ -92,7 +104,8 @@ fn feed_loop(socket: PathBuf, client: &'static str, tx: mpsc::Sender<Feed>) {
             Answer::Down => false,
         };
         // degraded: (re)start a daemon now and then, read directly meanwhile
-        if restart || last_spawn.is_none_or(|t| t.elapsed() > RESPAWN_EVERY) {
+        let may = revive_from.is_none_or(|t| crate::agent::now() >= t);
+        if may && (restart || last_spawn.is_none_or(|t| t.elapsed() > RESPAWN_EVERY)) {
             last_spawn = Some(Instant::now());
             client::revive(&socket, restart);
         }
@@ -289,7 +302,7 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     let tx = Tx::new(socket.clone());
     let client = tx.home_client();
     let store = Store::for_socket(&socket)?;
-    let feed = spawn_feed(socket.clone(), "popup");
+    let feed = spawn_feed(socket.clone(), "popup", None);
     let history = tx
         .run(&["show-options", "-gqv", "@home-preview-history"])
         .ok()
