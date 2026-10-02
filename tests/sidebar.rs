@@ -70,7 +70,7 @@ fn wait_screen_gone(s: &TestServer, pane: &str, re: &str) {
 }
 
 /// A second sidebar process in `window`, started the way a pane
-/// tmux-resurrect restored runs it: unmarked, it marks itself.
+/// tmux-resurrect restored runs it (`--managed`): unmarked, it marks itself.
 fn unmarked_sidebar(s: &TestServer, window: &str) -> String {
     s.tmux(&[
         "split-window",
@@ -83,7 +83,7 @@ fn unmarked_sidebar(s: &TestServer, window: &str) -> String {
         "#{pane_id}",
         "/bin/sh",
         "-c",
-        "\"$0\" sidebar; exit",
+        "\"$0\" sidebar --managed; exit",
         BIN,
     ])
     .trim()
@@ -153,20 +153,30 @@ fn session_toggle_turns_on_where_lacking_then_off_and_leaves_other_sessions() {
     assert_eq!(sidebars(&s, "beta:0").len(), 1, "beta's still there");
 }
 
+/// Auto-create's start-up gate, shortened: no minimum age, windows and
+/// panes unchanged for 300 ms. Set before the daemon starts (it reads
+/// the server's global environment).
+fn quick_gate(s: &TestServer) {
+    s.tmux(&["set-environment", "-g", "TMUX_HOME_AUTO_MIN_AGE", "0"]);
+    s.tmux(&["set-environment", "-g", "TMUX_HOME_AUTO_STABLE_MS", "300"]);
+}
+
 #[test]
 fn auto_create_adds_to_new_windows_except_excluded_sessions_once() {
     let _env = TestEnv::new();
     let s = TestServer::start();
     s.tmux(&["set-option", "-g", "@home-sidebar-auto", "on"]);
     s.tmux(&["set-option", "-g", "@home-sidebar-exclude", "scratch other"]);
-    install_binding(&s); // the daemon; the server is fresh, so alpha:0 is new
-    wait_until("a sidebar in alpha:0", || {
-        sidebars(&s, "alpha:0").len() == 1
-    });
+    quick_gate(&s);
+    install_binding(&s);
+    std::thread::sleep(Duration::from_millis(1500)); // allowed by now
+    assert!(sidebars(&s, "alpha:0").is_empty(), "pre-existing");
     s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "two"]);
     wait_until("a sidebar in alpha:1", || {
         sidebars(&s, "alpha:1").len() == 1
     });
+    let side = sidebars(&s, "alpha:1")[0].clone();
+    assert_eq!(fmt(&s, &side, "#{pane_active}"), "0", "never focused");
     s.tmux(&[
         "new-session",
         "-d",
@@ -183,16 +193,18 @@ fn auto_create_adds_to_new_windows_except_excluded_sessions_once() {
     std::thread::sleep(Duration::from_millis(1500)); // three polls
     assert!(sidebars(&s, "scratch:0").is_empty(), "excluded");
     assert!(sidebars(&s, "scratch:1").is_empty(), "excluded");
-    assert_eq!(sidebars(&s, "alpha:0").len(), 1, "never two");
+    assert!(sidebars(&s, "alpha:0").is_empty());
     assert!(sidebars(&s, "alpha:1").is_empty(), "decided once");
     assert_eq!(panes(&s, "alpha:1").len(), 1);
 }
 
 #[test]
-fn auto_create_is_off_by_default_and_ignores_windows_older_than_the_daemon() {
+fn auto_create_is_off_by_default_and_decides_each_window_once() {
     let _env = TestEnv::new();
     let s = TestServer::start();
+    quick_gate(&s);
     install_binding(&s);
+    std::thread::sleep(Duration::from_millis(1500));
     s.tmux(&["new-window", "-d", "-t", "alpha:"]);
     std::thread::sleep(Duration::from_millis(1200));
     assert!(sidebars(&s, "alpha:1").is_empty(), "off by default");
@@ -204,6 +216,40 @@ fn auto_create_is_off_by_default_and_ignores_windows_older_than_the_daemon() {
     });
     assert!(sidebars(&s, "alpha:0").is_empty());
     assert!(sidebars(&s, "alpha:1").is_empty());
+}
+
+/// A young server gets no auto-created sidebars, and with continuum's
+/// restore on none until resurrect's post-restore hook says it's done.
+#[test]
+fn auto_create_waits_for_server_age_and_the_restore() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    s.tmux(&["set-option", "-g", "@home-sidebar-auto", "on"]);
+    s.tmux(&["set-environment", "-g", "TMUX_HOME_AUTO_STABLE_MS", "300"]);
+    // default minimum age (30 s): this server is seconds old
+    install_binding(&s);
+    std::thread::sleep(Duration::from_millis(1000));
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(sidebars(&s, "alpha:1").is_empty(), "too young");
+    drop(s);
+
+    let s = TestServer::start();
+    s.tmux(&["set-option", "-g", "@home-sidebar-auto", "on"]);
+    s.tmux(&["set-option", "-g", "@continuum-restore", "on"]);
+    quick_gate(&s);
+    install_binding(&s);
+    std::thread::sleep(Duration::from_millis(1000));
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(sidebars(&s, "alpha:1").is_empty(), "restoring");
+    s.tmux(&["set-option", "-g", "@home_restore_done", "1"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(sidebars(&s, "alpha:1").is_empty(), "made while restoring");
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    wait_until("a sidebar in alpha:2", || {
+        sidebars(&s, "alpha:2").len() == 1
+    });
 }
 
 #[test]
@@ -269,7 +315,11 @@ fn a_sidebar_marks_itself_and_resurrect_would_save_it() {
         .filter_map(|l| l.strip_prefix(&format!("{pid} ")))
         .map(str::to_string)
         .collect();
-    assert_eq!(saved, [format!("{BIN} sidebar")], "what resurrect saves");
+    assert_eq!(
+        saved,
+        [format!("{BIN} sidebar --managed")],
+        "what resurrect saves"
+    );
     assert!(
         regex::Regex::new("(tmux-home sidebar)")
             .unwrap()
@@ -295,7 +345,13 @@ fn a_restored_sidebar_runs_in_a_shell_and_q_closes_its_pane() {
         ])
         .trim()
         .to_string();
-    s.tmux(&["send-keys", "-t", &pane, &format!("{BIN} sidebar"), "Enter"]);
+    s.tmux(&[
+        "send-keys",
+        "-t",
+        &pane,
+        &format!("{BIN} sidebar --managed"),
+        "Enter",
+    ]);
     wait_until("self-marked", || {
         fmt(&s, &pane, "#{@home_role}") == "sidebar"
     });
@@ -442,4 +498,228 @@ fn the_sidebar_renders_live_agent_and_badge_changes() {
     ]);
     wait_screen_gone(&s, &side, r"NEEDS YOU");
     wait_screen(&s, &side, r"^ 2s 3w · 1 running$");
+}
+
+/// Run by hand in a working pane, a sidebar marks nothing, and `q` exits
+/// it, leaving the pane and its shell.
+#[test]
+fn a_sidebar_run_by_hand_is_not_managed() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    let pane = panes(&s, "alpha:0")[0].clone();
+    s.tmux(&["send-keys", "-t", &pane, &format!("{BIN} sidebar"), "Enter"]);
+    wait_screen(&s, &pane, r"^─ alpha ─");
+    assert_eq!(fmt(&s, &pane, "#{@home_role}"), "");
+    s.tmux(&["send-keys", "-t", &pane, "q"]);
+    s.tmux(&["send-keys", "-t", &pane, "echo STILL-HERE", "Enter"]);
+    wait_screen(&s, &pane, r"^STILL-HERE");
+    assert_eq!(panes(&s, "alpha:0"), [pane]);
+}
+
+/// A sidebar in a server that is starting up doesn't start the daemon
+/// (the plugin does that later on purpose); it reads tmux directly.
+#[test]
+fn a_sidebar_in_a_young_server_does_not_start_the_daemon() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    toggle(&s, &["--window", "alpha:0"]);
+    let side = sidebars(&s, "alpha:0")[0].clone();
+    wait_screen(&s, &side, r"^ ○ 1s 1w");
+    std::thread::sleep(Duration::from_millis(2500));
+    let sock = tmux_home::paths::Paths::for_socket(&s.socket).unwrap().sock;
+    assert!(!sock.exists(), "no daemon yet");
+    // once the daemon exists, it subscribes
+    install_binding(&s);
+    wait_screen(&s, &side, r"^ 1s 1w");
+    drop(s);
+    // past that age it starts one itself
+    let s = TestServer::start();
+    s.tmux(&["set-environment", "-g", "TMUX_HOME_SIDEBAR_REVIVE_AGE", "0"]);
+    toggle(&s, &["--window", "alpha:0"]);
+    let side = sidebars(&s, "alpha:0")[0].clone();
+    wait_screen(&s, &side, r"^ 1s 1w");
+}
+
+/// A restored sidebar keeps the width it was saved with; the daemon sets
+/// it to `@home-sidebar-width` when it first sees it.
+#[test]
+fn a_sidebar_first_seen_is_resized_to_the_configured_width() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    install_binding(&s);
+    let pane = s
+        .tmux(&[
+            "split-window",
+            "-d",
+            "-h",
+            "-b",
+            "-l",
+            "50",
+            "-t",
+            "alpha:0",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "/bin/sh",
+            "-c",
+            "\"$0\" sidebar --managed; exit",
+            BIN,
+        ])
+        .trim()
+        .to_string();
+    wait_until("resized to 32", || fmt(&s, &pane, "#{pane_width}") == "32");
+}
+
+/// tmux-resurrect's scripts, if installed (the test is skipped without).
+fn resurrect_scripts() -> Option<std::path::PathBuf> {
+    let d = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+        .join(".tmux/plugins/tmux-resurrect/scripts");
+    d.join("restore.sh").exists().then_some(d)
+}
+
+/// Per window `session:index`: (pane count, sidebar count, the active
+/// pane is a sidebar, the sidebars' left edge and width).
+fn layout(s: &TestServer) -> Vec<(String, usize, usize, bool, Vec<String>)> {
+    let mut out = Vec::new();
+    for w in s
+        .tmux(&[
+            "list-windows",
+            "-a",
+            "-F",
+            "#{session_name}:#{window_index}",
+        ])
+        .lines()
+    {
+        let rows = s.tmux(&[
+            "list-panes",
+            "-t",
+            w,
+            "-F",
+            "#{@home_role}|#{pane_active}|#{pane_left}x#{pane_width}",
+        ]);
+        let rows: Vec<Vec<&str>> = rows.lines().map(|l| l.split('|').collect()).collect();
+        let side: Vec<&Vec<&str>> = rows.iter().filter(|r| r[0] == "sidebar").collect();
+        out.push((
+            w.to_string(),
+            rows.len(),
+            side.len(),
+            rows.iter().any(|r| r[0] == "sidebar" && r[1] == "1"),
+            side.iter().map(|r| r[2].to_string()).collect(),
+        ));
+    }
+    out
+}
+
+/// A cold start that restores a resurrect save with sidebars in it, the
+/// daemon up from the first second and auto-create on: every window comes
+/// back as saved (no orphan or extra panes), one sidebar each at the left
+/// at its width, none focused; only windows made afterwards get a new one.
+/// HOME, the resurrect dir and tmux-home's dirs are all temporary.
+#[test]
+fn a_cold_start_restore_with_sidebars_comes_back_as_saved() {
+    let Some(scripts) = resurrect_scripts() else {
+        eprintln!("skipped: tmux-resurrect isn't installed");
+        return;
+    };
+    let _env = TestEnv::new();
+    let home = TempDir::new("home");
+    let dir = home.0.join("resurrect");
+    std::fs::create_dir_all(&dir).unwrap();
+    let envs: Vec<(&str, std::ffi::OsString)> = vec![
+        ("HOME", home.0.clone().into()),
+        ("XDG_DATA_HOME", home.0.join("share").into()),
+        ("XDG_STATE_HOME", home.0.join("state").into()),
+        ("XDG_CONFIG_HOME", home.0.join("config").into()),
+    ];
+    let envs: Vec<(&str, &std::ffi::OsStr)> =
+        envs.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
+    let resurrect_opts = |s: &TestServer| {
+        s.tmux(&["set-option", "-g", "@resurrect-dir", dir.to_str().unwrap()]);
+        s.tmux(&[
+            "set-option",
+            "-g",
+            "@resurrect-processes",
+            "\"~tmux-home sidebar\"",
+        ]);
+    };
+
+    // server A: main (3 windows, one split) with sidebars, scratch without
+    let a = TestServer::start_with(&envs);
+    a.tmux(&["rename-session", "-t", "alpha", "main"]);
+    a.tmux(&["new-window", "-d", "-t", "main:"]);
+    a.tmux(&["split-window", "-d", "-t", "main:1"]);
+    a.tmux(&["new-window", "-d", "-t", "main:"]);
+    a.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "scratch",
+        "-x",
+        "200",
+        "-y",
+        "50",
+    ]);
+    toggle(&a, &["--session", "--window", "main:0"]);
+    for w in ["main:0", "main:1", "main:2"] {
+        let side = sidebars(&a, w)[0].clone();
+        wait_screen(&a, &side, r"^─ main ─");
+    }
+    resurrect_opts(&a);
+    let saved = layout(&a);
+    let o = Outer::attach(&a, "main:0", 200, 50);
+    let r = a.tmux(&[
+        "run-shell",
+        &format!("{}/save.sh quiet 2>&1; echo rc=$?", scripts.display()),
+    ]);
+    assert!(r.contains("rc=0"), "{r}");
+    drop(o);
+    let last = std::fs::read_to_string(dir.join("last")).unwrap();
+    assert_eq!(
+        last.matches("tmux-home sidebar --managed").count(),
+        3,
+        "{last}"
+    );
+    drop(a);
+
+    // server B: a cold start, the daemon at once, auto-create on, restore
+    let b = TestServer::start_with(&envs);
+    b.tmux(&["rename-session", "-t", "alpha", "0"]);
+    resurrect_opts(&b);
+    b.tmux(&["set-option", "-g", "@home-sidebar-auto", "on"]);
+    b.tmux(&["set-option", "-g", "@continuum-restore", "on"]);
+    b.tmux(&[
+        "set-option",
+        "-g",
+        "@resurrect-hook-post-restore-all",
+        "tmux set -g @home_restore_done 1",
+    ]);
+    b.tmux(&["set-environment", "-g", "TMUX_HOME_AUTO_MIN_AGE", "0"]);
+    b.tmux(&["set-environment", "-g", "TMUX_HOME_AUTO_STABLE_MS", "300"]);
+    b.tmux(&["set-environment", "-g", "TMUX_HOME_SIDEBAR_REVIVE_AGE", "0"]);
+    install_binding(&b);
+    let o = Outer::attach(&b, "0", 200, 50);
+    let r = b.tmux(&[
+        "run-shell",
+        &format!("{}/restore.sh 2>&1; echo rc=$?", scripts.display()),
+    ]);
+    assert!(r.contains("rc=0"), "{r}");
+    assert_eq!(fmt(&b, "main:0", "#{@home_restore_done}"), "1");
+    wait_until("the restored sidebars started", || {
+        ["main:0", "main:1", "main:2"]
+            .iter()
+            .all(|w| sidebars(&b, w).len() == 1)
+    });
+    std::thread::sleep(Duration::from_millis(2000)); // daemon passes
+    assert_eq!(layout(&b), saved, "restored as saved");
+    for (w, _, n, focused, geo) in &saved {
+        if w.starts_with("main") {
+            assert_eq!(*n, 1, "{w}");
+            assert!(!focused, "{w}");
+            assert_eq!(geo, &["0x32".to_string()], "{w}");
+        }
+    }
+    // from now on new windows get one
+    b.tmux(&["new-window", "-d", "-t", "main:"]);
+    wait_until("a sidebar in main:3", || sidebars(&b, "main:3").len() == 1);
+    drop(o);
 }

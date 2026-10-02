@@ -62,8 +62,15 @@ pub fn neutral_cwd() -> PathBuf {
 impl TestServer {
     /// A throwaway server with one detached 200x50 session "alpha" running /bin/sh.
     pub fn start() -> TestServer {
+        TestServer::start_with(&[])
+    }
+
+    /// `start`, with these environment variables set for the server (and
+    /// so for its panes and run-shell jobs), e.g. an isolated `HOME`.
+    pub fn start_with(env: &[(&str, &std::ffi::OsStr)]) -> TestServer {
         let name = format!("th-test-{}-{}", std::process::id(), rand_suffix());
         let out = Command::new("tmux")
+            .envs(env.iter().map(|(k, v)| (*k, *v)))
             .args([
                 "-L",
                 &name,
