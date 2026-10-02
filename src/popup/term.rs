@@ -47,10 +47,20 @@ impl MouseGuard {
     }
 }
 
+impl MouseGuard {
+    /// Mouse reporting off now (idempotent: the drop after it writes
+    /// nothing). For exits that leave the alternate screen before the
+    /// guard drops (`⏎`'s switch).
+    pub fn off() {
+        if MOUSE_ON.swap(false, Ordering::SeqCst) {
+            mouse_off(&mut std::io::stdout());
+        }
+    }
+}
+
 impl Drop for MouseGuard {
     fn drop(&mut self) {
-        MOUSE_ON.store(false, Ordering::SeqCst);
-        mouse_off(&mut std::io::stdout());
+        MouseGuard::off();
     }
 }
 

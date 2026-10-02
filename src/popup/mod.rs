@@ -190,6 +190,9 @@ impl Runtime {
             Action::None | Action::Redraw => {}
             Action::Quit => return false,
             Action::Switch { sid, wid, pane } => {
+                // mouse off before leaving the alternate screen and before
+                // tmux shows the target window
+                term::MouseGuard::off();
                 ratatui::restore();
                 let _ = self.tx.switch_to(self.client.as_deref(), &sid, &wid);
                 if let Some(p) = pane {

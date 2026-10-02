@@ -125,6 +125,11 @@ fn a_2000_line_capture_is_cheap() {
 /// everything it writes to its terminal into the returned file, with
 /// `TMUX_HOME_TEST_PANIC=<at>`. Returns the file and the window.
 fn recorded_popup(s: &TestServer, at: &str) -> (std::path::PathBuf, String) {
+    recorded_popup_for(s, at, "")
+}
+
+/// `recorded_popup` for `client` (`TMUX_HOME_CLIENT`; "" = none).
+fn recorded_popup_for(s: &TestServer, at: &str, client: &str) -> (std::path::PathBuf, String) {
     let out = std::env::temp_dir().join(format!("th-tty-{}-{}", std::process::id(), rand_suffix()));
     let bin = env!("CARGO_BIN_EXE_tmux-home");
     let sock = s.socket.display().to_string();
@@ -145,9 +150,30 @@ fn recorded_popup(s: &TestServer, at: &str) -> (std::path::PathBuf, String) {
         "alpha:",
         "-e",
         &format!("TMUX_HOME_TEST_PANIC={at}"),
+        "-e",
+        &format!("TMUX_HOME_CLIENT={client}"),
         &script,
     ]);
     (out, w.trim().to_string())
+}
+
+/// Mouse reporting was turned on, then every mode crossterm enabled
+/// (1000, 1002, 1003, 1015, 1006) off again before the alternate screen
+/// was left.
+fn assert_mouse_off_before_leaving(tty: &str) {
+    let on = tty
+        .find("\x1b[?1000h")
+        .unwrap_or_else(|| panic!("mouse never on: {tty:?}"));
+    let leave = tty[on..]
+        .find("\x1b[?1049l")
+        .map(|i| i + on)
+        .unwrap_or_else(|| panic!("never left the alt screen: {tty:?}"));
+    for m in ["1000", "1002", "1003", "1015", "1006"] {
+        assert!(
+            tty[on..leave].contains(&format!("\x1b[?{m}l")),
+            "?{m}l not before ?1049l: {tty:?}"
+        );
+    }
 }
 
 fn pane_dead(s: &TestServer, w: &str) -> bool {
@@ -165,17 +191,7 @@ fn a_panic_turns_the_mouse_off() {
     wait_until("the popup to panic and exit", || pane_dead(&s, &w));
     let tty = String::from_utf8_lossy(&std::fs::read(&out).unwrap()).into_owned();
     let _ = std::fs::remove_file(&out);
-    let on = tty
-        .find("\x1b[?1000h")
-        .unwrap_or_else(|| panic!("mouse never on: {tty:?}"));
-    let off = tty[on..].find("\x1b[?1000l").map(|i| i + on);
-    let off = off.unwrap_or_else(|| panic!("mouse never off after on: {tty:?}"));
-    assert!(tty[off..].contains("\x1b[?1006l"), "{tty:?}");
-    let leave = tty[on..]
-        .find("\x1b[?1049l")
-        .map(|i| i + on)
-        .expect("left the alt screen");
-    assert!(off < leave, "mouse off before ratatui's restore: {tty:?}");
+    assert_mouse_off_before_leaving(&tty);
     assert!(
         tty.contains("TMUX_HOME_TEST_PANIC=loop"),
         "the panic is still reported: {tty:?}"
@@ -210,4 +226,32 @@ fn a_parse_panic_is_silent() {
         tty[on..].contains("\x1b[?1000l"),
         "mouse off on Esc: {tty:?}"
     );
+}
+
+/// ⏎ (switch) turns mouse reporting off before leaving the alternate
+/// screen (and before tmux switches), and the switch happens.
+#[test]
+fn switch_turns_the_mouse_off_first() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    s.tmux(&["new-window", "-d", "-t", "alpha:5", "-n", "target"]);
+    let o = Outer::attach(&s, "alpha:0", 200, 50);
+    let client = s.tmux(&["list-clients", "-F", "#{client_name}"]);
+    let (out, w) = recorded_popup_for(&s, "none", client.trim());
+    let screen = || s.tmux(&["capture-pane", "-p", "-t", &w]);
+    wait_until("the popup", || screen().contains("F1 help"));
+    s.tmux(&["send-keys", "-t", &w, "-l", "target"]);
+    wait_until("the target selected", || {
+        screen()
+            .lines()
+            .any(|l| l.starts_with('▌') && l.contains("target"))
+    });
+    s.tmux(&["send-keys", "-t", &w, "Enter"]);
+    wait_until("the popup to exit", || pane_dead(&s, &w));
+    let tty = String::from_utf8_lossy(&std::fs::read(&out).unwrap()).into_owned();
+    let _ = std::fs::remove_file(&out);
+    assert_mouse_off_before_leaving(&tty);
+    // the switch: the client shows the target now
+    wait_until("the client on target", || client_at(&s) == "alpha:target");
+    drop(o);
 }
