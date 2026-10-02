@@ -69,8 +69,7 @@ fn feed_loop(socket: PathBuf, client: &'static str, tx: mpsc::Sender<Feed>) {
     loop {
         // live: subscribe until the daemon goes away
         let since = Instant::now();
-        let restart = match client::ask(&socket, &client::subscribe_req(client), SUBSCRIBE_BUDGET)
-        {
+        let restart = match client::ask(&socket, &client::subscribe_req(client), SUBSCRIBE_BUDGET) {
             Answer::Snapshot {
                 epoch,
                 seq,

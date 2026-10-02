@@ -73,8 +73,18 @@ fn wait_screen_gone(s: &TestServer, pane: &str, re: &str) {
 /// tmux-resurrect restored runs it: unmarked, it marks itself.
 fn unmarked_sidebar(s: &TestServer, window: &str) -> String {
     s.tmux(&[
-        "split-window", "-d", "-h", "-t", window, "-P", "-F", "#{pane_id}", "/bin/sh", "-c",
-        "\"$0\" sidebar; exit", BIN,
+        "split-window",
+        "-d",
+        "-h",
+        "-t",
+        window,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "/bin/sh",
+        "-c",
+        "\"$0\" sidebar; exit",
+        BIN,
     ])
     .trim()
     .to_string()
@@ -150,10 +160,23 @@ fn auto_create_adds_to_new_windows_except_excluded_sessions_once() {
     s.tmux(&["set-option", "-g", "@home-sidebar-auto", "on"]);
     s.tmux(&["set-option", "-g", "@home-sidebar-exclude", "scratch other"]);
     install_binding(&s); // the daemon; the server is fresh, so alpha:0 is new
-    wait_until("a sidebar in alpha:0", || sidebars(&s, "alpha:0").len() == 1);
+    wait_until("a sidebar in alpha:0", || {
+        sidebars(&s, "alpha:0").len() == 1
+    });
     s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "two"]);
-    wait_until("a sidebar in alpha:1", || sidebars(&s, "alpha:1").len() == 1);
-    s.tmux(&["new-session", "-d", "-s", "scratch", "-x", "200", "-y", "50"]);
+    wait_until("a sidebar in alpha:1", || {
+        sidebars(&s, "alpha:1").len() == 1
+    });
+    s.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "scratch",
+        "-x",
+        "200",
+        "-y",
+        "50",
+    ]);
     s.tmux(&["new-window", "-d", "-t", "scratch:"]);
     // a toggled-off sidebar stays off
     toggle(&s, &["--window", "alpha:1"]);
@@ -176,7 +199,9 @@ fn auto_create_is_off_by_default_and_ignores_windows_older_than_the_daemon() {
     // turned on later: only windows made from then on
     s.tmux(&["set-option", "-g", "@home-sidebar-auto", "on"]);
     s.tmux(&["new-window", "-d", "-t", "alpha:"]);
-    wait_until("a sidebar in alpha:2", || sidebars(&s, "alpha:2").len() == 1);
+    wait_until("a sidebar in alpha:2", || {
+        sidebars(&s, "alpha:2").len() == 1
+    });
     assert!(sidebars(&s, "alpha:0").is_empty());
     assert!(sidebars(&s, "alpha:1").is_empty());
 }
@@ -245,7 +270,11 @@ fn a_sidebar_marks_itself_and_resurrect_would_save_it() {
         .map(str::to_string)
         .collect();
     assert_eq!(saved, [format!("{BIN} sidebar")], "what resurrect saves");
-    assert!(regex::Regex::new("(tmux-home sidebar)").unwrap().is_match(&saved[0]));
+    assert!(
+        regex::Regex::new("(tmux-home sidebar)")
+            .unwrap()
+            .is_match(&saved[0])
+    );
 }
 
 #[test]
@@ -254,7 +283,16 @@ fn a_restored_sidebar_runs_in_a_shell_and_q_closes_its_pane() {
     let s = TestServer::start();
     // what resurrect does on restore: a shell, the saved command typed in
     let pane = s
-        .tmux(&["split-window", "-d", "-h", "-t", "alpha:0", "-P", "-F", "#{pane_id}"])
+        .tmux(&[
+            "split-window",
+            "-d",
+            "-h",
+            "-t",
+            "alpha:0",
+            "-P",
+            "-F",
+            "#{pane_id}",
+        ])
         .trim()
         .to_string();
     s.tmux(&["send-keys", "-t", &pane, &format!("{BIN} sidebar"), "Enter"]);
@@ -264,7 +302,10 @@ fn a_restored_sidebar_runs_in_a_shell_and_q_closes_its_pane() {
     wait_screen(&s, &pane, r"^─ alpha ─");
     s.tmux(&["send-keys", "-t", &pane, "x", "Enter", "j"]);
     std::thread::sleep(Duration::from_millis(300));
-    assert!(panes(&s, "alpha:0").contains(&pane), "other keys are ignored");
+    assert!(
+        panes(&s, "alpha:0").contains(&pane),
+        "other keys are ignored"
+    );
     s.tmux(&["send-keys", "-t", &pane, "q"]);
     wait_until("the pane closed, shell and all", || {
         !panes(&s, "alpha:0").contains(&pane)
@@ -296,7 +337,10 @@ fn the_popup_and_close_rules_ignore_sidebar_panes() {
     assert_eq!(row.pane.as_deref(), Some(main.as_str()));
     assert_eq!(rows.len(), 2, "one row per window");
     let sp = snap.panes.iter().find(|p| p.id == side).unwrap();
-    assert_eq!((sp.role.as_str(), sp.home_role.as_str()), ("sidebar", "sidebar"));
+    assert_eq!(
+        (sp.role.as_str(), sp.home_role.as_str()),
+        ("sidebar", "sidebar")
+    );
     // tmux-agent-sidebar's marker still counts
     s.tmux(&["set-option", "-p", "-t", &side, "-u", "@home_role"]);
     s.tmux(&["set-option", "-p", "-t", &side, "@pane_role", "sidebar"]);
@@ -315,7 +359,9 @@ fn prefix_e_and_shift_e_toggle_through_the_binding() {
     install_binding(&s);
     let o = Outer::attach(&s, "alpha:0", 120, 30);
     o.keys(&["C-b", "e"]);
-    wait_until("a sidebar in alpha:0", || sidebars(&s, "alpha:0").len() == 1);
+    wait_until("a sidebar in alpha:0", || {
+        sidebars(&s, "alpha:0").len() == 1
+    });
     assert!(sidebars(&s, "alpha:1").is_empty());
     o.keys(&["C-b", "E"]);
     wait_until("one in alpha:1", || sidebars(&s, "alpha:1").len() == 1);
@@ -338,9 +384,24 @@ fn the_sidebar_renders_live_agent_and_badge_changes() {
     let s = TestServer::start();
     s.tmux(&["rename-window", "-t", "alpha:0", "home"]);
     s.tmux(&[
-        "new-window", "-d", "-t", "alpha:", "-n", "app", "-c", repo.to_str().unwrap(),
+        "new-window",
+        "-d",
+        "-t",
+        "alpha:",
+        "-n",
+        "app",
+        "-c",
+        repo.to_str().unwrap(),
     ]);
-    s.tmux(&["new-session", "-d", "-s", "beta", "-n", "agent", &fake_claude()]);
+    s.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "beta",
+        "-n",
+        "agent",
+        &fake_claude(),
+    ]);
     install_binding(&s);
     toggle(&s, &["--window", "alpha:0"]);
     let side = sidebars(&s, "alpha:0")[0].clone();
@@ -363,8 +424,22 @@ fn the_sidebar_renders_live_agent_and_badge_changes() {
     wait_screen(&s, &side, r"^   permission");
     wait_screen(&s, &side, r"^ .*· 1 waiting$");
     // answered: running, and NEEDS YOU goes
-    s.tmux(&["set-option", "-p", "-t", "beta:agent.0", "@pane_status", "running"]);
-    s.tmux(&["set-option", "-p", "-t", "beta:agent.0", "@pane_attention", "clear"]);
+    s.tmux(&[
+        "set-option",
+        "-p",
+        "-t",
+        "beta:agent.0",
+        "@pane_status",
+        "running",
+    ]);
+    s.tmux(&[
+        "set-option",
+        "-p",
+        "-t",
+        "beta:agent.0",
+        "@pane_attention",
+        "clear",
+    ]);
     wait_screen_gone(&s, &side, r"NEEDS YOU");
     wait_screen(&s, &side, r"^ 2s 3w · 1 running$");
 }

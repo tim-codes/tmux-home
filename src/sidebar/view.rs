@@ -46,7 +46,10 @@ fn rule(label: &str, width: usize, style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled("─ ", dim()),
         Span::styled(label, style),
-        Span::styled(format!(" {}", "─".repeat(width.saturating_sub(used))), dim()),
+        Span::styled(
+            format!(" {}", "─".repeat(width.saturating_sub(used))),
+            dim(),
+        ),
     ])
 }
 
@@ -94,10 +97,16 @@ fn needs_lines(e: &Entry, width: usize) -> [Line<'static>; 2] {
     );
     let reason = e.reason.clone().unwrap_or_default();
     [
-        Line::from(vec![Span::raw(" "), icon(e), Span::styled(format!(" {head}"), st)]),
+        Line::from(vec![
+            Span::raw(" "),
+            icon(e),
+            Span::styled(format!(" {head}"), st),
+        ]),
         Line::styled(
             format!("   {}", clip(&reason, width.saturating_sub(3))),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
         ),
     ]
 }

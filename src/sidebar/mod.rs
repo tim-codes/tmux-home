@@ -62,7 +62,10 @@ impl Placement {
     }
 
     pub fn read(t: &Tmux) -> Placement {
-        Placement::from_options(&global_option(t, "@home-sidebar-width"), &global_option(t, "@home-sidebar-side"))
+        Placement::from_options(
+            &global_option(t, "@home-sidebar-width"),
+            &global_option(t, "@home-sidebar-side"),
+        )
     }
 }
 
@@ -94,9 +97,7 @@ pub fn sidebar_bin() -> PathBuf {
 /// which `"~tmux-home sidebar"` in `@resurrect-processes` matches. The
 /// `; exit` keeps `sh` from exec'ing the binary in its place.
 pub fn split_args(window: &str, p: &Placement, bin: &Path) -> Vec<String> {
-    let mut a: Vec<String> = ["split-window", "-d", "-f", "-h"]
-        .map(String::from)
-        .into();
+    let mut a: Vec<String> = ["split-window", "-d", "-f", "-h"].map(String::from).into();
     if p.left {
         a.push("-b".into());
     }
@@ -133,7 +134,12 @@ fn panes(t: &Tmux, target: &str, session: bool) -> anyhow::Result<Vec<(String, S
     if session {
         args.push("-s");
     }
-    args.extend(["-t", target, "-F", "#{window_id}\x1f#{pane_id}\x1f#{@home_role}"]);
+    args.extend([
+        "-t",
+        target,
+        "-F",
+        "#{window_id}\x1f#{pane_id}\x1f#{@home_role}",
+    ]);
     Ok(t.run(&args)?
         .lines()
         .filter_map(|l| {
@@ -188,7 +194,11 @@ pub fn decide(panes: &[(String, String, bool)]) -> Toggle {
 /// sidebar in the target window (default: the one `$TMUX_PANE` is in), or
 /// with `--session` in every window of that window's session — on if any
 /// window lacks one, else off. Never touches another session.
-pub fn toggle(socket: Option<PathBuf>, session: bool, window: Option<String>) -> anyhow::Result<()> {
+pub fn toggle(
+    socket: Option<PathBuf>,
+    session: bool,
+    window: Option<String>,
+) -> anyhow::Result<()> {
     let socket = client::current_socket(socket)
         .ok_or_else(|| anyhow::anyhow!("not inside tmux and no --socket"))?;
     let t = Tmux::new(socket);
@@ -199,7 +209,13 @@ pub fn toggle(socket: Option<PathBuf>, session: bool, window: Option<String>) ->
             .filter(|p| !p.is_empty())
             .ok_or_else(|| anyhow::anyhow!("no --window and no $TMUX_PANE"))?,
     };
-    let ids = t.run(&["display-message", "-p", "-t", &target, "#{session_id}\x1f#{window_id}"])?;
+    let ids = t.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        &target,
+        "#{session_id}\x1f#{window_id}",
+    ])?;
     let (sid, wid) = ids
         .trim_end()
         .split_once('\x1f')
@@ -275,7 +291,9 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
                     Event::Key(k)
                         if k.kind != KeyEventKind::Release
                             && k.code == KeyCode::Char('q')
-                            && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            && !k
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                     {
                         // the pane, not just this process: a pane
                         // resurrect restored runs us in a shell
@@ -302,7 +320,10 @@ mod tests {
 
     #[test]
     fn one_window_toggles() {
-        assert_eq!(decide(&[p("@1", "%1", false)]), Toggle::Add(vec!["@1".into()]));
+        assert_eq!(
+            decide(&[p("@1", "%1", false)]),
+            Toggle::Add(vec!["@1".into()])
+        );
         assert_eq!(
             decide(&[p("@1", "%2", true), p("@1", "%1", false)]),
             Toggle::Remove(vec!["%2".into()])
@@ -349,8 +370,22 @@ mod tests {
         assert_eq!(
             a,
             [
-                "split-window", "-d", "-f", "-h", "-b", "-l", "32", "-t", "@3", "-P", "-F",
-                "#{pane_id}", "/bin/sh", "-c", "\"$0\" sidebar; exit", "/p/tmux-home"
+                "split-window",
+                "-d",
+                "-f",
+                "-h",
+                "-b",
+                "-l",
+                "32",
+                "-t",
+                "@3",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "/bin/sh",
+                "-c",
+                "\"$0\" sidebar; exit",
+                "/p/tmux-home"
             ]
         );
         let right = Placement {
