@@ -438,6 +438,14 @@ so test servers never touch the real one; `TMUX_HOME_STATE_DIR` overrides):
 
 Writes are atomic (write + rename) under a store lock (`state.lock`), separate from the daemon's instance lock, so a degraded-mode popup can write safely.
 
+**Amendment (pass 7).** `agents.json`: the Claude Code sessions running when
+resurrect last saved, by `session:window.pane` (written by `tmux-home
+agents-snapshot` from resurrect's post-save hook, temp + rename; one writer
+at a time in practice, a race only replaces it whole), read by `tmux-home
+restore-agents` after a restore. `restore.log` beside it. The live record
+is the panes' own `@home_*` options, not a file. See the iteration plan's
+pass 7.
+
 ## 10. Install and build
 
 - TPM plugin as now. `tmux-home.tmux` binds keys and starts the daemon; it

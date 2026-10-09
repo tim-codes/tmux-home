@@ -68,12 +68,48 @@ Exit: daily use shows agent status.
 - The sidebar process sets `@home_role=sidebar` on its own `$TMUX_PANE`. Dotfiles adds `"~tmux-home sidebar"` to `@resurrect-processes`, so resurrect restores it. No `sidebars.json`; this replaces spec §8's "replace restored shells" plan.
 - Then the dotfiles cutover PR (spec §11).
 
+## Pass 7: resume Claude sessions after a reboot (single implementer)
+
+Scope widened by the user: SPEC §10 listed persistence/restore and launching agents as non-goals; agent
+*resume* (never launching a new agent) is now an explicit, opt-in goal (`@home-restore-agents on`).
+
+- **Record: pane options, not a sidecar file.** The hook already writes the pane's `@home_*` in one
+  `set-option` batch; SessionStart, UserPromptSubmit and Stop (main context only) add
+  `@home_transcript`, `@home_cwd` (launch directory: taken at SessionStart, or when the pane's session
+  changed without one, since Claude's `cwd` follows `cd`s in Bash calls) and `@home_config_dir` (the
+  hook's inherited `$CLAUDE_CONFIG_DIR`, the account; unset = default). Options are atomic (tmux
+  serialises them), race-free across panes, die with the server (so no pruning, no stale pane IDs
+  from a previous boot) and SessionEnd's teardown already wipes them. Not in the daemon's poll format.
+- **Snapshot at save** (`tmux-home agents-snapshot`, `@resurrect-hook-post-save-all`): pane IDs don't
+  survive a restore, so the record is saved under `session:window.pane` from the layout resurrect has
+  just saved, to `<state dir>/agents.json` (temp + rename). Only panes whose `pane_current_command`
+  is Claude (`AgentKind::Claude.looks_alive`) at that moment are saved. That, not SessionEnd's
+  `reason`, decides "don't resume what the user exited": an exited, crashed or killed session leaves
+  the pane at a shell (or running something else) by the next save, whether or not SessionEnd fired;
+  SessionEnd (any reason) clears the options too. A pane `restore-agents` claimed whose claude hasn't
+  recorded itself yet keeps its previous entry, so a save during a restore loses nothing.
+- **Restore** (`tmux-home restore-agents`, `@resurrect-hook-post-restore-all`, before
+  `@home_restore_done`): once per server (`@home_agents_restored`). Claims (`@home_restore`) each
+  saved pane that is a fish/POSIX shell prompt, not in a mode, in the saved directory, with the
+  transcript and launch directory on disk; logs every skip to `<state dir>/restore.log`. A detached
+  worker types `cd <cwd> && env [-u] CLAUDE_CONFIG_DIR[=<dir>] claude --resume <id>` into each
+  (re-checked first; marks `@home_restore_typed`), one per `@home-restore-agents-delay` (default 2 s).
+  `env` bypasses a shell function named `claude`. Values are single-quoted so fish and POSIX shells
+  read them alike (`'` and `\` escaped outside the quotes).
+- `claude --help` (2.1.295) documents `--resume <session id>` only, so the id is used, not the
+  transcript path; `cd` first anyway: project settings, CLAUDE.md and the transcript's project dir
+  follow the cwd.
+
+Exit: unit tests for record, snapshot, matching, quoting (through fish/bash/zsh/sh/dash) and skip
+rules; `tests/restore.rs` end to end on a throwaway server with a fake `claude`.
+
 ## Spec amendments carried by this plan
 
 - Spec §8, resurrect: use self-marking plus `@resurrect-processes`, as in pass 6.
 - Spec §5, transition: read `@pane_*` first (pass 4); `@home_*` hooks come second (pass 5).
 - Spec §6, refresh: git runs off the poll path and pushes are coalesced; scan results persist.
 - Spec §3, handshake: compare a build ID, not only the package version.
+- SPEC §10, non-goals: resuming Claude sessions after a resurrect restore is an opt-in goal (pass 7).
 
 ## Known caveat (shared with bash, not fixed)
 
