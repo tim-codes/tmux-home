@@ -4,17 +4,30 @@ A full-window home screen for tmux: every session and window in one popup,
 with rename, reorder, close and reopen, and you stay in it until you choose
 where to go.
 
-> **Status: R1.** A Rust popup (ratatui) on top of a per-server daemon:
-> grouped window list, type-first fuzzy filter, preview, `⏎` switch, inline
-> `^r` rename, `M-r` auto-name, `^x` close with an inline confirm, `^t`
-> reopen, `M-↑`/`M-↓` reorder and `M-n` new window, plus read-only agent
-> awareness (pass 4: status, NEEDS YOU, `^g`, filter tokens, agent card) from
-> [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s pane
-> options, and (pass 5a) from tmux-home's own Claude Code hooks, which run
-> alongside the sidebar's, and (pass 5b) git badges on window rows from the
-> daemon, and (pass 6) a read-only sidebar on `prefix e`/`E`. The repos
-> view comes in a later milestone; see
-> [`docs/superpowers/specs/2026-09-29-rust-daemon-design.md`](docs/superpowers/specs/2026-09-29-rust-daemon-design.md) §13.
+## Features
+
+- **Popup home screen** (`prefix .`): every session and window, grouped,
+  with a type-first fuzzy filter and a live, coloured preview of the
+  selected pane. Switch, rename inline, reorder, create, close (with a
+  confirm when something is still running) and reopen closed windows, all
+  without leaving the popup.
+- **Coding-agent awareness**: Claude Code sessions show their status
+  (running, waiting, idle, error, background) and run time on their window's
+  row; windows waiting on you are pinned under **NEEDS YOU**, and `^g` jumps
+  to the next one. Fed by tmux-home's own Claude Code hooks, or read-only
+  from [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s
+  pane options.
+- **Git badges**: branch, dirty state, ahead/behind, stashes, stray branches
+  and operations in progress for each window's repo, computed read-only in
+  the background.
+- **Sidebar** (`prefix e` / `prefix E`): a narrow, read-only, always-on view
+  of the same state for one window or a whole session.
+- **tmux-resurrect integration**: sidebars come back after a restore, and
+  (opt-in) Claude Code sessions are resumed in the panes they ran in.
+
+A small per-server daemon (one Rust binary) keeps the state; the popup and
+sidebar subscribe to it, and fall back to reading tmux directly if it is
+down.
 
 ## Why
 
@@ -26,47 +39,81 @@ where to go.
 - Agent sidebars show what Claude Code / Codex are doing, but not alongside
   window management.
 
-tmux-home puts the overview, the management and (soon) the agent state in
-one place.
+tmux-home puts the overview, the management and the agent state in one
+place.
+
+## Requirements
+
+- **tmux 3.3 or newer** (developed on 3.7c).
+- **macOS**: developed and used daily on macOS. **Linux is untested**: the
+  code has Linux paths (it reads `/proc`, and keeps the commands tmux
+  runs through `/bin/sh` working under dash), but it has not been run
+  there yet. Reports welcome.
+- **A Rust toolchain** (`cargo`) to build it: the plugin builds itself
+  from source on first load. `rust-toolchain.toml` pins the `stable`
+  channel; the crate uses edition 2024.
+- **git** for the badges (developed on 2.50); optional.
+- Optional: [Claude Code](https://github.com/anthropics/claude-code) for
+  agent status, and [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect)
+  / [tmux-continuum](https://github.com/tmux-plugins/tmux-continuum).
 
 ## Install
 
-With [TPM](https://github.com/tmux-plugins/tpm):
+With [TPM](https://github.com/tmux-plugins/tpm), in `~/.tmux.conf`:
 
 ```tmux
 set -g @plugin 'tim-codes/tmux-home'
-# set -g @home-keys '.'   # prefix keys to bind (default); '' binds nothing
-# set -g @home-preview-history 2000   # scrollback lines the preview captures
-# set -g @home-sidebar-keys 'e E'     # sidebar: window, session ('' = none)
-# set -g @home-sidebar-width 32       # columns, or a percentage (20%)
-# set -g @home-sidebar-side left      # or right
-# set -g @home-sidebar-auto off       # on: a sidebar in every new window
-# set -g @home-sidebar-exclude ''     # sessions auto-create skips (space-separated)
-# set -g @home-restore-agents off     # on: resume Claude Code sessions after a restore
-# set -g @home-restore-agents-delay 2 # seconds between resumed sessions
 ```
+
+Then `prefix I` to install. On its first load the plugin runs
+`cargo build --release` in the background (output in
+`~/.tmux/plugins/tmux-home/target/build.log`); until that finishes, the key
+shows a `tmux-home: not built yet` message instead of the popup. No reload is
+needed once the build is done. After a TPM update (`prefix U`), rebuild with
+`cargo build --release` in the plugin directory.
+
+Without TPM: clone the repo, run `cargo build --release` in it, and add
+`run-shell ~/path/to/tmux-home/tmux-home.tmux` to your config.
+
+## Quick start
+
+1. Install as above and wait for the build (a minute or so).
+2. `prefix .` opens the popup. Type to filter, `↑`/`↓` to move, `⏎` to
+   switch, `F1` for help, `Esc` to close.
+3. `prefix e` toggles the sidebar in the current window.
+4. For agent status, add the [Claude Code hooks](#claude-code-hooks).
+
+## Configuration
+
+All options are global (`set -g`) and read when the plugin loads or the
+feature runs. Shown with their defaults:
+
+```tmux
+set -g @home-keys '.'               # prefix keys for the popup; '' binds nothing
+set -g @home-preview-history 2000   # scrollback lines the preview captures (0: screen only)
+set -g @home-sidebar-keys 'e E'     # sidebar: this window, whole session ('' = none, '-' skips one)
+set -g @home-sidebar-width 32       # columns, or a percentage (20%)
+set -g @home-sidebar-side left      # or right
+set -g @home-sidebar-auto off       # on: a sidebar in every new window
+set -g @home-sidebar-exclude ''     # sessions auto-create skips (space-separated)
+set -g @home-restore-agents off     # on: resume Claude Code sessions after a restore
+set -g @home-restore-agents-delay 2 # seconds between resumed sessions
+```
+
+State (the closed-window stack, logs) lives in
+`${XDG_STATE_HOME:-~/.local/state}/tmux-home/<server key>/`, one directory
+per tmux server; `TMUX_HOME_STATE_DIR` overrides the root.
+
+## How it runs
 
 The plugin finds tmux by absolute path (the running server's own binary,
 then `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, then `PATH`), so it
 works from a login with a minimal `PATH`.
 
-Or clone it and add `run-shell ~/path/to/tmux-home/tmux-home.tmux`.
-
-## Build
-
-The popup and daemon are one Rust binary, `target/release/tmux-home`:
-
-```sh
-cargo build --release
-```
-
-If the plugin loads before it is built, it starts that build in the
-background, writing its output to `target/build.log`. Only one build runs at
-a time: reloading the config while it runs starts no other. Until the build
-finishes, the key shows a one-line `tmux-home: not built yet …` message
-naming that log instead of the popup; without `cargo` on `PATH` no build is
-started and the message says so. A build that finishes later is picked up on
-the next key press, with no reload. Rebuild after pulling an update.
+The popup and daemon are one Rust binary, `target/release/tmux-home`.
+Only one background build runs at a time: reloading the config while it
+runs starts no other. Without `cargo` on `PATH` no build is started and the
+key's message says so.
 
 Loading the plugin also starts the daemon, one per tmux server, 10 seconds
 later (`TMUX_HOME_DAEMON_DELAY`); it exits with the server. The delay is for
@@ -76,7 +123,7 @@ tmux by its absolute path, so its commands never look like that. A popup or
 sidebar opened sooner starts the daemon itself. The popup subscribes to it for live updates. If the daemon
 is down, the popup reads tmux itself (the header shows `(direct)`) and starts
 a new daemon in the background. The daemon's errors go to
-`<state root>/<server key>/daemon.log` (see below), moved to `daemon.log.1`
+`<state root>/<server key>/daemon.log` (see [Configuration](#configuration)), moved to `daemon.log.1`
 once it reaches 1 MB.
 
 Each client tells the daemon its build (the version plus the git commit, and
@@ -229,7 +276,10 @@ poll picks the options up), and it always exits 0, silently and in about
 
 Wire it in Claude Code's settings (`~/.claude/settings.json` or a
 project's `.claude/settings.json`), merged into any `hooks` you already
-have. The event names are Claude Code's, and the command's event must
+have. The snippet assumes TPM's default plugin directory
+(`~/.tmux/plugins/tmux-home`); adjust the path if yours differs. Claude
+Code is the only agent with hooks built in; other agents (Codex, …) show up
+only through tmux-agent-sidebar's pane options, if you run it. The event names are Claude Code's, and the command's event must
 match the key it sits under. Each command ends in `>/dev/null 2>&1 ||
 true` and has a 5-second timeout, so a missing or out-of-date binary can
 never get in Claude's way: Claude Code treats a hook's exit 2 as "block"
@@ -551,17 +601,12 @@ popup's binding can be pressed and the popup read back with `capture-pane`),
 with temporary state and runtime dirs, and start every window in the temp
 dir. They never touch your tmux server. Git tests use throwaway repos and
 run git with `GIT_CONFIG_GLOBAL=/dev/null` (no signing, no hooks).
-[`docs/superpowers/notes/r1-parity.md`](docs/superpowers/notes/r1-parity.md)
-maps each check of the retired bash suite to the test that replaced it.
 
-## Requirements
+## License
 
-tmux ≥ 3.3 (developed on 3.7c), git for the badges (developed on 2.50), and a
-Rust toolchain to build (`rust-toolchain.toml`).
-
-## Licence
-
-MIT. The git layer is vendored from
-[stray](https://github.com/tim-codes/stray) (MIT) and borrows ideas from
-[worktrunk](https://github.com/max-sixty/worktrunk) (MIT OR Apache-2.0); see
-[`NOTICE`](NOTICE).
+[MIT](LICENSE). The git layer is vendored from
+[stray](https://github.com/tim-codes/stray) (MIT), the Claude Code hook
+handling is adapted from
+[tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar) (MIT),
+and some ideas come from [worktrunk](https://github.com/max-sixty/worktrunk)
+(MIT OR Apache-2.0); see [`NOTICE`](NOTICE).
