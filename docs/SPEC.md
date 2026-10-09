@@ -266,6 +266,8 @@ Only what the primary user needs; more when someone asks.
 | --- | --- |
 | `@home-keys` | `w f` (space-separated prefix keys; empty = bind nothing) |
 | `@home-preview` | `auto` (`right`, `bottom`, `off`) |
+| `@home-restore-agents` | `off` (`on`: resume Claude Code sessions after a resurrect restore, §12) |
+| `@home-restore-agents-delay` | `2` (seconds between resumed launches) |
 
 Colours: terminal's default foreground/background plus the 16 ANSI colours,
 so it follows whatever theme the terminal has.
@@ -273,8 +275,16 @@ so it follows whatever theme the terminal has.
 ## 10. Non-goals
 
 - Sending prompts or keystrokes to agents; approving permissions.
-- Launching agents (claude-hatch `prefix y`).
-- Session persistence/restore (resurrect/continuum).
+- Launching agents (claude-hatch `prefix y`). Resuming one after a reboot
+  is the single exception (below); a new agent is never started.
+- Session persistence/restore (resurrect/continuum): tmux-resurrect saves
+  and restores the layout. tmux-home only cooperates with it: sidebars
+  restore themselves, and, as an explicit opt-in goal (pass 7,
+  `@home-restore-agents on`), a pane that was running a Claude Code session
+  when resurrect last saved comes back running `claude --resume <that
+  session>` in its directory and account. Resume only: never a new
+  session, never a pane that wasn't running one, never one the user
+  exited.
 - Replacing the sidebar: the sidebar is the always-on glance, tmux-home the
   on-demand full view.
 - Mouse support beyond what comes free.
@@ -322,6 +332,17 @@ this section, and §7, §8, §10 and §13 where they conflict.
   snapshot's `git` section: repo root → status, pane cwd → root. Git runs
   read-only, with a timeout and at most 4 at once; nothing git-related runs
   on the tmux poll's path.
+- Agent restore (pass 7, `src/restore.rs`; opt-in). The Claude hook keeps
+  each pane's session in its options (`@home_session_id`,
+  `@home_transcript`, `@home_cwd`, `@home_config_dir`). `tmux-home
+  agents-snapshot`, run by resurrect after each save, writes the panes
+  running Claude at that moment to `<state dir>/agents.json` by
+  `session:window.pane`. `tmux-home restore-agents`, run by resurrect after
+  a restore, once per server, types `cd <cwd> && env [-u]
+  CLAUDE_CONFIG_DIR[=<dir>] claude --resume <id>` into each restored pane
+  that is at a shell prompt in the saved directory and whose transcript
+  still exists, one every `@home-restore-agents-delay` seconds from a
+  detached process.
 
 **Install:** a TPM plugin. `tmux-home.tmux` binds `@home-keys` (default `.`)
 and starts the daemon; without a built binary the key shows a one-line

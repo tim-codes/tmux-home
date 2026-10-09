@@ -75,8 +75,20 @@ fn run(args: &[String]) {
             Err(e) => return log(&format!("bad JSON: {e}")),
         }
     };
+    let config_dir = ad
+        .config_env()
+        .and_then(|k| std::env::var(k).ok())
+        .filter(|v| !v.is_empty());
     let t = Tmux::new(socket);
-    if let Err(e) = apply_event(&t, &pane, ad, event, &payload, crate::agent::now()) {
+    if let Err(e) = apply_event(
+        &t,
+        &pane,
+        ad,
+        event,
+        &payload,
+        config_dir,
+        crate::agent::now(),
+    ) {
         log(&format!("{pane}: {e:#}"));
     }
 }
@@ -90,9 +102,13 @@ pub fn apply_event(
     ad: &dyn AgentAdapter,
     event: &str,
     payload: &serde_json::Value,
+    config_dir: Option<String>,
     now: u64,
 ) -> anyhow::Result<()> {
-    let prior = read_prior(t, pane)?;
+    let prior = Prior {
+        config_dir,
+        ..read_prior(t, pane)?
+    };
     let changes = stamped(ad.on_hook(event, payload, &prior, now), now);
     write(t, pane, &changes)
 }
@@ -100,15 +116,16 @@ pub fn apply_event(
 /// The pane's subagent list, known background shells and wait state, in
 /// one call: tmux-agent-sidebar's `@pane_bg_cmd` (set by its PostToolUse
 /// hook, cleared by its refresh sweep), `@home_bg_cmd` (from the last
-/// Stop's `background_tasks`), and `@home_status` / `@home_attention` /
-/// `@home_wait_reason`.
+/// Stop's `background_tasks`), `@home_status` / `@home_attention` /
+/// `@home_wait_reason`, and `@home_session_id`. (`config_dir` comes from
+/// the environment, not the pane: left `None`.)
 pub fn read_prior(t: &Tmux, pane: &str) -> anyhow::Result<Prior> {
     let out = t.run(&[
         "display-message",
         "-p",
         "-t",
         pane,
-        "#{@home_subagents}\x1f#{@pane_bg_cmd}\x1f#{@home_bg_cmd}\x1f#{@home_status}\x1f#{@home_attention}\x1f#{@home_wait_reason}",
+        "#{@home_subagents}\x1f#{@pane_bg_cmd}\x1f#{@home_bg_cmd}\x1f#{@home_status}\x1f#{@home_attention}\x1f#{@home_wait_reason}\x1f#{@home_session_id}",
     ])?;
     let out = out.strip_suffix('\n').unwrap_or(&out);
     let mut f = out.split('\x1f').map(|v| v.trim().to_string());
@@ -119,6 +136,8 @@ pub fn read_prior(t: &Tmux, pane: &str) -> anyhow::Result<Prior> {
         status: f.next().unwrap_or_default(),
         attention: f.next().unwrap_or_default(),
         wait_reason: f.next().unwrap_or_default(),
+        session_id: f.next().unwrap_or_default(),
+        config_dir: None,
     })
 }
 
@@ -157,9 +176,14 @@ pub fn write_args(pane: &str, changes: &[Change]) -> Vec<String> {
     a
 }
 
-/// Appends a line to `<state_dir>/hook.log` (state dir created 0700),
-/// rotating it to `hook.log.1` at `LOG_CAP`. Errors are dropped.
+/// Appends a line to `<state_dir>/hook.log`; see `append_log`.
 fn log(socket: &Path, msg: &str) {
+    append_log(socket, "hook.log", msg);
+}
+
+/// Appends a timestamped line to `<state_dir>/<name>` (state dir created
+/// 0700), rotating it to `<name>.1` at `LOG_CAP`. Errors are dropped.
+pub fn append_log(socket: &Path, name: &str, msg: &str) {
     let _ = (|| -> std::io::Result<()> {
         let dir = crate::paths::Paths::for_socket(socket)
             .map_err(std::io::Error::other)?
@@ -171,10 +195,8 @@ fn log(socket: &Path, msg: &str) {
                 .mode(0o700)
                 .create(&dir)?;
         }
-        let path = dir.join("hook.log");
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() >= LOG_CAP) {
-            std::fs::rename(&path, dir.join("hook.log.1"))?;
-        }
+        let path = dir.join(name);
+        crate::client::rotate_log(&path, LOG_CAP);
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

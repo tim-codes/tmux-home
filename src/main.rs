@@ -72,6 +72,23 @@ enum Cmd {
         /// The event name, as the agent calls it (`Stop`).
         event: String,
     },
+    /// Save the panes running Claude Code under their `session:window.pane`
+    /// (for `@resurrect-hook-post-save-all`). Always exits 0.
+    AgentsSnapshot {
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
+    /// Resume the saved Claude Code sessions in the panes resurrect
+    /// restored (for `@resurrect-hook-post-restore-all`; needs
+    /// `@home-restore-agents on`). Once per server; returns at once, the
+    /// launches are staggered in the background. Always exits 0.
+    RestoreAgents {
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+        /// The background half (started by the command itself).
+        #[arg(long, hide = true)]
+        worker: bool,
+    },
     /// R0 spike: measure control-mode side effects on a server and print a report.
     SpikeControl {
         #[arg(long)]
@@ -98,6 +115,10 @@ fn main() -> anyhow::Result<()> {
             socket,
         } => return tmux_home::sidebar::toggle(socket, session, window),
         Cmd::Query { socket, json: _ } => return tmux_home::client::query(socket),
+        Cmd::AgentsSnapshot { socket } => return tmux_home::restore::snapshot_cli(socket),
+        Cmd::RestoreAgents { socket, worker } => {
+            return tmux_home::restore::restore_cli(socket, worker);
+        }
         Cmd::Reopen { socket } => {
             let code = tmux_home::popup::reopen_cli(socket)?;
             std::process::exit(code);
@@ -114,6 +135,8 @@ fn main() -> anyhow::Result<()> {
         | Cmd::Query { .. }
         | Cmd::Sidebar { .. }
         | Cmd::SidebarToggle { .. }
+        | Cmd::AgentsSnapshot { .. }
+        | Cmd::RestoreAgents { .. }
         | Cmd::Hook { .. } => {
             unreachable!()
         }

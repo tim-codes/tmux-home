@@ -42,6 +42,8 @@ set -g @plugin 'tim-codes/tmux-home'
 # set -g @home-sidebar-side left      # or right
 # set -g @home-sidebar-auto off       # on: a sidebar in every new window
 # set -g @home-sidebar-exclude ''     # sessions auto-create skips (space-separated)
+# set -g @home-restore-agents off     # on: resume Claude Code sessions after a restore
+# set -g @home-restore-agents-delay 2 # seconds between resumed sessions
 ```
 
 The plugin finds tmux by absolute path (the running server's own binary,
@@ -482,6 +484,51 @@ so it saves `<path>/tmux-home sidebar --managed`, which `~tmux-home sidebar`
 (a substring match) restores by typing it into the restored shell. The
 sidebar then marks its own pane, so nothing else is needed; `q` on a
 restored one closes the whole pane.
+
+#### Resuming Claude Code sessions
+
+Opt-in: after a reboot, resurrect restores every pane as a plain shell;
+with this, a pane that was running a Claude Code session when resurrect
+last saved comes back running `claude --resume <that session>`, in the
+session's directory and account. It only resumes: it never starts a new
+session, and never touches a pane that wasn't running one.
+
+```tmux
+set -g @home-restore-agents on
+set -g @resurrect-hook-post-save-all '~/.tmux/plugins/tmux-home/target/release/tmux-home agents-snapshot'
+set -g @resurrect-hook-post-restore-all '~/.tmux/plugins/tmux-home/target/release/tmux-home restore-agents; tmux set -g @home_restore_done 1'
+```
+
+(the second line replaces the post-restore hook above; `restore-agents`
+returns at once). It needs tmux-home's Claude Code hooks (above) in every
+account whose sessions should come back: SessionStart, UserPromptSubmit
+and Stop record the session's id, transcript, directory and account
+(`$CLAUDE_CONFIG_DIR`) in the pane's `@home_*` options.
+
+- **Save.** After each resurrect save, `agents-snapshot` writes the panes
+  running Claude at that moment, by `session:window.pane`, to
+  `<state root>/<server key>/agents.json`. A session you exited (or that
+  crashed) has left its pane by then, so it isn't saved.
+- **Restore.** After a restore, once per tmux server, `restore-agents`
+  takes each saved pane that is back at a shell prompt (fish, bash, zsh,
+  sh, …) in the saved directory, and whose transcript still exists
+  (Claude Code deletes old ones, `cleanupPeriodDays`), and types
+
+  ```sh
+  cd '<dir>' && env CLAUDE_CONFIG_DIR='<account>' claude --resume <id>
+  ```
+
+  (`env -u CLAUDE_CONFIG_DIR` for the default account) into it, one every
+  `@home-restore-agents-delay` seconds (default 2) from a background
+  process, so a dozen sessions don't start their MCP servers at once.
+  `env` runs the `claude` on `PATH`, not a shell function of that name.
+  Exiting claude leaves you at the shell. Every skip, and every resume, is
+  logged to `restore.log` beside `agents.json`; a second restore on the
+  same server (`prefix C-r`) types nothing.
+
+Don't add claude to `@resurrect-processes` as well. A long idle session
+may open at Claude Code's "resume from summary?" question instead of its
+prompt; nothing is sent to the API until you answer it.
 
 ### Moving from tmux-agent-sidebar
 
