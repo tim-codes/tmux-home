@@ -163,6 +163,24 @@ fn meta(w: &mut Writes, p: &Value) {
     w.set_or_unset(Key::WorktreeBranch, branch);
 }
 
+/// The resume keys (pass 7; `crate::restore`): for the main context of
+/// an event that names a session, its transcript, its launch directory and
+/// the account (the hook's `$CLAUDE_CONFIG_DIR`). `cwd` follows Claude's
+/// working directory, which a `cd` in a Bash tool call moves, so it is
+/// taken at SessionStart, or when the pane's session changed without one
+/// (a SessionEnd wiped the options, or the record predates pass 7).
+fn resume_meta(w: &mut Writes, p: &Value, prior: &Prior, session_start: bool) {
+    let id = s(p, "session_id");
+    if from_subagent(p) || id.is_empty() {
+        return;
+    }
+    w.set_or_unset(Key::Transcript, s(p, "transcript_path"));
+    if session_start || prior.session_id != id {
+        w.set_or_unset(Key::Cwd, s(p, "cwd"));
+    }
+    w.set_or_unset(Key::ConfigDir, prior.config_dir.as_deref().unwrap_or(""));
+}
+
 /// `clear_run_state`.
 fn clear_run(w: &mut Writes) {
     w.unset(Key::RunStarted);
@@ -207,11 +225,16 @@ impl AgentAdapter for Claude {
         TOOL_EVENTS.contains(&event)
     }
 
+    fn config_env(&self) -> Option<&'static str> {
+        Some("CLAUDE_CONFIG_DIR")
+    }
+
     fn on_hook(&self, event: &str, p: &Value, prior: &Prior, now: u64) -> Vec<Change> {
         let mut w = Writes::new(prior);
         match event {
             "SessionStart" => {
                 meta(&mut w, p);
+                resume_meta(&mut w, p, prior, true);
                 w.unset(Key::Attention);
                 clear_run(&mut w);
                 w.unset(Key::Prompt);
@@ -231,6 +254,7 @@ impl AgentAdapter for Claude {
             }
             "UserPromptSubmit" if !from_subagent(p) => {
                 meta(&mut w, p);
+                resume_meta(&mut w, p, prior, false);
                 w.unset(Key::Attention);
                 w.status("running");
                 // `source` (2.1.284): the prompt is the user's only from
@@ -250,6 +274,7 @@ impl AgentAdapter for Claude {
             }
             "Stop" => {
                 meta(&mut w, p);
+                resume_meta(&mut w, p, prior, false);
                 w.unset(Key::Attention);
                 let msg = s(p, "last_assistant_message");
                 if !msg.is_empty() {
@@ -429,8 +454,100 @@ mod tests {
             status: find(Key::Status),
             attention: find(Key::Attention),
             wait_reason: find(Key::WaitReason),
+            session_id: find(Key::SessionId),
+            config_dir: None,
         };
         apply(start, &Claude.on_hook(event, payload, &prior, NOW))
+    }
+
+    /// `run` with the hook's `$CLAUDE_CONFIG_DIR` = `config_dir`.
+    fn run_in(
+        start: &[(Key, &str)],
+        config_dir: Option<&str>,
+        event: &str,
+        payload: &Value,
+    ) -> Opts {
+        let find = |k| {
+            start
+                .iter()
+                .find(|(x, _)| *x == k)
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default()
+        };
+        let prior = Prior {
+            session_id: find(Key::SessionId),
+            config_dir: config_dir.map(String::from),
+            ..Prior::default()
+        };
+        apply(start, &Claude.on_hook(event, payload, &prior, NOW))
+    }
+
+    const T1: &str =
+        "/home/user/.claude/projects/-home-user-project/00000000-0000-4000-8000-000000000001.jsonl";
+
+    #[test]
+    fn session_events_record_the_resume_keys() {
+        for (event, fx) in [
+            ("SessionStart", fixture!("session_start")),
+            ("UserPromptSubmit", fixture!("user_prompt_submit")),
+            ("Stop", fixture!("stop")),
+        ] {
+            let m = run_in(&[], Some("/home/user/.claude-work"), event, &fx);
+            assert_eq!(get(&m, Key::Transcript), Some(T1), "{event}");
+            assert_eq!(get(&m, Key::Cwd), Some("/home/user/project"), "{event}");
+            assert_eq!(
+                get(&m, Key::ConfigDir),
+                Some("/home/user/.claude-work"),
+                "{event}"
+            );
+            // the default account: no config dir recorded
+            let m = run_in(&[(Key::ConfigDir, "/old")], None, event, &fx);
+            assert_eq!(get(&m, Key::ConfigDir), None, "{event}");
+        }
+    }
+
+    #[test]
+    fn cwd_is_the_sessions_launch_directory() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut stop = fixture!("stop");
+        stop["cwd"] = json!("/home/user/project/sub");
+        // same session, Claude has cd'd: the launch directory stays
+        let m = run_in(
+            &[(Key::SessionId, id), (Key::Cwd, "/home/user/project")],
+            None,
+            "Stop",
+            &stop,
+        );
+        assert_eq!(get(&m, Key::Cwd), Some("/home/user/project"));
+        // a session the pane hasn't recorded: best known is the event's
+        let m = run_in(&[(Key::SessionId, "other")], None, "Stop", &stop);
+        assert_eq!(get(&m, Key::Cwd), Some("/home/user/project/sub"));
+        // SessionStart always takes it (a /clear's new session)
+        let mut start = fixture!("session_start_clear");
+        start["cwd"] = json!("/x");
+        let m = run_in(
+            &[(Key::SessionId, id), (Key::Cwd, "/y")],
+            None,
+            "SessionStart",
+            &start,
+        );
+        assert_eq!(get(&m, Key::Cwd), Some("/x"));
+    }
+
+    #[test]
+    fn subagents_never_touch_the_resume_keys() {
+        let start = [
+            (Key::SessionId, "parent"),
+            (Key::Transcript, "/t/parent.jsonl"),
+            (Key::Cwd, "/p"),
+        ];
+        let p = json!({"agent_id": "a", "session_id": "child", "transcript_path": "/t/child.jsonl", "cwd": "/c"});
+        for event in ["Stop", "UserPromptSubmit"] {
+            let m = run_in(&start, Some("/acct"), event, &p);
+            assert_eq!(get(&m, Key::Transcript), Some("/t/parent.jsonl"), "{event}");
+            assert_eq!(get(&m, Key::Cwd), Some("/p"), "{event}");
+            assert_eq!(get(&m, Key::ConfigDir), None, "{event}");
+        }
     }
 
     fn get(m: &Opts, k: Key) -> Option<&str> {
@@ -802,7 +919,11 @@ mod tests {
 
     #[test]
     fn session_end_clears_everything() {
-        let start: Vec<(Key, &str)> = Key::ALL.iter().map(|k| (*k, "x")).collect();
+        let start: Vec<(Key, &str)> = Key::ALL
+            .iter()
+            .chain(&Key::RESUME)
+            .map(|k| (*k, "x"))
+            .collect();
         let m = run(&start, "", "SessionEnd", &fixture!("session_end"));
         assert!(m.is_empty(), "{m:?}");
         assert!(derived(&m).is_none());

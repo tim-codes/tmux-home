@@ -40,6 +40,12 @@ pub enum Key {
     /// Unix seconds of the last hook write (set on every write that sets
     /// anything); how fresh these options are against the sidebar's.
     Updated,
+    /// Resume keys (pass 7), read by `crate::restore`, not by the popup:
+    /// the session's transcript file, its launch directory, and the
+    /// account (`$CLAUDE_CONFIG_DIR` of the hook; unset for the default).
+    Transcript,
+    Cwd,
+    ConfigDir,
 }
 
 impl Key {
@@ -60,6 +66,11 @@ impl Key {
         Key::Updated,
     ];
 
+    /// What `tmux-home restore-agents` needs to resume the pane's session
+    /// after a reboot (with `SessionId`). Not in `OPTIONS`: the daemon's
+    /// poll never reads them.
+    pub const RESUME: [Key; 3] = [Key::Transcript, Key::Cwd, Key::ConfigDir];
+
     pub fn option(self) -> &'static str {
         match self {
             Key::Agent => "@home_agent",
@@ -76,6 +87,9 @@ impl Key {
             Key::WorktreeBranch => "@home_worktree_branch",
             Key::SessionId => "@home_session_id",
             Key::Updated => "@home_updated",
+            Key::Transcript => "@home_transcript",
+            Key::Cwd => "@home_cwd",
+            Key::ConfigDir => "@home_config_dir",
         }
     }
 }

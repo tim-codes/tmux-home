@@ -31,6 +31,12 @@ pub struct Prior {
     pub status: String,
     pub attention: String,
     pub wait_reason: String,
+    /// `@home_session_id`: the session the pane last recorded.
+    pub session_id: String,
+    /// The agent's config directory from the hook's own environment
+    /// (`AgentAdapter::config_env`; the hook inherits the agent's), `None`
+    /// when unset or empty: which account the session belongs to.
+    pub config_dir: Option<String>,
 }
 
 pub trait AgentAdapter: Sync {
@@ -47,6 +53,12 @@ pub trait AgentAdapter: Sync {
     /// drains stdin without parsing it and passes an empty object.
     fn payload_unused(&self, _event: &str) -> bool {
         false
+    }
+
+    /// The environment variable that selects the agent's account (config
+    /// directory), passed to `on_hook` as `Prior::config_dir`.
+    fn config_env(&self) -> Option<&'static str> {
+        None
     }
 
     /// The changes `event` (with its stdin `payload`) makes to a pane in
@@ -112,9 +124,10 @@ impl Writes {
         }
     }
 
-    /// Every `@home_*` option unset (the SessionEnd teardown).
+    /// Every `@home_*` option unset (the SessionEnd teardown), the resume
+    /// keys included.
     pub fn clear_all(&mut self) {
-        for k in Key::ALL {
+        for k in Key::ALL.into_iter().chain(Key::RESUME) {
             self.unset(k);
         }
     }
