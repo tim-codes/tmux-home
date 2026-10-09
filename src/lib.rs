@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod ops;
 pub mod paths;
 pub mod popup;
+pub mod restore;
 pub mod sidebar;
 pub mod store;
 pub mod tmux;

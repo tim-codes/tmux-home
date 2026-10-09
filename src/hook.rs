@@ -176,9 +176,14 @@ pub fn write_args(pane: &str, changes: &[Change]) -> Vec<String> {
     a
 }
 
-/// Appends a line to `<state_dir>/hook.log` (state dir created 0700),
-/// rotating it to `hook.log.1` at `LOG_CAP`. Errors are dropped.
+/// Appends a line to `<state_dir>/hook.log`; see `append_log`.
 fn log(socket: &Path, msg: &str) {
+    append_log(socket, "hook.log", msg);
+}
+
+/// Appends a timestamped line to `<state_dir>/<name>` (state dir created
+/// 0700), rotating it to `<name>.1` at `LOG_CAP`. Errors are dropped.
+pub fn append_log(socket: &Path, name: &str, msg: &str) {
     let _ = (|| -> std::io::Result<()> {
         let dir = crate::paths::Paths::for_socket(socket)
             .map_err(std::io::Error::other)?
@@ -190,10 +195,8 @@ fn log(socket: &Path, msg: &str) {
                 .mode(0o700)
                 .create(&dir)?;
         }
-        let path = dir.join("hook.log");
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() >= LOG_CAP) {
-            std::fs::rename(&path, dir.join("hook.log.1"))?;
-        }
+        let path = dir.join(name);
+        crate::client::rotate_log(&path, LOG_CAP);
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
