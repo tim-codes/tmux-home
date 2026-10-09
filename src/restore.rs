@@ -246,13 +246,17 @@ pub fn command(e: &Entry) -> Result<String, String> {
     ))
 }
 
-/// Whether `e` can be resumed in pane `p` now: the pane is a live shell
-/// prompt (not in copy mode) in the saved directory, and the transcript
-/// and launch directory still exist (`exists`). The resume command, or
-/// why not. Claims are checked by the callers.
+/// Whether `e` can be resumed in pane `p`: the pane is live, in the saved
+/// directory, and the transcript and launch directory still exist
+/// (`exists`); when `typing`, also at a shell prompt and not in copy mode.
+/// (At claim time, right after the restore, a pane may still be running
+/// resurrect's `cat` of its saved contents before it execs the shell; the
+/// worker checks again just before it types.) The resume command, or why
+/// not. Claims are checked by the callers.
 pub fn check(
     e: &Entry,
     p: Option<&LivePane>,
+    typing: bool,
     exists: impl Fn(&Path) -> bool,
 ) -> Result<String, String> {
     let Some(p) = p else {
@@ -261,10 +265,10 @@ pub fn check(
     if p.dead {
         return Err("pane is dead".into());
     }
-    if p.in_mode {
+    if typing && p.in_mode {
         return Err("pane is in a mode".into());
     }
-    if !restorable_shell(&p.command) {
+    if typing && !restorable_shell(&p.command) {
         return Err(format!("pane runs {:?}, not a shell", p.command));
     }
     if p.path != e.path {
@@ -300,7 +304,7 @@ pub fn plan<'a>(
             let p = find(panes, e);
             let r = match p {
                 Some(p) if !p.claim.is_empty() || p.typed => Err("already restored".to_string()),
-                _ => check(e, p, &exists).map(|_| p.expect("checked")),
+                _ => check(e, p, false, &exists).map(|_| p.expect("checked")),
             };
             (e, r)
         })
@@ -480,7 +484,7 @@ fn run_worker(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
         let Some(p) = panes.iter().find(|p| ours(p)) else {
             continue;
         };
-        match check(e, Some(p), Path::exists) {
+        match check(e, Some(p), true, Path::exists) {
             Ok(cmd) => {
                 t.run(&[
                     "set-option",
@@ -739,8 +743,8 @@ mod tests {
         let e = entry();
         let ok = shell("%1", "main", 1, 0, "/w/api");
         let all = |_: &Path| true;
-        assert!(check(&e, Some(&ok), all).is_ok());
-        assert_eq!(check(&e, None, all).unwrap_err(), "no such pane");
+        assert!(check(&e, Some(&ok), true, all).is_ok());
+        assert_eq!(check(&e, None, true, all).unwrap_err(), "no such pane");
         let cases: [(LivePane, &str); 4] = [
             (
                 LivePane {
@@ -772,21 +776,32 @@ mod tests {
             ),
         ];
         for (p, why) in cases {
-            let err = check(&e, Some(&p), all).unwrap_err();
+            let err = check(&e, Some(&p), true, all).unwrap_err();
             assert!(err.contains(why), "{err}");
         }
         let no_transcript = |p: &Path| !p.to_string_lossy().ends_with(".jsonl");
         assert!(
-            check(&e, Some(&ok), no_transcript)
+            check(&e, Some(&ok), true, no_transcript)
                 .unwrap_err()
                 .contains("transcript gone")
         );
         let no_dir = |p: &Path| p != Path::new("/w/api");
         assert!(
-            check(&e, Some(&ok), no_dir)
+            check(&e, Some(&ok), true, no_dir)
                 .unwrap_err()
                 .contains("directory gone")
         );
+    }
+
+    #[test]
+    fn claims_before_the_shell_is_up_but_types_only_into_one() {
+        let e = entry();
+        let cat = LivePane {
+            command: "cat".into(),
+            ..shell("%1", "main", 1, 0, "/w/api")
+        };
+        assert!(check(&e, Some(&cat), false, |_| true).is_ok());
+        assert!(check(&e, Some(&cat), true, |_| true).is_err());
     }
 
     #[test]

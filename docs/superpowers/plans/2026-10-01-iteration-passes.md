@@ -90,9 +90,10 @@ Scope widened by the user: SPEC §10 listed persistence/restore and launching ag
   recorded itself yet keeps its previous entry, so a save during a restore loses nothing.
 - **Restore** (`tmux-home restore-agents`, `@resurrect-hook-post-restore-all`, before
   `@home_restore_done`): once per server (`@home_agents_restored`). Claims (`@home_restore`) each
-  saved pane that is a fish/POSIX shell prompt, not in a mode, in the saved directory, with the
-  transcript and launch directory on disk; logs every skip to `<state dir>/restore.log`. A detached
-  worker types `cd <cwd> && env [-u] CLAUDE_CONFIG_DIR[=<dir>] claude --resume <id>` into each
+  saved pane that exists in the saved directory, with the transcript and launch directory on disk;
+  logs every skip to `<state dir>/restore.log`. A detached worker checks each claimed pane again
+  (now also: at a fish/POSIX shell prompt, not in a mode; at claim time a pane may still be running
+  resurrect's `cat` of its saved contents) and types `cd <cwd> && env [-u] CLAUDE_CONFIG_DIR[=<dir>] claude --resume <id>` into each
   (re-checked first; marks `@home_restore_typed`), one per `@home-restore-agents-delay` (default 2 s).
   `env` bypasses a shell function named `claude`. Values are single-quoted so fish and POSIX shells
   read them alike (`'` and `\` escaped outside the quotes).
@@ -101,7 +102,8 @@ Scope widened by the user: SPEC §10 listed persistence/restore and launching ag
   follow the cwd.
 
 Exit: unit tests for record, snapshot, matching, quoting (through fish/bash/zsh/sh/dash) and skip
-rules; `tests/restore.rs` end to end on a throwaway server with a fake `claude`.
+rules; `tests/restore.rs` end to end on a throwaway server with a fake `claude`, and through
+tmux-resurrect's own save.sh/restore.sh (its hooks, `$TMUX`, a fresh server on the same socket).
 
 ## Spec amendments carried by this plan
 

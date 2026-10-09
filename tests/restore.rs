@@ -91,6 +91,38 @@ fn window(s: &TestServer, index: u32, dir: &Path, path: &str, cmd: Option<&str>)
     .to_string()
 }
 
+/// A fake `claude` in `<base>/bin` that appends `$PWD|$CLAUDE_CONFIG_DIR
+/// (or unset)|args` to `<base>/claude.log`; the bin dir and the log.
+fn fake_claude_cli(base: &Path) -> (PathBuf, PathBuf) {
+    let bin = base.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = base.join("claude.log");
+    let fake = bin.join("claude");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$PWD\" \"${{CLAUDE_CONFIG_DIR-unset}}\" \"$*\" >> '{}'\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, log)
+}
+
+/// A temp dir (canonical: tmux reports `/private/var/…` on macOS),
+/// removed on drop.
+fn temp_base(tag: &str) -> Dirs {
+    let base = std::env::temp_dir().canonicalize().unwrap().join(format!(
+        "th-{tag}-{}-{}",
+        std::process::id(),
+        common::rand_suffix()
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    Dirs { base }
+}
+
 fn payload(id: &str, transcript: &Path, cwd: &Path) -> String {
     serde_json::json!({
         "session_id": id,
@@ -118,21 +150,7 @@ fn sessions_are_resumed_in_their_directory_and_account() {
     };
     let (proj_a, proj_b, proj_c) = (mk("it's a"), mk("b"), mk("c"));
     let acct = mk("acct");
-    let bin = mk("bin");
-    let log = base.join("claude.log");
-    let fake = bin.join("claude");
-    std::fs::write(
-        &fake,
-        format!(
-            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$PWD\" \"${{CLAUDE_CONFIG_DIR-unset}}\" \"$*\" >> '{}'\n",
-            log.display()
-        ),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let (bin, log) = fake_claude_cli(&base);
     let transcript = |name: &str| {
         let p = base.join(format!("{name}.jsonl"));
         std::fs::write(&p, "{}\n").unwrap();
@@ -259,4 +277,127 @@ fn sessions_are_resumed_in_their_directory_and_account() {
         "back at the shell: {cmd}"
     );
     drop(dirs);
+}
+
+/// Through tmux-resurrect itself (skipped when it isn't installed): its
+/// save runs `agents-snapshot` from the post-save hook, the server goes
+/// away, a new one on the same socket restores, and the post-restore hook
+/// resumes the session. Hooks find the server from `$TMUX`, as in a real
+/// config.
+#[test]
+fn through_resurrect_save_and_restore() {
+    let scripts = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+        .join(".tmux/plugins/tmux-resurrect/scripts");
+    if !scripts.join("restore.sh").exists() {
+        eprintln!("skipped: tmux-resurrect isn't installed");
+        return;
+    }
+    let _env = TestEnv::new();
+    let dirs = temp_base("resurrect");
+    let base = dirs.base.clone();
+    let proj = base.join("proj");
+    let rdir = base.join("resurrect");
+    for d in [&proj, &rdir] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let (bin, log) = fake_claude_cli(&base);
+    let transcript = base.join("t.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let id = "00000000-0000-4000-8000-0000000000aa";
+    let envs = [("HOME", base.as_os_str())];
+    let setup = |s: &TestServer| {
+        s.tmux(&["set", "-g", "@resurrect-dir", rdir.to_str().unwrap()]);
+        s.tmux(&[
+            "set",
+            "-g",
+            "@resurrect-hook-post-save-all",
+            &format!("{BIN} agents-snapshot"),
+        ]);
+        s.tmux(&[
+            "set",
+            "-g",
+            "@resurrect-hook-post-restore-all",
+            &format!("{BIN} restore-agents; tmux set -g @home_restore_done 1"),
+        ]);
+        s.tmux(&["set", "-g", "@home-restore-agents", "on"]);
+        s.tmux(&["set", "-g", "@home-restore-agents-delay", "0.3"]);
+        // restored panes: a shell that can only find the fake claude
+        s.tmux(&[
+            "set",
+            "-g",
+            "default-command",
+            &format!("exec /usr/bin/env -i PATH='{path}' /bin/sh -i"),
+        ]);
+    };
+
+    let a = TestServer::start_with(&envs);
+    setup(&a);
+    let pane = window(&a, 1, &proj, &path, Some(&fake_claude()));
+    wait_until("fake claude running", || {
+        opt(&a, &pane, "pane_current_command") == "2.1.283"
+    });
+    hook(
+        &a,
+        &pane,
+        "SessionStart",
+        &payload(id, &transcript, &proj),
+        None,
+    );
+    let r = a.tmux(&[
+        "run-shell",
+        &format!("{}/save.sh quiet 2>&1; echo rc=$?", scripts.display()),
+    ]);
+    assert!(r.contains("rc=0"), "{r}");
+    let state = tmux_home::paths::Paths::for_socket(&a.socket)
+        .unwrap()
+        .state_dir;
+    let snap = std::fs::read_to_string(state.join("agents.json")).expect("snapshot saved");
+    assert!(snap.contains(id) && snap.contains("\"alpha\""), "{snap}");
+
+    // the "reboot": the same socket, a fresh server
+    let name = a.name.clone();
+    drop(a);
+    let out = Command::new("tmux")
+        .envs(envs)
+        .args([
+            "-L",
+            &name,
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-s",
+            "0",
+            "/bin/sh",
+        ])
+        .current_dir(common::neutral_cwd())
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let socket = Command::new("tmux")
+        .args(["-L", &name, "display", "-p", "#{socket_path}"])
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    let b = TestServer {
+        name,
+        socket: PathBuf::from(String::from_utf8(socket.stdout).unwrap().trim()),
+    };
+    setup(&b);
+    let r = b.tmux(&[
+        "run-shell",
+        &format!("{}/restore.sh 2>&1; echo rc=$?", scripts.display()),
+    ]);
+    assert!(r.contains("rc=0"), "{r}");
+    assert_eq!(opt(&b, "alpha:1", "@home_restore"), id, "claimed");
+    wait_until("resumed", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| !l.is_empty())
+    });
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        format!("{}|unset|--resume {id}\n", proj.display())
+    );
+    assert_eq!(opt(&b, "alpha:1", "@home_restore_typed"), "1");
 }
