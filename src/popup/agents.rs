@@ -1,4 +1,4 @@
-//! How agents look in the popup (SPEC §7): the status cell of a window row
+//! How agents look in the popup (SPEC §7): the state cells of the table
 //! and the agent card the preview shows. Status is always icon **and**
 //! word, never colour alone; a stale agent is dimmed and says `(ended?)`.
 
@@ -35,71 +35,23 @@ pub fn clip(s: &str, n: usize) -> String {
     }
 }
 
-/// The status cell of an agent window's row, in place of command + path:
-/// `● running    12m  claude ×2  feat/x (wt) +!  plan  <reason or prompt>`.
-/// `badge` is the git badge of the lead agent's repo (`popup::git`); without
-/// one, a worktree the agent reported shows as `(wt) <branch>`. The cell
-/// has `room` columns: the badge keeps whole pieces that fit after status,
-/// time and kind; what follows (mode, reason, prompt) is clipped by the row.
-pub fn row_cell(
-    a: &WindowAgents,
-    now: u64,
-    badge: Option<Vec<Span<'static>>>,
-    room: usize,
-) -> Vec<Span<'static>> {
-    let used = |v: &Vec<Span<'static>>| v.iter().map(Span::width).sum::<usize>();
-    let fit = |b: Option<Vec<Span<'static>>>, v: &Vec<Span<'static>>| {
-        b.map(|b| super::git::fit_badge(b, room.saturating_sub(used(v))))
-    };
-    let lead = a.lead();
-    let st = &lead.state;
-    let mut v = Vec::new();
-    if a.stale() {
-        v.push(Span::styled(
-            format!("  {} {} (ended?)", st.status.icon(), st.status.word()),
-            dim(),
-        ));
-        v.push(Span::styled(format!("  {}", st.kind.name()), dim()));
-        v.extend(fit(badge, &v).unwrap_or_default());
-        return v;
-    }
-    let s = st.status;
-    v.push(Span::styled(
-        format!("  {} {:<10}", s.icon(), s.word()),
-        status_style(s),
-    ));
-    let run = st.run_started.map(|t| elapsed(t, now)).unwrap_or_default();
-    v.push(Span::raw(format!(" {run:>5}")));
-    let n = a.live_count();
-    let count = if n > 1 {
-        format!(" ×{n}")
+/// An agent state cell: icon and word, coloured by status; a stale
+/// agent's dimmed, with `(ended?)`.
+pub fn state_span(s: Status, stale: bool) -> Span<'static> {
+    if stale {
+        Span::styled(format!("{} {} (ended?)", s.icon(), s.word()), dim())
     } else {
-        String::new()
-    };
-    v.push(Span::raw(format!("  {}{count}", st.kind.name())));
-    match (fit(badge, &v), &st.worktree) {
-        (Some(b), _) => v.extend(b),
-        (None, Some(wt)) => v.push(Span::styled(format!("  (wt) {}", wt.branch), dim())),
-        (None, None) => {}
+        Span::styled(format!("{} {}", s.icon(), s.word()), status_style(s))
     }
-    if st.permission_mode.as_deref() == Some("plan") {
-        v.push(Span::styled("  plan", Style::default().fg(Color::Cyan)));
-    }
-    if let Some(p) = a.needing() {
-        let why = p
-            .state
-            .wait_reason
-            .as_ref()
-            .map(|r| r.label())
-            .unwrap_or_else(|| "needs you".into());
-        v.push(Span::styled(
-            format!("  {}", clip(&why, 60)),
-            Style::default().fg(Color::Yellow),
-        ));
-    } else if let Some(p) = &st.prompt {
-        v.push(Span::styled(format!("  {}", clip(p, 60)), dim()));
-    }
-    v
+}
+
+/// Why `p` needs you: its wait reason, else `needs you`.
+pub fn need_reason(p: &PaneAgent) -> String {
+    p.state
+        .wait_reason
+        .as_ref()
+        .map(|r| r.label())
+        .unwrap_or_else(|| "needs you".into())
 }
 
 /// Greedy word wrap to `width` columns, at most `max` lines (the last

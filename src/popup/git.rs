@@ -1,6 +1,5 @@
-//! How git looks in the popup: the compact badge on a window row (and on an
-//! agent row, for the lead agent's worktree) and the git card in the
-//! preview. Symbols and their meaning: `crate::git::badge`. A stale status
+//! How git looks in the popup: the compact badge in a pane row's `GT`
+//! cell (and on the sidebar's lines) and the git card in the preview. Symbols and their meaning: `crate::git::badge`. A stale status
 //! (its last check timed out or failed) is drawn dimmed, ending in `~`.
 
 use super::app::short_path;
@@ -39,6 +38,16 @@ pub fn badge_spans(g: &RepoStatus) -> Vec<Span<'static>> {
             Span::styled(format!("{}{text}", if i == 0 { "  " } else { " " }), style)
         })
         .collect()
+}
+
+/// The badge as table-cell pieces: one space between them, none before
+/// the first.
+pub fn badge_pieces(g: &RepoStatus) -> Vec<Span<'static>> {
+    let mut v = badge_spans(g);
+    if let Some(first) = v.first_mut() {
+        first.content = first.content.trim_start().to_string().into();
+    }
+    v
 }
 
 /// The badge spans that fit in `room` columns: whole pieces, dropped from
