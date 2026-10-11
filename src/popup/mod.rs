@@ -620,7 +620,8 @@ fn shows_title(title: &str, host: &str) -> bool {
     !title.trim().is_empty() && title != host && title != short
 }
 
-/// The cells of a line, one per column (empty: nothing to show).
+/// The cells of a line, one per column (empty: nothing to show). A
+/// window row has only `#` and `NM`.
 fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; NCOLS] {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let r = &app.rows[it.row];
@@ -629,16 +630,8 @@ fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; NCOLS] {
     match it.pane {
         None => {
             set(Col::Idx, Span::raw(r.index.to_string()));
+            // nothing per-pane: the pane rows below say it
             set(Col::Name, Span::raw(r.name.clone()));
-            if let Some(a) = &r.agents {
-                set(
-                    Col::State,
-                    match a.status() {
-                        Some(s) => agents::state_span(s, false),
-                        None => agents::state_span(a.lead().state.status, true),
-                    },
-                );
-            }
         }
         Some(pi) => {
             let p = &r.panes[pi];
@@ -1500,15 +1493,18 @@ mod tests {
                 .position(|l| l.contains("─ NEEDS YOU ─"))
                 .unwrap();
             assert!(lines[needs + 1].contains("fix"), "{s}");
-            assert!(lines[needs + 1].contains("◐ waiting"), "{s}");
+            assert!(!lines[needs + 1].contains("◐ waiting"), "{s}");
             assert!(lines[needs + 2].contains("└ .0"), "{s}");
             assert!(!lines[needs + 2].contains("permission"), "no MS: {s}");
             assert!(lines[needs + 3].contains("─ dev ─"), "{s}");
-            // the window: its most urgent state; its panes: each one's
+            // the window row: just index and name; its panes: each one's
             // state and run time
             let api = line(&s, " api");
-            assert!(api.contains("● running"), "{s}");
-            assert!(!api.contains("claude ×2"), "no AG: {s}");
+            assert_eq!(
+                api.split_whitespace().collect::<Vec<_>>(),
+                ["1", "api"],
+                "{s}"
+            );
             assert!(!api.contains("12m"), "no run time on a window: {s}");
             let api_panes: Vec<&str> = lines
                 .iter()
@@ -1524,9 +1520,13 @@ mod tests {
             for p in &api_panes {
                 assert!(p.contains("● running") && p.contains("12m"), "{s}");
             }
-            assert!(line(&s, " old").contains("◐ waiting (ended?)"), "{s}");
+            assert!(line(&s, " old").ends_with("old"), "{s}");
+            assert!(
+                line(&s, "└ .0         fish").contains("◐ waiting (ended?)"),
+                "{s}"
+            );
             // the fix window is listed twice: pinned, and in its session
-            assert_eq!(s.matches(" fix ").count(), 2, "{s}");
+            assert_eq!(s.lines().filter(|l| l.ends_with(" fix")).count(), 2, "{s}");
             assert!(line(&s, "> ").ends_with("4/4"), "windows, not lines: {s}");
         }
         // no prompt on a pane row (the pane shows it)

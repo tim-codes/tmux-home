@@ -1355,9 +1355,9 @@ pub const COLUMNS: &str = "  columns         window row / pane row
   #               window index / ├ .N └ .N pane index
   NM              window name / pane title (blank: the host name)
   CM              — / the pane's command
-  ST              agent state, icon and word: the most urgent pane's /
-                  the pane's (● running ◐ waiting ✕ error ◎ background
-                  ○ idle; dim with (ended?): the agent has gone)
+  ST              — / the agent's state, icon and word (● running
+                  ◐ waiting ✕ error ◎ background ○ idle; dim with
+                  (ended?): the agent has gone)
   T               — / the agent's run time
   PA              — / the pane's directory
   GT              — / git badge of the pane's directory (below)";

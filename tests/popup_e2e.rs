@@ -409,7 +409,7 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
     let pinned = needs_you_rows(&screen);
     assert_eq!(pinned.len(), 1, "{screen}");
     assert!(
-        pinned[0].contains("agent") && pinned[0].contains("◐ waiting"),
+        pinned[0].contains("agent") && !pinned[0].contains("◐ waiting"),
         "{screen}"
     );
     assert!(
@@ -476,8 +476,13 @@ fn answered_while_its_pinned_copy_is_selected() {
     );
     o.wait_gone("NEEDS YOU");
     o.wait_cursor_on("agent");
-    let row = o.cursor_row().unwrap();
-    assert!(row.contains("● running"), "{row}");
+    let screen = o.screen();
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains(" .0") && l.contains("● running")),
+        "the state on its pane row:\n{screen}"
+    );
     assert_eq!(
         row_windows(&o.screen()),
         ["logs", "build", "agent"],
@@ -497,7 +502,8 @@ fn waiting_filter_and_stale_agent() {
     }
     o.open_popup();
     o.wait_for("beta ●1");
-    o.wait_for(r"win two .*\(ended\?\)");
+    o.wait_for(r"win two$");
+    o.wait_for(r"[└├] \.0 .*\(ended\?\)");
     let screen = o.screen();
     assert!(!screen.contains("NEEDS YOU"), "{screen}");
     assert!(
