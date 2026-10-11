@@ -56,6 +56,9 @@ fn default_binds_prefix_dot_to_the_rust_popup() {
     assert!(b.contains("run-shell -b"), "{b}");
     assert!(b.contains("display-popup -c #{q:client_name}"), "{b}");
     assert!(b.contains("TMUX_HOME_CLIENT=#{q:client_name}"), "{b}");
+    // the popup learns its own chord, to close on it
+    assert!(b.contains("-e TMUX_HOME_PREFIX=C-b"), "{b}");
+    assert!(b.contains("-e TMUX_HOME_KEYS=."), "{b}");
     assert!(b.contains(&format!("{BIN} popup")), "{b}");
     assert_eq!(
         s.tmux(&["list-keys", "-T", "prefix", "w"]),
@@ -70,8 +73,11 @@ fn custom_keys_bind_each() {
     let _env = TestEnv::new();
     let s = TestServer::start();
     s.tmux(&["set-option", "-g", "@home-keys", "w f"]);
+    s.tmux(&["set-option", "-g", "prefix", "C-a"]);
     run_plugin(&s, BIN);
-    assert!(binding(&s, "w").is_some());
+    let w = binding(&s, "w").expect("prefix w bound");
+    assert!(w.contains("TMUX_HOME_PREFIX=C-a"), "{w}");
+    assert!(w.contains("TMUX_HOME_KEYS=w"), "{w}");
     assert!(binding(&s, "f").is_some());
     assert_eq!(binding(&s, "."), None);
 }

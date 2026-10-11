@@ -322,6 +322,7 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     };
     let mut app = App::new();
     app.home = rt.home.clone();
+    app.chord = app::Chord::from_env();
     // first picture: read tmux directly, so the cursor lands on the window
     // the client shows now; no floor, since nothing was written (the feed's
     // first snapshot is a fresh read too)

@@ -97,6 +97,10 @@ tmux_q=
 for w in "${TMUX_CMD[@]}"; do tmux_q+="$(q "$w") "; done
 popup="${tmux_q}display-popup -c #{q:client_name} -E -B -w 100% -h 100%"
 popup+=" -e TMUX_HOME_CLIENT=#{q:client_name} "
+# Inside the popup tmux doesn't see the prefix: the popup gets prefix and
+# key as two keystrokes. Told both, it closes on them, so the key toggles.
+prefix=$(t show-options -gqv prefix)
+popup+="-e $(q "TMUX_HOME_PREFIX=$prefix") -e $(q "TMUX_HOME_KEYS=$keys") "
 rust_q=$(q "$RUST_BIN")
 # Which binary runs is decided when the key is pressed, so a build that
 # finishes later (first install, TPM update) is used without a reload.
