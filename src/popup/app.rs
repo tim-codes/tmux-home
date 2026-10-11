@@ -90,6 +90,20 @@ impl Row {
     }
 }
 
+/// The command a pane shows: Claude Code's executable is named after its
+/// version (`2.1.296`), so a pane tmux-home's hooks tagged as an agent
+/// (`@home_agent`) whose command is a bare `N.N.N` shows the agent's name
+/// instead. Anything else, an untagged version-named process included, is
+/// shown as tmux reports it.
+pub fn display_cmd(p: &crate::tmux::snapshot::Pane) -> String {
+    match p.agent_opts.get("@home_agent") {
+        Some(agent) if !agent.is_empty() && crate::agent::is_version(&p.current_command) => {
+            agent.clone()
+        }
+        _ => p.current_command.clone(),
+    }
+}
+
 /// Rows grouped by session (the client's session first, then by name),
 /// windows in index order; windows that need you are also pinned, in the
 /// same order, above them all.
@@ -126,9 +140,15 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
             panes.sort_by_key(|p| p.index);
             let pane = panes.iter().find(|p| p.active).or(panes.first()).copied();
             let (cmd, cwd) = pane
-                .map(|p| (p.current_command.clone(), p.current_path.clone()))
+                .map(|p| (display_cmd(p), p.current_path.clone()))
                 .unwrap_or_default();
             let path = short_path(&cwd, home);
+            // an automatic name is the active pane's command: shown as
+            // that command is (`display_cmd`)
+            let wname = match pane {
+                Some(p) if w.automatic_rename && w.name == p.current_command => cmd.clone(),
+                _ => w.name.replace(['\t', '\n'], " "),
+            };
             let agents = WindowAgents::of(panes.iter().copied());
             let kind = agents
                 .as_ref()
@@ -142,10 +162,7 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                 .unwrap_or(&cwd);
             let git = git_of(git_cwd);
             let branch = git.as_ref().map(|(_, g)| g.branch.as_str()).unwrap_or("");
-            let hay = format!(
-                "{} {} {} {} {} {}",
-                w.index, w.name, cmd, path, kind, branch
-            );
+            let hay = format!("{} {} {} {} {} {}", w.index, wname, cmd, path, kind, branch);
             let prompts = agents
                 .iter()
                 .flat_map(|a| &a.panes)
@@ -163,9 +180,10 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                     let git = git_of(&p.current_path);
                     let path = short_path(&p.current_path, home);
                     let title = p.title.replace(['\t', '\n'], " ");
+                    let cmd = display_cmd(p);
                     let hay = format!(
                         "{} {} {} {} {}",
-                        p.current_command,
+                        cmd,
                         path,
                         title,
                         agent.as_ref().map(|a| a.state.kind.name()).unwrap_or(""),
@@ -174,7 +192,7 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                     PaneRow {
                         id: p.id.clone(),
                         index: p.index,
-                        cmd: p.current_command.clone(),
+                        cmd,
                         cwd: p.current_path.clone(),
                         path,
                         title,
@@ -190,7 +208,7 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                 session: sess.name.clone(),
                 wid: w.id.clone(),
                 index: w.index,
-                name: w.name.replace(['\t', '\n'], " "),
+                name: wname,
                 pane: pane.map(|p| p.id.clone()),
                 cmd,
                 cwd,
@@ -1376,6 +1394,50 @@ mod tests {
 
     fn app() -> App {
         app_of(&snap())
+    }
+
+    /// Claude Code runs as its version: a tagged agent pane shows the
+    /// agent's name instead, nothing else changes.
+    #[test]
+    fn display_cmd_names_version_named_agents() {
+        let p = |cmd: &str, tag: Option<&str>| {
+            let mut p = Pane {
+                current_command: cmd.into(),
+                ..Default::default()
+            };
+            if let Some(t) = tag {
+                p.agent_opts.insert("@home_agent".into(), t.into());
+            }
+            p
+        };
+        assert_eq!(display_cmd(&p("2.1.296", Some("claude"))), "claude");
+        assert_eq!(display_cmd(&p("node", Some("claude"))), "node");
+        assert_eq!(display_cmd(&p("2.1", Some("claude"))), "2.1");
+        assert_eq!(display_cmd(&p("2.1.296", None)), "2.1.296");
+        assert_eq!(display_cmd(&p("fish", None)), "fish");
+        // in the rows: the pane's command, the hay and an automatic name
+        let mut s = snap();
+        s.panes[3] = Pane {
+            current_command: "2.1.296".into(),
+            ..s.panes[3].clone()
+        };
+        s.panes[3]
+            .agent_opts
+            .insert("@home_agent".into(), "claude".into());
+        s.windows[3].name = "2.1.296".into();
+        s.windows[3].automatic_rename = true;
+        let rows = rows_of(&s);
+        let build = rows.iter().find(|r| r.wid == "@3").unwrap();
+        assert_eq!(
+            (build.cmd.as_str(), build.name.as_str()),
+            ("claude", "claude")
+        );
+        assert_eq!(build.panes[0].cmd, "claude");
+        assert!(build.panes[0].hay.starts_with("claude "));
+        assert!(!build.hay.contains("2.1.296"));
+        // a name typed by hand is kept, even if it looks like a version
+        s.windows[3].automatic_rename = false;
+        assert_eq!(rows_of(&s)[1].name, "2.1.296");
     }
 
     #[test]

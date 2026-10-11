@@ -126,7 +126,7 @@ impl AgentKind {
 }
 
 /// `^\d+\.\d+\.\d+$`.
-fn is_version(s: &str) -> bool {
+pub(crate) fn is_version(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     parts.len() == 3
         && parts
