@@ -11,12 +11,15 @@ use std::{
 };
 use tmux_home::paths::Paths;
 
-/// A full-width rule with the layout's frame right under it: the
-/// preview, below the list.
+/// The layout's frame, edge to edge, right under the list (no divider
+/// rule above it): the preview, below the list.
 fn bottom_preview(screen: &str, cols: usize) -> bool {
     let lines: Vec<&str> = screen.lines().collect();
     lines.windows(2).any(|w| {
-        w[0].chars().count() == cols && w[0].chars().all(|c| c == '─') && w[1].starts_with('┌')
+        !(w[0].starts_with('─') && w[0].chars().all(|c| c == '─'))
+            && w[1].chars().count() == cols
+            && w[1].starts_with('┌')
+            && w[1].ends_with('┐')
     })
 }
 

@@ -25,7 +25,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Paragraph},
 };
 use std::{
     path::PathBuf,
@@ -456,13 +456,10 @@ fn event_loop(
 /// only after ^o.
 const PREVIEW_MIN_HEIGHT: u16 = 30;
 
-/// Blank rows the auto split leaves under the list's last line.
-const LIST_PAD: u16 = 2;
-
 /// The preview's rows out of `avail` (the list and preview area). `pct`:
 /// the size set with M-j/M-k (`@home-preview-pct`), a share of `avail`.
-/// None (auto): the list gets its `content` lines plus `LIST_PAD` and the
-/// preview the rest, unless that leaves it under a third of `avail` (or
+/// None (auto): the list gets its `content` lines and the preview the
+/// rest (its frame's top edge right under the list's last line), unless that leaves it under a third of `avail` (or
 /// `PREVIEW_MIN_ROWS`): then half. Either way the list and the preview
 /// keep `PREVIEW_MIN_ROWS` each when there is room for both.
 fn preview_height(avail: u16, pct: Option<u16>, content: usize) -> u16 {
@@ -471,9 +468,7 @@ fn preview_height(avail: u16, pct: Option<u16>, content: usize) -> u16 {
         Some(p) => app::pct_rows(avail, p),
         None => {
             let floor = (avail.div_ceil(3)).max(app::PREVIEW_MIN_ROWS);
-            let list = u16::try_from(content)
-                .unwrap_or(u16::MAX)
-                .saturating_add(LIST_PAD);
+            let list = u16::try_from(content).unwrap_or(u16::MAX);
             match avail.saturating_sub(list) {
                 fit if fit >= floor => fit,
                 _ => avail / 2,
@@ -984,6 +979,9 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, t: &Table, now: u64) {
         ];
         spans.extend(table_spans(t, cells));
         if selected {
+            // the highlight runs to the list's right edge
+            let pad = width.saturating_sub(spans_width(&spans));
+            spans.push(Span::raw(" ".repeat(pad)));
             for s in spans.iter_mut().skip(1) {
                 s.style = s.style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
             }
@@ -1031,14 +1029,11 @@ fn band_text(p: &PaneRow) -> String {
 /// brighter) and scrolls.
 fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot) {
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let block = Block::default().borders(Borders::TOP).border_style(dim);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
     let (Some(r), pane) = (app.selected().cloned(), app.selected_pane().cloned()) else {
         return;
     };
     let geo: Vec<_> = r.panes.iter().map(|p| p.rect).collect();
-    let rects = preview::place(&geo, inner);
+    let rects = preview::place(&geo, area);
     let hl = pane
         .as_ref()
         .and_then(|p| r.panes.iter().position(|x| x.id == p.id));
@@ -1091,7 +1086,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot) {
         }
     }
     let buf = f.buffer_mut();
-    for (x, y, c, outline) in preview::borders(inner, &rects, hl) {
+    for (x, y, c, outline) in preview::borders(area, &rects, hl) {
         let style = if outline {
             Style::default().fg(Color::Magenta)
         } else {
@@ -1736,7 +1731,7 @@ mod tests {
         s
     }
 
-    /// The preview below its rule: the selection changes only which
+    /// The preview below the list: the selection changes only which
     /// pane is outlined, never a row of text or the split. Every pane
     /// carries its one-line meta band (index, command, agent state, git),
     /// and no agent or git card is drawn.
@@ -1763,14 +1758,14 @@ mod tests {
         assert_eq!(win, agent, "window row vs agent pane");
         assert_eq!(agent, shell, "agent pane vs shell pane");
         // one band per pane, on the row under the frame's top edge
-        let band = &agent[2];
+        let band = &agent[1];
         assert!(
             band.starts_with("│.0 claude  ● running  main !"),
             "{band:?}\n{s}"
         );
         assert!(band.contains("│.1 fish"), "{band:?}");
         // the captures start below the bands
-        assert!(agent[3].contains("line one"), "{:?}", &agent[..4]);
+        assert!(agent[2].contains("line one"), "{:?}", &agent[..4]);
         // no cards
         let preview = agent.join("\n");
         for gone in [
@@ -1785,7 +1780,7 @@ mod tests {
         // the selected pane's band is the brighter one
         let shot = shot_of(&a, "line one\nline two");
         let buf = render(&mut a, w, h, &shot);
-        let y = (r2 + 2) as u16;
+        let y = (r2 + 1) as u16;
         let x = |pat: &str| col(band, pat) as u16;
         assert!(buf[(x(".0"), y)].modifier.contains(Modifier::DIM));
         assert!(!buf[(x(".1"), y)].modifier.contains(Modifier::DIM));
@@ -1842,12 +1837,12 @@ mod tests {
 
     #[test]
     fn auto_split_fits_the_list() {
-        // a short list: its lines plus 2, the preview the rest
-        assert_eq!(preview_height(45, None, 6), 37);
+        // a short list: its lines, the preview the rest
+        assert_eq!(preview_height(45, None, 6), 39);
         // the floor: a third of the area (15 of 45) ...
-        assert_eq!(preview_height(45, None, 28), 15);
+        assert_eq!(preview_height(45, None, 30), 15);
         // ... below it, half
-        assert_eq!(preview_height(45, None, 29), 22);
+        assert_eq!(preview_height(45, None, 31), 22);
         assert_eq!(preview_height(45, None, 500), 22);
         // and at least PREVIEW_MIN_ROWS: 12 rows, a third is 4; the list
         // keeps 5 too
@@ -1873,27 +1868,65 @@ mod tests {
         assert_eq!(preview_height(45, Some(1), 6), 5);
     }
 
-    /// The preview's top rule row on a drawn screen.
+    /// The preview frame's top row on a drawn screen: it spans the whole
+    /// width, corner to corner.
     fn rule_row(s: &str, w: u16) -> usize {
         s.lines()
-            .position(|l| l.chars().count() == w as usize && l.chars().all(|c| c == '─'))
-            .unwrap_or_else(|| panic!("no rule\n{s}"))
+            .position(|l| l.chars().count() == w as usize && l.starts_with('┌') && l.ends_with('┐'))
+            .unwrap_or_else(|| panic!("no frame\n{s}"))
     }
 
-    /// Auto: the preview starts 2 rows below the page's last line, and
+    /// The preview's frame is flush with the popup's edges and sits right
+    /// under the list: no rule, no blank row between them; the selected
+    /// row's highlight spans the list's width.
+    #[test]
+    fn the_frame_is_flush_under_the_list() {
+        let mut a = agent_app();
+        let (w, h) = (120u16, 40u16);
+        let shot = shot_of(&a, "line one\nline two");
+        let buf = render(&mut a, w, h, &shot);
+        let s = text_of(&buf);
+        let top = rule_row(&s, w);
+        let lines: Vec<&str> = s.lines().collect();
+        assert!(!lines[top - 1].trim().is_empty(), "a blank row above:\n{s}");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.chars().count() == w as usize && l.chars().all(|c| c == '─')),
+            "a divider rule:\n{s}"
+        );
+        let bottom = lines.iter().rposition(|l| l.starts_with('└')).unwrap();
+        for l in &lines[top + 1..bottom] {
+            assert!(l.starts_with('│'), "left edge at x=0: {l:?}");
+            assert_eq!(
+                l.chars().count(),
+                w as usize,
+                "right edge at x={}: {l:?}",
+                w - 1
+            );
+        }
+        assert!(lines[bottom].ends_with('┘'), "{s}");
+        // the selected row: highlighted to the right edge
+        let y = (0..h).find(|&y| buf[(0, y)].symbol() == "▌").unwrap();
+        for x in 1..w {
+            assert_eq!(buf[(x, y)].bg, Color::DarkGray, "x={x}");
+        }
+    }
+
+    /// Auto: the preview starts right below the page's last line, and
     /// grows when the filter shortens the list; M-j/M-k start from the
     /// split shown and set it; M-= goes back to auto.
     #[test]
     fn the_split_follows_the_list_until_set() {
-        let mut a = app();
+        let mut a = agent_app();
         let s = screen(&mut a, 200, 50);
         let lines = list_lines(&a).len();
-        // tab strip, prompt, column header, the list, 2 blank rows (the
-        // list keeps 5 rows)
-        assert_eq!(rule_row(&s, 200), 3 + (lines + 2).max(5), "{s}");
+        // tab strip, prompt, column header, the list (it keeps 5 rows),
+        // then the frame
+        assert_eq!(rule_row(&s, 200), 3 + lines.max(5), "{s}");
         assert_eq!(a.preview_pct, None);
         // a filter matching less: the preview grows
-        for c in "longer".chars() {
+        for c in "shell".chars() {
             a.key(plain(KeyCode::Char(c)));
         }
         let s2 = screen(&mut a, 200, 50);
@@ -1921,7 +1954,7 @@ mod tests {
         assert!(rule_row(&s, 200) < auto, "larger:\n{s}");
         // a set size no longer follows the list
         let set = rule_row(&s, 200);
-        for c in "longer".chars() {
+        for c in "shell".chars() {
             a.key(plain(KeyCode::Char(c)));
         }
         assert_eq!(rule_row(&screen(&mut a, 200, 50), 200), set);
@@ -1997,12 +2030,8 @@ mod tests {
         for (w, h) in [(200, 50), (120, 40), (300, 30)] {
             let s = screen(&mut app(), w, h);
             let lines: Vec<&str> = s.lines().collect();
-            let rule = lines
-                .iter()
-                .position(|l| l.chars().count() == w as usize && l.chars().all(|c| c == '─'))
-                .unwrap_or_else(|| panic!("{w}x{h}: no rule\n{s}"));
+            let rule = rule_row(&s, w);
             assert!(rule > 3 && rule < h as usize - 3, "{s}");
-            assert!(lines[rule + 1].starts_with('┌'), "the frame: {s}");
             let one = lines.iter().position(|l| l.contains("line one")).unwrap();
             assert!(one > rule, "{s}");
             assert!(lines[..rule].iter().all(|l| !l.contains("line")), "{s}");
