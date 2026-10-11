@@ -1701,6 +1701,96 @@ mod tests {
         );
     }
 
+    /// Window `@1` of the agent fixture as an agent pane (`%1`, in a
+    /// repo) beside a plain shell (`%11`).
+    fn mixed_snap() -> Snapshot {
+        use crate::agent::tests::pane;
+        use crate::git::badge::{Phase, RepoStatus};
+        let mut s = agent_snap();
+        let i = s.panes.iter().position(|p| p.id == "%11").unwrap();
+        let mut shell = pane("%11", "fish", &[]);
+        shell.window_id = "@1".into();
+        shell.index = 1;
+        shell.active = false;
+        s.panes[i] = shell;
+        for p in s.panes.iter_mut().filter(|p| p.window_id == "@1") {
+            let left = p.index == 0;
+            (p.left, p.top, p.height) = (if left { 0 } else { 101 }, 0, 50);
+            p.width = if left { 100 } else { 99 };
+        }
+        let agent = s.panes.iter_mut().find(|p| p.id == "%1").unwrap();
+        agent.current_path = "/home/u/dev/app".into();
+        s.git
+            .paths
+            .insert("/home/u/dev/app".into(), "/home/u/dev/app".into());
+        s.git.repos.insert(
+            "/home/u/dev/app".into(),
+            RepoStatus {
+                branch: "main".into(),
+                phase: Phase::Refs,
+                upstream: Some("origin/main".into()),
+                modified: 2,
+                ..RepoStatus::default()
+            },
+        );
+        s
+    }
+
+    /// The preview below its rule: the selection changes only which
+    /// pane is outlined, never a row of text or the split. Every pane
+    /// carries its one-line meta band (index, command, agent state, git),
+    /// and no agent or git card is drawn.
+    #[test]
+    fn the_preview_never_shifts_with_the_selection() {
+        let mut a = app_of(&mixed_snap());
+        let (w, h) = (120u16, 40u16);
+        let below = |a: &mut App| {
+            let s = screen(a, w, h);
+            let r = rule_row(&s, w);
+            (
+                r,
+                s.lines().skip(r).map(String::from).collect::<Vec<_>>(),
+                s,
+            )
+        };
+        a.select_wid("@1");
+        let (r0, win, s) = below(&mut a);
+        a.select_key("@1/%1");
+        let (r1, agent, _) = below(&mut a);
+        a.select_key("@1/%11");
+        let (r2, shell, _) = below(&mut a);
+        assert_eq!((r0, r1), (r1, r2), "the split moved\n{s}");
+        assert_eq!(win, agent, "window row vs agent pane");
+        assert_eq!(agent, shell, "agent pane vs shell pane");
+        // one band per pane, on the row under the frame's top edge
+        let band = &agent[2];
+        assert!(
+            band.starts_with("│.0 claude  ● running  main !"),
+            "{band:?}\n{s}"
+        );
+        assert!(band.contains("│.1 fish"), "{band:?}");
+        // the captures start below the bands
+        assert!(agent[3].contains("line one"), "{:?}", &agent[..4]);
+        // no cards
+        let preview = agent.join("\n");
+        for gone in [
+            "·  claude",
+            "prompt",
+            "add the tests",
+            "changes",
+            "worktree",
+        ] {
+            assert!(!preview.contains(gone), "{gone:?} in\n{preview}");
+        }
+        // the selected pane's band is the brighter one
+        let shot = shot_of(&a, "line one\nline two");
+        let buf = render(&mut a, w, h, &shot);
+        let y = (r2 + 2) as u16;
+        let x = |pat: &str| col(band, pat) as u16;
+        assert!(buf[(x(".0"), y)].modifier.contains(Modifier::DIM));
+        assert!(!buf[(x(".1"), y)].modifier.contains(Modifier::DIM));
+    }
+
     /// ^r (or ^x's confirm) from a pinned copy marks that copy's window
     /// row; from the session row, that row; from a pane row, its window's.
     #[test]
