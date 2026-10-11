@@ -99,9 +99,11 @@ session pages, a window/pane tree, a column table, a bottom layout preview.*
    └ .1         fish                             ~/d/api        main ! ≡
  ▶ 3     shell
    └ .0         fish                             ~/d/a/src      main +!? ⇕⇡2⇣1
-──────────────────────────────────────────────────────────────────────────────────
 ┌──────────────────────────────────────┬─────────────────────────────────────────┐
-│.0 claude  ● running  main ! ≡        │.1 fish  main ! ≡                        │
+│.0 claude  ● running  12m  opus 5.5   │.1 fish                                  │
+│main → origin/main ≡  !1              │main → origin/main ≡  !1                 │
+│~/dev/api                             │~/dev/api                                │
+│┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄│┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄│
 │> add the tests                       │$ cargo test                             │
 └──────────────────────────────────────┴─────────────────────────────────────────┘
  ⏎ go   ^r rename   ^x close   M-↑↓ move   ^o preview   pfx ( ) session   F1 keys
@@ -144,7 +146,8 @@ session pages, a window/pane tree, a column table, a bottom layout preview.*
 - **Preview:** always at the bottom, shown when the popup is ≥ 30 rows,
   else hidden unless `^o` (which also hides a shown one) or `M-k`. Size,
   auto (no `@home-preview-pct`): the list gets its page's lines (window and
-  pane rows, group headers) + 2 blank rows, the preview the rest,
+  pane rows, group headers), the preview the rest (its frame's top edge
+  right under the list's last line: no rule or blank rows between),
   recomputed every draw; if that leaves the preview under max(⅓ of the
   list+preview area, 5 rows) it is a 50/50 split and the list scrolls.
   `M-k`/`M-j` move the divider 5 points up/down, starting from the split
@@ -154,11 +157,20 @@ session pages, a window/pane tree, a column table, a bottom layout preview.*
   clamped the same way on a smaller popup. It
   draws the selected window's pane layout — each pane's visible capture
   (`capture-pane -e`) in its rectangle scaled to the preview (the bounding
-  box of the non-sidebar panes), inside a frame with tmux-style separators.
-  Each pane's rectangle starts with a static, dim one-line meta band:
-  `.N cmd`, the agent state (icon and word) if an agent pane, and the git
-  badge (branch cut to 20) if its cwd is in a repo, clipped to the pane's
-  width. On a pane row that pane is outlined in magenta (its band drawn
+  box of the non-sidebar panes), inside a frame with tmux-style separators
+  spanning the popup's full width. Each pane's rectangle starts with a
+  banner (`src/popup/banner.rs`): up to three dim lines — `.N cmd`, agent
+  state, run time, model; git: branch → upstream, sync, change counts,
+  stashes, operation, `⊗`/`~`; where: cwd, `(wt) ← main` or linked count,
+  stray, mismatch, prunable/locked, default branch — and a `┄` rule. A
+  pane outside a repo shows its cwd as the second line. All panes of a
+  layout get the same banner height (`banner::height` of the shortest:
+  4 rows, shedding the rule then lines as panes drop under 7 rows),
+  missing lines blank; each line drops whole pieces, least important
+  first, to fit the pane's width. Banner data is all from the snapshot
+  (hook-written agent options incl. `@home_model`, the daemon's
+  `RepoStatus`); the popup computes nothing but layout and formatting.
+  On a pane row that pane is outlined in magenta (its banner drawn
   undimmed) and is the one the wheel and `S-↑`/`S-↓` scroll (its capture
   includes history); on a window row nothing is highlighted or scrolls.
   No agent or git card: the selection changes only the outline, so the
@@ -298,7 +310,8 @@ while it carries agent options, tmux-home treats them as **stale**: shown
 dimmed with `(ended?)`, excluded from NEEDS YOU and the tally. Read-only —
 tmux-home never clears another tool's options.
 
-**In the preview** an agent pane's meta band shows its state (§5); there
+**In the preview** an agent pane's banner shows its state, run time and
+model (§5); there
 is no agent card — the prompt and reply are visible in the pane itself.
 
 No fallback when the sidebar isn't installed: windows are listed without an
