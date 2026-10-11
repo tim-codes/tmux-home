@@ -21,8 +21,9 @@ where to go.
 - **Git badges**: branch, dirty state, ahead/behind, stashes, stray branches
   and operations in progress for each window's repo, computed read-only in
   the background.
-- **Sidebar** (`prefix e` / `prefix E`): a narrow, read-only, always-on view
-  of the same state for one window or a whole session.
+- **Sidebar** (`prefix e` / `prefix E`): a narrow, always-on view of the
+  same state for one window or a whole session; focus it to move through
+  its windows and switch.
 - **tmux-resurrect integration**: sidebars come back after a restore, and
   (opt-in) Claude Code sessions are resumed in the panes they ran in.
 
@@ -528,30 +529,45 @@ any does, else off everywhere; other sessions are never touched). From a
 shell or your own binding: `tmux-home sidebar-toggle [--session] [--window
 <target>]`.
 
-The sidebar is a narrow, read-only pane (`@home-sidebar-width`, default 32
-columns, at the `@home-sidebar-side` edge, full height):
+The sidebar is a narrow pane (`@home-sidebar-width`, default 32 columns,
+at the `@home-sidebar-side` edge, full height):
 
 ```
 ─ NEEDS YOU ───────────────────
  ◐ main:1 api
    permission
 ─ main ────────────────────────
- ◐ 1 api
-▌  2 web  main ! ⇡1
- ● 3 editor  feat/x +?
+ ◐ 1 api     waiting
+▌  2 web     main ! ⇡1
+ ● 3 editor  running feat/x +? ⇣2
+             $1
  2s 7w · 1 waiting · 1 running
 ```
 
 Windows that need you, server-wide, with the reason; then the windows of
-its own session, each with its agent status icon, index, name and git
-badge (whole pieces dropped as the width shrinks), the window it lives in
-highlighted; a tally at the bottom (sessions, windows, live agents by
-status; `○` while it reads tmux directly, without the daemon). It updates
-live from the daemon. It never takes focus and never captures the mouse;
-it ignores every key except `q`, which closes it. Sidebar panes are marked
-`@home_role=sidebar` and left out of the popup's rows, `^x`'s close check
-and `^t`'s reopen snapshot (as are tmux-agent-sidebar's `@pane_role`
-panes).
+its own session as a table, the window it lives in highlighted. The first
+column (agent status icon, index, name) is the same width on every row: the
+longest name, at most half the sidebar. The second column holds the tags,
+the agent's state word and the git badge's pieces; what doesn't fit wraps,
+whole pieces at a time, onto lines aligned under it, and a window with no
+agent and no repo has none. A tally sits at the bottom (sessions, windows,
+live agents by status; `○` while it reads tmux directly, without the
+daemon). It updates live from the daemon. It never takes focus by itself
+and never captures the mouse.
+
+Move into it (`prefix ←`/`→`, or however you change panes) and it takes the
+popup's movement keys:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓`, `^p` / `^n`, `k` / `j` | Move the selection (it starts on the sidebar's own window) over NEEDS YOU and the session's windows |
+| `⏎` | Switch to the selected window; the sidebar's window gets its last pane back, so returning there doesn't land in the sidebar |
+| `Esc` | Hand the focus back to the window's last pane |
+| `q` | Close the sidebar |
+
+Sidebar panes are marked `@home_role=sidebar` and left out of the popup's
+rows, `^x`'s close check and `^t`'s reopen snapshot (as are
+tmux-agent-sidebar's `@pane_role` panes).
 
 With `@home-sidebar-auto on`, the daemon adds a sidebar to each window
 created from then on, except in sessions named in `@home-sidebar-exclude`
