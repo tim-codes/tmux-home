@@ -66,7 +66,7 @@ fn run(args: &[String]) {
     if let Err(e) = read {
         return log(&format!("stdin: {e}"));
     }
-    let payload: serde_json::Value = if input.trim().is_empty() {
+    let mut payload: serde_json::Value = if input.trim().is_empty() {
         serde_json::Value::Object(Default::default())
     } else {
         match serde_json::from_str(&input) {
@@ -79,6 +79,7 @@ fn run(args: &[String]) {
         .config_env()
         .and_then(|k| std::env::var(k).ok())
         .filter(|v| !v.is_empty());
+    ad.enrich(event, &mut payload);
     let t = Tmux::new(socket);
     if let Err(e) = apply_event(
         &t,

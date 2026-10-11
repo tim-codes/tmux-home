@@ -37,6 +37,9 @@ pub enum Key {
     WorktreeName,
     WorktreeBranch,
     SessionId,
+    /// The model the session runs (`claude-opus-5-5`): SessionStart's
+    /// `model`, then the transcript's latest at every Stop.
+    Model,
     /// Unix seconds of the last hook write (set on every write that sets
     /// anything); how fresh these options are against the sidebar's.
     Updated,
@@ -49,7 +52,7 @@ pub enum Key {
 }
 
 impl Key {
-    pub const ALL: [Key; 14] = [
+    pub const ALL: [Key; 15] = [
         Key::Agent,
         Key::Status,
         Key::Attention,
@@ -63,6 +66,7 @@ impl Key {
         Key::WorktreeName,
         Key::WorktreeBranch,
         Key::SessionId,
+        Key::Model,
         Key::Updated,
     ];
 
@@ -86,6 +90,7 @@ impl Key {
             Key::WorktreeName => "@home_worktree_name",
             Key::WorktreeBranch => "@home_worktree_branch",
             Key::SessionId => "@home_session_id",
+            Key::Model => "@home_model",
             Key::Updated => "@home_updated",
             Key::Transcript => "@home_transcript",
             Key::Cwd => "@home_cwd",
@@ -108,6 +113,7 @@ pub const OPTIONS: &[&str] = &[
     "@home_worktree_name",
     "@home_worktree_branch",
     "@home_session_id",
+    "@home_model",
     "@home_updated",
 ];
 
@@ -125,6 +131,7 @@ const NAMES: Names = Names {
     worktree_name: "@home_worktree_name",
     worktree_branch: "@home_worktree_branch",
     session_id: "@home_session_id",
+    model: "@home_model",
 };
 
 pub struct Home;
@@ -168,6 +175,7 @@ mod tests {
                     ("@home_wait_reason", "permission_prompt"),
                     ("@home_run_started", "1790864748"),
                     ("@home_subagents", "Explore:a1"),
+                    ("@home_model", "claude-opus-5-5"),
                 ],
             ))
             .unwrap();
@@ -175,6 +183,7 @@ mod tests {
         assert_eq!(s.wait_reason, Some(WaitReason::Permission));
         assert_eq!(s.run_started, Some(1790864748));
         assert_eq!(s.subagents, ["Explore"]);
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5-5"));
         assert!(s.attention);
         // the sidebar's names mean nothing to this source
         assert_eq!(

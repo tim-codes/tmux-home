@@ -242,6 +242,8 @@ pub struct AgentState {
     pub permission_mode: Option<String>,
     pub worktree: Option<Worktree>,
     pub session_id: Option<String>,
+    /// The model ID (`claude-opus-5-5`), when the hooks recorded one.
+    pub model: Option<String>,
 }
 
 /// A pane's agent and whether it looks stale.

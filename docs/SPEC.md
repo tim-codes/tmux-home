@@ -232,8 +232,8 @@ order.
 > `@home_status`, `@home_attention`, `@home_wait_reason`,
 > `@home_run_started`, `@home_prompt` / `_prompt_source`,
 > `@home_subagents`, `@home_bg_cmd`, `@home_permission_mode`,
-> `@home_worktree_name` / `_branch`, `@home_session_id`, `@home_updated`, with the
-> sidebar's value vocabulary, so the table below applies with `@home_`
+> `@home_worktree_name` / `_branch`, `@home_session_id`, `@home_model`,
+> `@home_updated`, with the sidebar's value vocabulary, so the table below applies with `@home_`
 > for `@pane_` (and `@home_run_started` for `@pane_started_at`). The
 > `HomeSource` reads them first and wins, unless the sidebar's are
 > clearly newer (`@home_updated`, stamped on every write, against the
@@ -251,6 +251,11 @@ order.
 > SessionEnd (main context only) always clears, and SessionStart
 > `startup`/`clear` drops the list; UserPromptSubmit records the prompt
 > only for `source` `user`/`sdk` (or none).
+> `@home_model` (tmux-home's own, no sidebar counterpart) is the model
+> ID: SessionStart's `model` field, then at every Stop the `message.model`
+> of the transcript's last assistant entry (the hook reads at most the
+> file's last 512 KiB once per turn), so `/model` switches show by the
+> end of the next turn.
 
 > **Until pass 5** (implemented in pass 4), this state comes only from
 > tmux-agent-sidebar's `@pane_*` options, read in the same `list-panes` call

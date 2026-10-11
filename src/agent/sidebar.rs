@@ -59,6 +59,8 @@ pub struct Names {
     pub worktree_name: &'static str,
     pub worktree_branch: &'static str,
     pub session_id: &'static str,
+    /// Empty: the source has no such option.
+    pub model: &'static str,
 }
 
 pub const NAMES: Names = Names {
@@ -75,6 +77,7 @@ pub const NAMES: Names = Names {
     worktree_name: "@pane_worktree_name",
     worktree_branch: "@pane_worktree_branch",
     session_id: "@pane_session_id",
+    model: "",
 };
 
 impl AgentSource for Sidebar {
@@ -143,6 +146,7 @@ pub fn read_named(n: &Names, pane: &Pane) -> Option<AgentState> {
         permission_mode: get(n.permission_mode).map(str::to_string),
         worktree,
         session_id: get(n.session_id).map(str::to_string),
+        model: get(n.model).map(str::to_string),
     })
 }
 
