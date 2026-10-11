@@ -335,10 +335,16 @@ impl Outer {
             .map(str::to_string)
     }
 
-    /// Waits until the cursor row shows window `name` (whole word after
-    /// the index column).
+    /// Waits until the cursor is on window `name`'s row (its name right
+    /// after the index column).
     pub fn wait_cursor_on(&self, name: &str) {
-        self.wait_for(&format!(r"^▌.*\d  {}( |$)", regex::escape(name)));
+        self.wait_for(&format!(r"^▌[▶ ] \d+ +{}( |$)", regex::escape(name)));
+    }
+
+    /// Waits until the cursor is on a pane row (`├ .N` / `└ .N`) whose
+    /// line also matches `re` after the index.
+    pub fn wait_cursor_on_pane(&self, re: &str) {
+        self.wait_for(&format!(r"^▌  [├└] \.\d+ .*{re}"));
     }
 }
 
@@ -473,9 +479,9 @@ pub fn client_at(s: &TestServer) -> String {
         .to_string()
 }
 
-/// Session names of the window rows on screen, top to bottom.
-pub fn row_sessions(screen: &str) -> Vec<String> {
-    let r = regex::Regex::new(r"^[▌ ](\S+) +[▶ ] +\d+  ").unwrap();
+/// The window names of the window rows on screen, top to bottom.
+pub fn row_windows(screen: &str) -> Vec<String> {
+    let r = regex::Regex::new(r"^[▌ ][▶ ] \d+ +(\S+(?: \S+)*)").unwrap();
     screen
         .lines()
         .filter_map(|l| r.captures(l).map(|c| c[1].to_string()))

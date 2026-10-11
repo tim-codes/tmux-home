@@ -38,16 +38,13 @@ fn close_idle_current_and_cursor() {
     s.wait_settled();
     let qcur = wid(&s, "alpha:qcur");
     o.open_popup();
-    o.wait_for(&format!(
-        "tmux-home +alpha ▸ {}",
-        fmt(&s, &qcur, "#{window_index}")
-    ));
-    o.wait_for(r"^▌alpha ▶ +\d+  qcur");
+    o.wait_for(r"^  ▶alpha ");
+    o.wait_for(r"^▌▶ \d+ +qcur");
 
     // the client's current, idle window closes at once; the client moves
     // to another alpha window and the popup stays
     o.keys(&["C-x"]);
-    o.wait_for(r"^> +.*7/7");
+    o.wait_for(r"^> +.*5/5");
     assert!(!window_ids(&s).contains(&qcur));
     assert!(
         !s.tmux(&["list-clients", "-F", "#{client_name}"])
@@ -61,28 +58,26 @@ fn close_idle_current_and_cursor() {
         .tmux(&["list-clients", "-F", "#{window_id}"])
         .trim()
         .to_string();
-    o.wait_for(&format!(
-        "tmux-home +alpha ▸ {}",
-        fmt(&s, &cur, "#{window_index}")
-    ));
+    o.wait_for(&format!(r"^ ▶ {} ", fmt(&s, &cur, "#{window_index}")));
     assert!(o.popup_open());
     assert_eq!(store(&s).len().unwrap(), 1, "closing pushed its shape");
 
     // an idle window closes at once, the filter stays
     let qone = wid(&s, "alpha:qone");
     o.typed("qone");
-    o.wait_for(r"^> qone .*1/7");
+    o.wait_for(r"^> qone .*1/5");
     o.keys(&["C-x"]);
-    o.wait_for(r"^> qone .*0/6");
+    o.wait_for(r"^> qone .*0/4");
     assert!(!window_ids(&s).contains(&qone));
     o.keys(&["Escape"]);
-    o.wait_for(r"^> +.*6/6");
+    o.wait_for(r"^> +.*4/4");
 
-    // closing a row leaves the cursor on the next one
-    o.keys(&["Down", "Down"]);
+    // closing a row leaves the cursor on the next window
+    o.wait_cursor_on("editor");
+    o.keys(&["Down", "Down", "Down", "Down"]);
     o.wait_cursor_on("qtwo");
     o.keys(&["C-x"]);
-    o.wait_for(r"^> +.*5/5");
+    o.wait_for(r"^> +.*3/3");
     o.wait_cursor_on("qnext");
     o.wait_for("QNEXT-MARKER");
     assert!(!window_names(&s, "alpha").contains(&"qtwo".to_string()));
@@ -95,7 +90,7 @@ fn close_idle_current_and_cursor() {
     assert!(o.screen().contains("rename › qnext"), "{}", o.screen());
     assert!(window_names(&s, "alpha").contains(&"qnext".to_string()));
     o.keys(&["Escape"]);
-    o.wait_for(r"^> +.*5/5");
+    o.wait_for(r"^> +.*3/3");
 }
 
 #[test]
@@ -131,31 +126,31 @@ fn close_asks_when_busy() {
     let qbusy = wid(&s, "alpha:qbusy");
     o.open_popup();
     o.typed("qbusy");
-    o.wait_for(r"^> qbusy .*1/6");
+    o.wait_for(r"^> qbusy .*1/4");
     o.keys(&["C-x"]);
     o.wait_for(r#"^close "qbusy"\? running: sleep \(y/N\)"#);
     o.typed("n");
-    o.wait_for(r"^> qbusy .*1/6");
+    o.wait_for(r"^> qbusy .*1/4");
     assert!(window_ids(&s).contains(&qbusy), "kept after n");
     for cancel in ["Escape", "Enter"] {
         o.keys(&["C-x"]);
         o.wait_for(r#"^close "qbusy"\?"#);
         o.keys(&[cancel]);
-        o.wait_for(r"^> qbusy .*1/6");
+        o.wait_for(r"^> qbusy .*1/4");
         assert!(window_ids(&s).contains(&qbusy), "kept after {cancel}");
     }
     assert!(o.popup_open());
     o.keys(&["C-x"]);
     o.wait_for(r#"^close "qbusy"\?"#);
     o.typed("y");
-    o.wait_for(r"^> qbusy .*0/5");
+    o.wait_for(r"^> qbusy .*0/3");
     assert!(!window_ids(&s).contains(&qbusy));
     o.keys(&["Escape"]);
     // a sidebar pane running a program doesn't make the window busy
     o.typed("qside");
-    o.wait_for(r"^> qside .*1/5");
+    o.wait_for(r"^> qside .*1/3");
     o.keys(&["C-x"]);
-    o.wait_for(r"^> qside .*0/4");
+    o.wait_for(r"^> qside .*0/2");
 }
 
 /// A job stopped with ^z leaves the shell in the foreground, so the pane
@@ -176,11 +171,11 @@ fn close_asks_when_a_job_is_stopped() {
     let w = wid(&s, "alpha:qstop");
     o.open_popup();
     o.typed("qstop");
-    o.wait_for(r"^> qstop .*1/5");
+    o.wait_for(r"^> qstop .*1/3");
     o.keys(&["C-x"]);
     o.wait_for(r#"^close "qstop"\? running: sleep \(stopped\) \(y/N\)"#);
     o.keys(&["Escape"]);
-    o.wait_for(r"^> qstop .*1/5");
+    o.wait_for(r"^> qstop .*1/3");
     assert!(window_ids(&s).contains(&w));
 }
 
@@ -209,28 +204,28 @@ fn reopen_restores_and_selects() {
     o.open_popup();
     close_idle(&o, "qside");
     close_idle(&o, "qnext");
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     let before = client_at(&s);
 
     // ^t reopens the last closed (qnext), selects it, doesn't switch
     o.keys(&["C-t"]);
-    o.wait_for(r"^> +.*5/5");
+    o.wait_for(r"^> +.*3/3");
     assert!(window_names(&s, "alpha").contains(&"qnext".to_string()));
     assert_eq!(client_at(&s), before, "client not switched");
     o.wait_cursor_on("qnext");
 
     // from a filter that hides it: the filter clears, the cursor is on it
-    o.typed("build");
-    o.wait_for(r"^> build .*1/5");
+    o.typed("qnext");
+    o.wait_for(r"^> qnext .*1/3");
     o.keys(&["C-t"]);
-    o.wait_for(r"^> +.*6/6");
+    o.wait_for(r"^> +.*4/4");
     o.wait_cursor_on("qside");
     // a reopened window has fresh shells: the sidebar is not rebuilt
     assert_eq!(fmt(&s, "alpha:qside", "#{window_panes}"), "1");
 
     close_idle(&o, "qnext");
     close_idle(&o, "qside");
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     let st = store(&s);
     while st.pop().unwrap().is_some() {}
     o.keys(&["C-t"]);
@@ -239,7 +234,7 @@ fn reopen_restores_and_selects() {
     o.typed("x");
     o.wait_gone("nothing to reopen");
     o.keys(&["Escape"]);
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
 }
 
 #[test]
@@ -255,11 +250,11 @@ fn close_last_window_of_client_session() {
     s.tmux(&["switch-client", "-c", &client, "-t", "qdelta"]);
     s.wait_settled();
     o.open_popup();
-    o.wait_for("tmux-home +qdelta ▸ 0");
+    o.wait_for(r"▶qdelta ");
     o.keys(&["C-x"]);
     o.wait_for(r#"^close "qd"\? — session "qdelta" will end \(y/N\)"#);
     o.typed("y");
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     assert!(!sessions(&s).contains(&"qdelta".to_string()));
     assert!(
         !s.tmux(&["list-clients", "-F", "#{client_name}"])
@@ -269,12 +264,14 @@ fn close_last_window_of_client_session() {
     );
     let at = client_at(&s);
     assert!(at.starts_with("alpha:") || at.starts_with("beta:"), "{at}");
-    o.wait_for(r"tmux-home +(alpha|beta) ▸ \d");
+    o.wait_for(r"▶(alpha|beta) ");
+    assert!(!o.screen().contains("qdelta"), "{}", o.screen());
     assert!(o.popup_open());
 
-    // and ^t brings the session back, without switching the client
+    // and ^t brings the session back, without switching the client: the
+    // popup pages to it
     o.keys(&["C-t"]);
-    o.wait_for(r"^> +.*5/5");
+    o.wait_for(r"^> +.*1/1");
     o.wait_cursor_on("qd");
     assert!(sessions(&s).contains(&"qdelta".to_string()));
     assert_eq!(client_at(&s), at);
@@ -308,7 +305,7 @@ fn reorder_and_new_window() {
     wait_until("editor at index 1", || {
         fmt(&s, &editor, "#{window_index}") == "1"
     });
-    o.wait_for(r"^▌alpha ▶ +1  editor");
+    o.wait_for(r"^▌▶ 1 +editor");
     assert_eq!(
         s.tmux(&["list-clients", "-F", "#{window_id}"]).trim(),
         editor,
@@ -322,12 +319,12 @@ fn reorder_and_new_window() {
     wait_until("editor back at index 0", || {
         fmt(&s, &editor, "#{window_index}") == "0"
     });
-    o.wait_for(r"^▌alpha ▶ +0  editor");
+    o.wait_for(r"^▌▶ 0 +editor");
 
     o.keys(&["M-n"]);
     o.wait_for("^new window ›");
     o.keys(&["Escape"]);
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     assert_eq!(window_ids(&s).len(), 4, "Esc creates nothing");
     o.keys(&["M-n"]);
     o.wait_for("^new window ›");
@@ -337,7 +334,7 @@ fn reorder_and_new_window() {
         window_names(&s, "alpha") == ["editor", "fresh #1", "win two"]
     });
     o.wait_cursor_on("fresh #1");
-    o.wait_for(r"^> +.*5/5");
+    o.wait_for(r"^> +.*3/3");
     assert_eq!(
         s.tmux(&["list-clients", "-F", "#{window_id}"]).trim(),
         editor,
@@ -352,18 +349,18 @@ fn live_redraw_keeps_the_editor() {
     o.keys(&["C-r"]);
     o.wait_for("^rename › editor");
     o.typed("-x");
-    s.tmux(&["new-window", "-d", "-t", "beta:", "-n", "pushed"]);
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "pushed"]);
     o.wait_for("pushed");
     o.wait_for("^rename › editor-x");
     o.keys(&["Escape"]);
-    o.wait_for(r"^> +.*5/5");
-    o.keys(&["Down"]);
+    o.wait_for(r"^> +.*3/3");
+    o.keys(&["Down", "Down"]);
     o.wait_cursor_on("win two");
     o.keys(&["C-r"]);
     o.wait_for("^rename › win two");
     s.tmux(&["kill-window", "-t", "alpha:1"]);
     o.wait_for("that window has gone");
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
 }
 
 fn kill_daemon(s: &TestServer) {
@@ -398,15 +395,15 @@ fn daemon_death_falls_back_to_polling() {
     o.wait_gone(r"\(direct\)");
     kill_daemon(&s);
     o.wait_for(r"\(direct\)");
-    s.tmux(&["new-window", "-d", "-t", "beta:", "-n", "later"]);
-    o.wait_for(r"^> +.*5/5");
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "later"]);
+    o.wait_for(r"^> +.*3/3");
     o.wait_for("later");
     // its own write shows without waiting for a poll
     o.keys(&["M-n"]);
     o.typed("mine");
     o.keys(&["Enter"]);
     o.wait_cursor_on("mine");
-    o.wait_for(r"^> +.*6/6");
+    o.wait_for(r"^> +.*4/4");
 }
 
 /// No daemon at all and none can start: the popup works on direct reads.
@@ -426,11 +423,11 @@ fn degraded_mode_without_a_daemon() {
     kill_daemon(&s);
     o.open_popup();
     o.wait_for(r"\(direct\)");
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "polled"]);
-    o.wait_for(r"^> +.*5/5");
+    o.wait_for(r"^> +.*3/3");
     close_idle(&o, "polled");
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     o.keys(&["C-t"]);
     o.wait_cursor_on("polled");
     assert!(sessions(&s).len() == 2 && window_ids(&s).len() == 5);
@@ -445,9 +442,9 @@ fn corrupt_store_does_not_break_close_and_reopen() {
     std::fs::write(dir.join("closed.json"), "{\"closed\": [trunc").unwrap();
     o.open_popup();
     close_idle(&o, "win two");
-    o.wait_for(r"^> +.*3/3");
+    o.wait_for(r"^> +.*1/1");
     o.keys(&["C-t"]);
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     o.wait_cursor_on("win two");
     let aside = std::fs::read_dir(&dir)
         .unwrap()
