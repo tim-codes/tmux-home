@@ -64,6 +64,27 @@ fn filter_esc_and_navigation() {
 }
 
 #[test]
+fn the_open_key_toggles_the_popup() {
+    let (_env, _s, o) = popup_fixture();
+    o.open_popup();
+    // inside the popup tmux passes the prefix on: `C-b .` reaches it as two
+    // keys, and closes it rather than typing '.' into the filter
+    o.typed("bu");
+    o.wait_for(r"^> bu .*/4");
+    o.keys(&["C-b", "."]);
+    o.wait_gone(r"^> bu ");
+    assert!(!o.popup_open(), "{}", o.screen());
+    // opens again on the same key
+    o.open_popup();
+    // the prefix then another key acts as before: C-a moves to the start
+    o.typed("x");
+    o.keys(&["C-b", "C-a"]);
+    o.typed(".");
+    o.wait_for(r"^> \.x ");
+    assert!(o.popup_open());
+}
+
+#[test]
 fn rename_inline() {
     let (_env, s, o) = popup_fixture();
     let target = wid(&s, "alpha:editor");
