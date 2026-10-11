@@ -567,20 +567,25 @@ at the `@home-sidebar-side` edge, full height):
  ◐ main:1 api
    permission
 ─ main ────────────────────────
- ◐ 1 api     waiting
-▌  2 web     main ! ⇡1
- ● 3 editor  running feat/x +? ⇣2
-             $1
+ ◐ 1 api
+     waiting
+▌  2 web
+     main ! ⇡1
+ ● 3 editor
+     running feat/x +? ⇣2
+     $1
  2s 7w · 1 waiting · 1 running
 ```
 
 Windows that need you, server-wide, with the reason; then the windows of
-its own session as a table, the window it lives in highlighted. The first
-column (agent status icon, index, name) is the same width on every row: the
-longest name, at most half the sidebar. The second column holds the tags,
-the agent's state word and the git badge's pieces; what doesn't fit wraps,
-whole pieces at a time, onto lines aligned under it, and a window with no
-agent and no repo has none. A tally sits at the bottom (sessions, windows,
+its own session, the window it lives in highlighted as one band. Each window
+is stacked, at every width: the first line is the agent status icon, the
+index (a fixed-width field, so names line up) and the name on the full
+remaining width, clipped with `…` only if it still doesn't fit; the tags
+(the agent's state word and the git badge's pieces) follow below, indented to
+the name. What doesn't fit on a line wraps, whole pieces at a time, onto
+further lines with the same indent (a single piece wider than the line is
+clipped), and a window with no agent and no repo is one line. A tally sits at the bottom (sessions, windows,
 live agents by status; `○` while it reads tmux directly, without the
 daemon). It updates live from the daemon. It never takes focus by itself
 and never captures the mouse.
