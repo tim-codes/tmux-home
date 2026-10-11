@@ -1416,7 +1416,7 @@ mod tests {
         assert!(!s.contains("changes    "), "{s}");
         a.select_wid("@0");
         let s = screen(&mut a, 200, 50);
-        assert!(line(&s, "│.0 2.1.283").contains("fix/x (wt) !"), "{s}");
+        assert!(line(&s, "│.0 claude").contains("fix/x (wt) !"), "{s}");
         // a stale repo's badge ends in ~ in the band too
         a.select_key("@2/%2");
         let s = screen(&mut a, 200, 50);
@@ -1565,11 +1565,7 @@ mod tests {
             .lines()
             .filter(|l| l.contains("└ .0") || l.contains("├ .0"))
         {
-            let cmd = if l.contains("fish") {
-                "fish"
-            } else {
-                "2.1.283"
-            };
+            let cmd = if l.contains("fish") { "fish" } else { "claude" };
             assert_eq!(col(l, cmd), at[2], "{l:?}\n{s}");
             let path = if l.contains('~') { "~" } else { " /" };
             assert_eq!(
@@ -1678,7 +1674,7 @@ mod tests {
         a.select_wid("@0");
         for (w, h) in [(200, 50), (120, 40)] {
             let s = screen(&mut a, w, h);
-            let band = line(&s, "│.0 2.1.283");
+            let band = line(&s, "│.0 claude");
             assert!(band.contains("◐ waiting"), "{w}x{h}: {s}");
             assert!(s.contains("line two"), "{s}");
             for gone in ["subagents", "background", "please refactor", "·  claude"] {
@@ -1688,8 +1684,8 @@ mod tests {
         // two agents: a band each
         a.select_key("@1/%11");
         let s = screen(&mut a, 200, 50);
-        assert!(line(&s, "│.0 2.1.283").contains("● running"), "{s}");
-        assert!(line(&s, ".1 2.1.283").contains("● running"), "{s}");
+        assert!(line(&s, "│.0 claude").contains("● running"), "{s}");
+        assert!(line(&s, ".1 claude").contains("● running"), "{s}");
         // a stale agent says so
         a.select_wid("@2");
         let s = screen(&mut a, 200, 50);

@@ -91,15 +91,15 @@ impl Row {
 }
 
 /// The command a pane shows: Claude Code's executable is named after its
-/// version (`2.1.296`), so a pane tmux-home's hooks tagged as an agent
-/// (`@home_agent`) whose command is a bare `N.N.N` shows the agent's name
-/// instead. Anything else, an untagged version-named process included, is
-/// shown as tmux reports it.
+/// version (`2.1.296`), so a pane tagged as an agent whose command is a
+/// bare `N.N.N` shows the agent's name instead: `@home_agent` (tmux-home's
+/// hooks), else the legacy `@pane_agent` older sessions still carry.
+/// Anything else, an untagged version-named process included, is shown as
+/// tmux reports it.
 pub fn display_cmd(p: &crate::tmux::snapshot::Pane) -> String {
-    match p.agent_opts.get("@home_agent") {
-        Some(agent) if !agent.is_empty() && crate::agent::is_version(&p.current_command) => {
-            agent.clone()
-        }
+    let tag = |k: &str| p.agent_opts.get(k).filter(|v| !v.is_empty());
+    match tag("@home_agent").or_else(|| tag("@pane_agent")) {
+        Some(agent) if crate::agent::is_version(&p.current_command) => agent.clone(),
         _ => p.current_command.clone(),
     }
 }
@@ -1477,21 +1477,34 @@ mod tests {
     /// agent's name instead, nothing else changes.
     #[test]
     fn display_cmd_names_version_named_agents() {
-        let p = |cmd: &str, tag: Option<&str>| {
+        let tagged = |cmd: &str, opts: &[(&str, &str)]| {
             let mut p = Pane {
                 current_command: cmd.into(),
                 ..Default::default()
             };
-            if let Some(t) = tag {
-                p.agent_opts.insert("@home_agent".into(), t.into());
+            for (k, v) in opts {
+                p.agent_opts.insert(k.to_string(), v.to_string());
             }
             p
+        };
+        let p = |cmd: &str, tag: Option<&str>| match tag {
+            Some(t) => tagged(cmd, &[("@home_agent", t)]),
+            None => tagged(cmd, &[]),
         };
         assert_eq!(display_cmd(&p("2.1.296", Some("claude"))), "claude");
         assert_eq!(display_cmd(&p("node", Some("claude"))), "node");
         assert_eq!(display_cmd(&p("2.1", Some("claude"))), "2.1");
         assert_eq!(display_cmd(&p("2.1.296", None)), "2.1.296");
         assert_eq!(display_cmd(&p("fish", None)), "fish");
+        // older sessions are tagged with the legacy @pane_agent instead;
+        // @home_agent wins when both are set
+        let legacy = [("@pane_agent", "codex")];
+        assert_eq!(display_cmd(&tagged("2.1.296", &legacy)), "codex");
+        assert_eq!(display_cmd(&tagged("fish", &legacy)), "fish");
+        let both = [("@home_agent", "claude"), ("@pane_agent", "codex")];
+        assert_eq!(display_cmd(&tagged("2.1.296", &both)), "claude");
+        let empty = [("@home_agent", ""), ("@pane_agent", "claude")];
+        assert_eq!(display_cmd(&tagged("2.1.296", &empty)), "claude");
         // in the rows: the pane's command, the hay and an automatic name
         let mut s = snap();
         s.panes[3] = Pane {
