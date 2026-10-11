@@ -2,7 +2,7 @@
 //! (and of the preview's pane bands). Status is always icon **and**
 //! word, never colour alone; a stale agent is dimmed and says `(ended?)`.
 
-use crate::agent::{PaneAgent, Status};
+use crate::agent::Status;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::Span,
@@ -43,15 +43,6 @@ pub fn state_span(s: Status, stale: bool) -> Span<'static> {
     } else {
         Span::styled(format!("{} {}", s.icon(), s.word()), status_style(s))
     }
-}
-
-/// Why `p` needs you: its wait reason, else `needs you`.
-pub fn need_reason(p: &PaneAgent) -> String {
-    p.state
-        .wait_reason
-        .as_ref()
-        .map(|r| r.label())
-        .unwrap_or_else(|| "needs you".into())
 }
 
 #[cfg(test)]

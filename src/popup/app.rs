@@ -1359,10 +1359,8 @@ pub const COLUMNS: &str = "  columns         window row / pane row
                   the pane's (● running ◐ waiting ✕ error ◎ background
                   ○ idle; dim with (ended?): the agent has gone)
   T               — / the agent's run time
-  AG              agent kind, ×N live agents / the pane's agent
   PA              — / the pane's directory
-  GT              — / git badge of the pane's directory (below)
-  MS              — / why it needs you (yellow), else the last prompt";
+  GT              — / git badge of the pane's directory (below)";
 
 #[cfg(test)]
 mod tests {

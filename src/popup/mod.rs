@@ -517,39 +517,28 @@ enum Col {
     Cmd,
     State,
     Time,
-    Agent,
     Path,
     Git,
-    Msg,
 }
 
-const COLS: [Col; 9] = [
+const NCOLS: usize = 7;
+
+const COLS: [Col; NCOLS] = [
     Col::Idx,
     Col::Name,
     Col::Cmd,
     Col::State,
     Col::Time,
-    Col::Agent,
     Col::Path,
     Col::Git,
-    Col::Msg,
 ];
 
-/// Dropped in this order when the row is too narrow (after `Msg`, which
-/// only takes what is left).
-const DROP: [Col; 6] = [
-    Col::Git,
-    Col::Path,
-    Col::Time,
-    Col::Agent,
-    Col::Cmd,
-    Col::State,
-];
+/// Dropped in this order when the row is too narrow.
+const DROP: [Col; 5] = [Col::Git, Col::Path, Col::Time, Col::Cmd, Col::State];
 /// The selection bar, the current-window mark and a space.
 const GUTTER: usize = 3;
 const SEP: &str = "  ";
 const NAME_MIN: usize = 8;
-const MSG_MIN: usize = 8;
 
 impl Col {
     fn label(self) -> &'static str {
@@ -559,19 +548,17 @@ impl Col {
             Col::Cmd => "CM",
             Col::State => "ST",
             Col::Time => "T",
-            Col::Agent => "AG",
             Col::Path => "PA",
             Col::Git => "GT",
-            Col::Msg => "MS",
         }
     }
 
     /// The widest a column gets.
     fn cap(self) -> usize {
         match self {
-            Col::Idx | Col::Msg => usize::MAX,
+            Col::Idx => usize::MAX,
             Col::Name | Col::Path => 24,
-            Col::Cmd | Col::Agent => 12,
+            Col::Cmd => 12,
             Col::State => 18,
             Col::Time => 6,
             Col::Git => 32,
@@ -582,7 +569,7 @@ impl Col {
 /// The column widths of a page; a width of 0 is a column not shown.
 #[derive(Clone, Debug, PartialEq)]
 struct Table {
-    w: [usize; 9],
+    w: [usize; NCOLS],
 }
 
 impl Table {
@@ -590,9 +577,9 @@ impl Table {
         self.w[c as usize] > 0
     }
 
-    /// Columns used (gutter and separators included), `Msg` aside.
+    /// Columns used (gutter and separators included).
     fn used(&self) -> usize {
-        let cols: Vec<usize> = COLS[..8]
+        let cols: Vec<usize> = COLS
             .iter()
             .filter(|&&c| self.on(c))
             .map(|&c| self.w[c as usize])
@@ -634,10 +621,10 @@ fn shows_title(title: &str, host: &str) -> bool {
 }
 
 /// The cells of a line, one per column (empty: nothing to show).
-fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; 9] {
+fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; NCOLS] {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let r = &app.rows[it.row];
-    let mut c: [Vec<Span<'static>>; 9] = Default::default();
+    let mut c: [Vec<Span<'static>>; NCOLS] = Default::default();
     let mut set = |col: Col, s: Span<'static>| c[col as usize] = vec![s];
     match it.pane {
         None => {
@@ -650,15 +637,6 @@ fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; 9] {
                         Some(s) => agents::state_span(s, false),
                         None => agents::state_span(a.lead().state.status, true),
                     },
-                );
-                let n = a.live_count();
-                let kind = match n {
-                    0 | 1 => a.lead().state.kind.name().to_string(),
-                    n => format!("{} ×{n}", a.lead().state.kind.name()),
-                };
-                set(
-                    Col::Agent,
-                    Span::styled(kind, if a.stale() { dim } else { Style::default() }),
                 );
             }
         }
@@ -681,21 +659,6 @@ fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; 9] {
                 set(Col::State, agents::state_span(a.state.status, a.stale));
                 if let Some(t) = a.state.run_started.filter(|_| a.live()) {
                     set(Col::Time, Span::raw(crate::agent::elapsed(t, now)));
-                }
-                set(
-                    Col::Agent,
-                    Span::styled(
-                        a.state.kind.name().to_string(),
-                        if a.stale { dim } else { Style::default() },
-                    ),
-                );
-                if a.needs_you() {
-                    set(
-                        Col::Msg,
-                        Span::styled(agents::need_reason(a), Style::default().fg(Color::Yellow)),
-                    );
-                } else if let Some(pr) = &a.state.prompt {
-                    set(Col::Msg, Span::styled(pr.replace('\n', " "), dim));
                 }
             }
             set(Col::Path, Span::styled(p.path.clone(), dim));
@@ -727,11 +690,10 @@ fn page_items(app: &App) -> Vec<Item> {
 
 /// The page's column widths in `width` columns: each column as wide as
 /// its widest cell (capped; at least its label), columns nothing fills
-/// left out. `MS` takes what the others leave, if that is enough; too
-/// narrow, it goes, then the others right to left (`DROP`), then `NM`
+/// left out. Too narrow, columns go right to left (`DROP`), then `NM`
 /// gives way down to `NAME_MIN`.
 fn table(app: &App, width: usize, now: u64) -> Table {
-    let mut w = [0usize; 9];
+    let mut w = [0usize; NCOLS];
     for it in page_items(app) {
         for (i, cell) in cells(app, it, now).iter().enumerate() {
             w[i] = w[i].max(spans_width(cell));
@@ -744,10 +706,6 @@ fn table(app: &App, width: usize, now: u64) -> Table {
         }
     }
     let mut t = Table { w };
-    // MS goes first: it shows only if everything else fits
-    let rest = width.saturating_sub(t.used() + SEP.len());
-    let msg = &mut t.w[Col::Msg as usize];
-    *msg = if *msg > 0 && rest >= MSG_MIN { rest } else { 0 };
     for c in DROP {
         if t.used() <= width {
             break;
@@ -761,7 +719,7 @@ fn table(app: &App, width: usize, now: u64) -> Table {
 }
 
 /// A line's cells laid out in the table's columns (after the gutter).
-fn table_spans(t: &Table, cells: [Vec<Span<'static>>; 9]) -> Vec<Span<'static>> {
+fn table_spans(t: &Table, cells: [Vec<Span<'static>>; NCOLS]) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut first = true;
     for (c, cell) in COLS.iter().zip(cells) {
@@ -1515,7 +1473,7 @@ mod tests {
             "prefix )  (     next / previous session page",
             "columns",
             "NM              window name / pane title",
-            "MS              — / why it needs you",
+            "GT              — / git badge",
             "git badge",
             "⚠n stray branches",
             "~ stale",
@@ -1524,6 +1482,9 @@ mod tests {
             assert!(s.contains(want), "no {want:?} in\n{s}");
         }
         assert!(!s.contains("s:<session>"), "{s}");
+        for gone in ["AG ", "MS "] {
+            assert!(!s.contains(gone), "{gone:?} in\n{s}");
+        }
     }
 
     #[test]
@@ -1541,15 +1502,13 @@ mod tests {
             assert!(lines[needs + 1].contains("fix"), "{s}");
             assert!(lines[needs + 1].contains("◐ waiting"), "{s}");
             assert!(lines[needs + 2].contains("└ .0"), "{s}");
-            assert!(lines[needs + 2].contains("permission"), "{s}");
+            assert!(!lines[needs + 2].contains("permission"), "no MS: {s}");
             assert!(lines[needs + 3].contains("─ dev ─"), "{s}");
-            // the window: its most urgent state, the kind ×N; its panes:
-            // each one's state and run time
+            // the window: its most urgent state; its panes: each one's
+            // state and run time
             let api = line(&s, " api");
-            assert!(
-                api.contains("● running") && api.contains("claude ×2"),
-                "{s}"
-            );
+            assert!(api.contains("● running"), "{s}");
+            assert!(!api.contains("claude ×2"), "no AG: {s}");
             assert!(!api.contains("12m"), "no run time on a window: {s}");
             let api_panes: Vec<&str> = lines
                 .iter()
@@ -1570,9 +1529,9 @@ mod tests {
             assert_eq!(s.matches(" fix ").count(), 2, "{s}");
             assert!(line(&s, "> ").ends_with("4/4"), "windows, not lines: {s}");
         }
-        // the prompt shows (dim) on a pane row when nothing is waiting
+        // no prompt on a pane row (the pane shows it)
         let s = screen(&mut a, 200, 50);
-        assert!(line(&s, "├ .0").contains("add the tests"), "{s}");
+        assert!(!s.contains("add the tests"), "{s}");
     }
 
     /// The column header names the columns over the cells they head; the
@@ -1582,7 +1541,7 @@ mod tests {
         let mut a = app_of(&git_snap());
         let s = screen(&mut a, 200, 50);
         let head = s.lines().nth(2).unwrap().to_string();
-        let labels = ["#", "NM", "CM", "ST", "T", "AG", "PA", "GT", "MS"];
+        let labels = ["#", "NM", "CM", "ST", "T", "PA", "GT"];
         let words: Vec<(usize, &str)> = head
             .char_indices()
             .filter(|&(i, c)| c != ' ' && (i == 0 || head[..i].ends_with(' ')))
@@ -1612,10 +1571,10 @@ mod tests {
                 "2.1.283"
             };
             assert_eq!(col(l, cmd), at[2], "{l:?}\n{s}");
-            let path = if l.contains('~') { "~" } else { " / " };
+            let path = if l.contains('~') { "~" } else { " /" };
             assert_eq!(
-                col(l, path) + usize::from(path == " / "),
-                at[6],
+                col(l, path) + usize::from(path == " /"),
+                at[5],
                 "{l:?}\n{s}"
             );
         }
@@ -1623,18 +1582,13 @@ mod tests {
             assert_eq!(col(l, "●"), at[3], "{l:?}\n{s}");
         }
         let pane = line(&s, "~/d/a/src");
-        assert_eq!(col(&pane, "main"), at[7], "{s}");
-        let wait = s
-            .lines()
-            .find(|l| l.contains("permission") && l.contains("└"))
-            .unwrap();
-        assert_eq!(col(wait, "permission"), at[8], "{s}");
+        assert_eq!(col(&pane, "main"), at[6], "{s}");
         // the header is dim
         let buf = render(&mut a, 200, 50, &Shot::default());
         assert!(buf[(4, 2)].modifier.contains(Modifier::DIM));
     }
 
-    /// Narrow: columns go right to left (MS, GT, PA, T, …); # and NM stay.
+    /// Narrow: columns go right to left (GT, PA, T, …); # and NM stay.
     #[test]
     fn narrow_widths_drop_columns_right_to_left() {
         let head = |w| {
@@ -1647,9 +1601,9 @@ mod tests {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         };
-        let all = ["#", "NM", "CM", "ST", "T", "AG", "PA", "GT", "MS"];
+        let all = ["#", "NM", "CM", "ST", "T", "PA", "GT"];
         assert_eq!(head(200), all);
-        let order = ["MS", "GT", "PA", "T", "AG", "CM", "ST"];
+        let order = ["GT", "PA", "T", "CM", "ST"];
         let mut last = 0;
         for w in (30..200).rev().step_by(3) {
             let h = head(w);

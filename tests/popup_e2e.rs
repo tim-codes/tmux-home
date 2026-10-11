@@ -415,8 +415,8 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
     assert!(
         screen
             .lines()
-            .any(|l| l.contains(" .0") && l.contains("permission")),
-        "the reason on its pane row:\n{screen}"
+            .any(|l| l.contains(" .0") && l.contains("◐ waiting")),
+        "the state on its pane row:\n{screen}"
     );
     assert!(
         pinned[0].starts_with('▌'),
