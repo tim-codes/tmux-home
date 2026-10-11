@@ -1212,15 +1212,16 @@ impl App {
     }
 }
 
-/// The F1 page: keys, the columns, then the git badge legend.
-pub fn help() -> String {
-    format!(
-        "{HELP}\n\n{COLUMNS}\n\n{}\n\npress any key to return",
-        crate::git::badge::LEGEND
+/// The F1 page: the keys, and the legends (the columns, then the git
+/// badge).
+pub fn help() -> (String, String) {
+    (
+        HELP.to_string(),
+        format!("{COLUMNS}\n\n{}", crate::git::badge::LEGEND),
     )
 }
 
-pub const HELP: &str = "tmux-home — keys
+pub const HELP: &str = "tmux-home — keys   (press any key to return)
 
   type            filter the session's windows (name, command, path,
                   agent prompt; a window matching by a pane shows all its

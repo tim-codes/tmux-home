@@ -738,7 +738,18 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, shot: &Shot, now: u64) {
     app.preview_rows = 0;
     app.list_hits.clear();
     if app.mode == Mode::Help {
-        f.render_widget(Paragraph::new(app::help()), area);
+        // side by side when wide: the keys, then the legends
+        let (keys, legends) = app::help();
+        if area.width >= 160 {
+            let h = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            f.render_widget(Paragraph::new(keys), h[0]);
+            f.render_widget(Paragraph::new(format!("\n\n{legends}")), h[1]);
+        } else {
+            f.render_widget(Paragraph::new(format!("{keys}\n\n{legends}")), area);
+        }
         return;
     }
     let v = Layout::default()
@@ -746,7 +757,8 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, shot: &Shot, now: u64) {
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(1),
+            // the column header goes first when there is no room
+            Constraint::Length(u16::from(area.height >= 5)),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
