@@ -140,8 +140,17 @@ session pages, a window/pane tree, a column table, a bottom layout preview.*
   then `GT`, `PA`, `T`, `AG`, `CM`, `ST`; `NM` shrinks no further than its
   minimum. `F1` lists the legend. Sidebar panes (`@pane_role=sidebar`) are
   never listed or counted.
-- **Preview:** always at the bottom: half the list area when the popup is
-  ≥ 30 rows, else hidden unless `^o` (which also hides a shown one). It
+- **Preview:** always at the bottom, shown when the popup is ≥ 30 rows,
+  else hidden unless `^o` (which also hides a shown one) or `M-k`. Size,
+  auto (no `@home-preview-pct`): the list gets its page's lines (window and
+  pane rows, group headers) + 2 blank rows, the preview the rest,
+  recomputed every draw; if that leaves the preview under max(⅓ of the
+  list+preview area, 5 rows) it is a 50/50 split and the list scrolls.
+  `M-k`/`M-j` move the divider 5 points up/down, starting from the split
+  shown (auto converted to its percentage), clamped so list and preview
+  keep 5 rows each (no-op at the limit; `M-j` never hides the preview), and
+  write `set -g @home-preview-pct N`; `M-=` unsets it. A set size is
+  clamped the same way on a smaller popup. It
   draws the selected window's pane layout — each pane's visible capture
   (`capture-pane -e`) in its rectangle scaled to the preview (the bounding
   box of the non-sidebar panes), inside a frame with tmux-style separators.
@@ -168,6 +177,8 @@ session pages, a window/pane tree, a column table, a bottom layout preview.*
 | `^g` | Jump to the next window needing attention, paging to its session |
 | `Esc` | Clear filter; if already empty, close |
 | `prefix` + home key | Close, from any mode (the key that opened the popup toggles it). Inside the popup tmux passes the prefix on, so the chord arrives as two keys; the popup learns its prefix and `@home-keys` from `TMUX_HOME_PREFIX` / `TMUX_HOME_KEYS`, set by the binding. The prefix keeps its own meaning (`^a`: cursor to the start; cancels a close prompt; leaves help), so only a home key straight after it closes. An unsaved rename / new-window name is dropped and a pending close is not done. Only single-character home keys count; `prefix2` is not recognised. |
+| `M-k` / `M-j` | Preview larger / smaller: divider up / down 5 points (§5); `M-k` shows a hidden preview. List only — the editors ignore them (no text inserted). tmux delivers them to the popup even with root-table `M-j`/`M-k` bindings (`resize-pane`): while a popup has focus its keys go to the popup's program |
+| `M-=` | Preview back to auto size (unsets `@home-preview-pct`) |
 | `F1` or `^/` | All keys |
 
 Filter tokens (combine with text): `@attn`, `@agent`, `@running`,
@@ -303,6 +314,7 @@ Only what the primary user needs; more when someone asks.
 | --- | --- |
 | `@home-keys` | `w f` (space-separated prefix keys; empty = bind nothing) |
 | `@home-preview` | `auto` (`right`, `bottom`, `off`) |
+| `@home-preview-pct` | unset = auto size (§5); 1–99 = the preview's % of the list+preview area, written by `M-j`/`M-k`, unset by `M-=` |
 | `@home-restore-agents` | `off` (`on`: resume Claude Code sessions after a resurrect restore, §12) |
 | `@home-restore-agents-delay` | `2` (seconds between resumed launches) |
 
