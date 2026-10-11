@@ -13,6 +13,7 @@ use crate::tmux::snapshot::Snapshot;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub wid: String,
+    pub sid: String,
     pub session: String,
     pub index: u32,
     pub name: String,
@@ -38,6 +39,7 @@ impl Entry {
         });
         Entry {
             wid: r.wid.clone(),
+            sid: r.sid.clone(),
             session: r.session.clone(),
             index: r.index,
             name: r.name.clone(),
@@ -62,12 +64,25 @@ pub struct Model {
     pub tally: Tally,
     pub sessions: usize,
     pub window_count: usize,
+    /// The sidebar's pane is its window's active pane, in its session's
+    /// current window: keys typed go to the sidebar.
+    pub focused: bool,
+}
+
+/// The selected row: a window, in NEEDS YOU (`needs`) or in the session's
+/// list. Kept by window ID so it follows its window across rebuilds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sel {
+    pub needs: bool,
+    pub wid: String,
 }
 
 impl Model {
     /// The model for the sidebar in pane `me`.
     pub fn build(s: &Snapshot, me: &str, home: &str) -> Model {
         let mine = s.panes.iter().find(|p| p.id == me);
+        let focused = mine
+            .is_some_and(|p| p.active && s.windows.iter().any(|w| w.id == p.window_id && w.active));
         let (sid, wid) = mine
             .map(|p| (p.session_id.as_str(), p.window_id.as_str()))
             .unwrap_or_default();
@@ -80,6 +95,7 @@ impl Model {
                 .map(|x| x.name.clone()),
             sessions: s.sessions.len(),
             window_count: rows.iter().filter(|r| !r.pinned).count(),
+            focused,
             ..Model::default()
         };
         for r in &rows {
@@ -95,6 +111,52 @@ impl Model {
             }
         }
         m
+    }
+
+    /// The selectable rows, top to bottom: NEEDS YOU, then the session's
+    /// windows.
+    pub fn rows(&self) -> impl Iterator<Item = (bool, &Entry)> {
+        let needs = self.needs.iter().map(|e| (true, e));
+        needs.chain(self.windows.iter().map(|e| (false, e)))
+    }
+
+    /// The selected entry, if it is still listed.
+    pub fn entry(&self, sel: &Sel) -> Option<&Entry> {
+        self.rows()
+            .find(|(n, e)| *n == sel.needs && e.wid == sel.wid)
+            .map(|(_, e)| e)
+    }
+
+    /// The selection the sidebar's own window row starts with.
+    pub fn here(&self) -> Option<Sel> {
+        self.windows.iter().find(|e| e.here).map(|e| Sel {
+            needs: false,
+            wid: e.wid.clone(),
+        })
+    }
+
+    /// `delta` rows from `sel` (from the sidebar's own window, else the
+    /// first row, when there is no selection or it has gone), clamped to
+    /// the list; `None` when nothing is listed.
+    pub fn step(&self, sel: Option<&Sel>, delta: isize) -> Option<Sel> {
+        let rows: Vec<(bool, &Entry)> = self.rows().collect();
+        if rows.is_empty() {
+            return None;
+        }
+        let find = |s: &Sel| {
+            rows.iter()
+                .position(|(n, e)| *n == s.needs && e.wid == s.wid)
+        };
+        let from = sel
+            .and_then(find)
+            .or_else(|| self.here().as_ref().and_then(find))
+            .unwrap_or(0);
+        let to = from.saturating_add_signed(delta).min(rows.len() - 1);
+        let (needs, e) = rows[to];
+        Some(Sel {
+            needs,
+            wid: e.wid.clone(),
+        })
     }
 
     /// The bottom line: `2s 7w · 1 waiting · 2 running` (`no agents`
@@ -261,6 +323,46 @@ pub(crate) mod tests {
             Model::build(&quiet, "%9", "/home").tally_line(),
             "2s 4w · no agents"
         );
+    }
+
+    #[test]
+    fn focus_is_the_active_pane_of_the_current_window() {
+        let mut s = snap();
+        assert!(!Model::build(&s, "%9", "/home").focused, "%2 is active");
+        for p in s.panes.iter_mut().filter(|p| p.window_id == "@2") {
+            p.active = p.id == "%9";
+        }
+        assert!(
+            !Model::build(&s, "%9", "/home").focused,
+            "@2 isn't its session's current window"
+        );
+        for w in &mut s.windows {
+            w.active = w.id == "@2";
+        }
+        assert!(Model::build(&s, "%9", "/home").focused);
+    }
+
+    #[test]
+    fn the_selection_steps_over_needs_you_then_windows_and_clamps() {
+        let m = Model::build(&snap(), "%9", "/home");
+        let sel = |needs, wid: &str| Sel {
+            needs,
+            wid: wid.into(),
+        };
+        assert_eq!(m.here(), Some(sel(false, "@2")));
+        // no selection: from the sidebar's own window
+        assert_eq!(m.step(None, 1), Some(sel(false, "@3")));
+        assert_eq!(m.step(None, 0), Some(sel(false, "@2")));
+        assert_eq!(m.step(None, -2), Some(sel(true, "@4")));
+        assert_eq!(m.step(Some(&sel(false, "@3")), 5), Some(sel(false, "@3")));
+        assert_eq!(m.step(Some(&sel(true, "@1")), -1), Some(sel(true, "@1")));
+        // the same window, pinned and listed, are two rows
+        assert_eq!(m.step(Some(&sel(true, "@4")), 1), Some(sel(false, "@1")));
+        // a selection whose window went starts over from here
+        assert_eq!(m.step(Some(&sel(false, "@99")), 0), m.here());
+        assert_eq!(m.entry(&sel(true, "@4")).unwrap().name, "logs");
+        assert_eq!(m.entry(&sel(false, "@4")), None, "ops isn't listed");
+        assert_eq!(Model::default().step(None, 1), None);
     }
 
     #[test]

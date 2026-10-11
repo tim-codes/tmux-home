@@ -113,6 +113,64 @@ fn toggle_adds_and_removes_a_sidebar_in_the_window() {
     assert_eq!(panes(&s, "alpha:0"), [main]);
 }
 
+/// A client focused on the sidebar of alpha:0 (windows 0, "two",
+/// "three"): returns the sidebar pane, the window's real pane and the
+/// outer client. Keys go through a real tmux client, as typed.
+fn focused_sidebar(s: &TestServer) -> (String, String, Outer) {
+    s.tmux(&["set-option", "-g", "escape-time", "50"]);
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "two"]);
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "three"]);
+    let main = panes(s, "alpha:0")[0].clone();
+    toggle(s, &["--window", "alpha:0"]);
+    let side = sidebars(s, "alpha:0")[0].clone();
+    wait_screen(s, &side, r"^▌  0 ");
+    let o = Outer::attach(s, "alpha:0", 120, 30);
+    s.tmux(&["select-pane", "-t", &side]);
+    assert_eq!(
+        fmt(s, "alpha:0", "#{pane_id}"),
+        side,
+        "the sidebar has focus"
+    );
+    (side, main, o)
+}
+
+#[test]
+fn a_focused_sidebar_moves_and_enter_switches_to_the_window() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    let (side, main, o) = focused_sidebar(&s);
+    o.keys(&["Down", "j", "k", "C-n"]);
+    o.keys(&["Enter"]);
+    wait_until("the client on alpha:three", || {
+        client_at(&s) == "alpha:three"
+    });
+    assert_eq!(
+        fmt(&s, "alpha:0", "#{pane_id}"),
+        main,
+        "the sidebar's window gets its real pane back"
+    );
+    assert!(panes(&s, "alpha:0").contains(&side), "the sidebar stays");
+    // up from the top stays on the top row
+    s.tmux(&["select-window", "-t", "alpha:0"]);
+    s.tmux(&["select-pane", "-t", &side]);
+    o.keys(&["Up", "C-p", "k", "j"]);
+    o.keys(&["Enter"]);
+    wait_until("the client on alpha:two", || client_at(&s) == "alpha:two");
+}
+
+#[test]
+fn escape_in_a_focused_sidebar_returns_focus_to_the_last_pane() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    let (side, main, o) = focused_sidebar(&s);
+    o.keys(&["Escape"]);
+    wait_until("focus back on the real pane", || {
+        fmt(&s, "alpha:0", "#{pane_id}") == main
+    });
+    assert!(panes(&s, "alpha:0").contains(&side), "Esc doesn't close it");
+    assert_eq!(fmt(&s, "alpha:", "#{window_index}"), "0", "no switch");
+}
+
 #[test]
 fn width_and_side_come_from_options() {
     let _env = TestEnv::new();
@@ -360,7 +418,7 @@ fn a_restored_sidebar_runs_in_a_shell_and_q_closes_its_pane() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         panes(&s, "alpha:0").contains(&pane),
-        "other keys are ignored"
+        "other keys (and Enter, j) don't close it"
     );
     s.tmux(&["send-keys", "-t", &pane, "q"]);
     wait_until("the pane closed, shell and all", || {

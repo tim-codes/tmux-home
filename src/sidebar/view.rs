@@ -2,7 +2,7 @@
 //! compact look — status icon (never colour alone), name, and the git
 //! badge clipped by whole pieces.
 
-use super::model::{Entry, Model};
+use super::model::{Entry, Model, Sel};
 use crate::agent::Status;
 use crate::popup::{agents::clip, git};
 use ratatui::{
@@ -111,10 +111,25 @@ fn needs_lines(e: &Entry, width: usize) -> [Line<'static>; 2] {
     ]
 }
 
-/// The body lines (everything above the tally) and the index of the
-/// sidebar's own window line, if listed.
-pub fn body(m: &Model, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
+/// Shows `lines` as the selected row: reversed, to the edge.
+fn select(lines: &mut [Line<'static>], width: usize) {
+    for l in lines {
+        let w = l.width();
+        if w < width {
+            l.spans.push(Span::raw(" ".repeat(width - w)));
+        }
+        for s in &mut l.spans {
+            s.style = s.style.add_modifier(Modifier::REVERSED);
+        }
+    }
+}
+
+/// The body lines (everything above the tally) and the line to keep in
+/// view: the selected row's, else the sidebar's own window line, if listed.
+pub fn body(m: &Model, width: usize, sel: Option<&Sel>) -> (Vec<Line<'static>>, Option<usize>) {
     let mut lines = Vec::new();
+    let mut picked = None;
+    let is = |needs: bool, e: &Entry| sel.is_some_and(|s| s.needs == needs && s.wid == e.wid);
     if !m.needs.is_empty() {
         lines.push(rule(
             "NEEDS YOU",
@@ -124,7 +139,12 @@ pub fn body(m: &Model, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
                 .add_modifier(Modifier::BOLD),
         ));
         for e in &m.needs {
-            lines.extend(needs_lines(e, width));
+            let mut l = needs_lines(e, width);
+            if is(true, e) {
+                select(&mut l, width);
+                picked = Some(lines.len());
+            }
+            lines.extend(l);
         }
     }
     let mut here = None;
@@ -141,25 +161,31 @@ pub fn body(m: &Model, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
                 if e.here {
                     here = Some(lines.len());
                 }
-                lines.push(window_line(e, width));
+                let mut l = [window_line(e, width)];
+                if is(false, e) {
+                    select(&mut l, width);
+                    picked = Some(lines.len());
+                }
+                lines.extend(l);
             }
         }
         None => lines.push(Line::styled(" …", dim())),
     }
-    (lines, here)
+    (lines, picked.or(here))
 }
 
-/// Draws the sidebar; `live` is false while it reads tmux directly (no
-/// daemon), shown as `○` before the tally.
-pub fn draw(f: &mut Frame, m: &Model, live: bool) {
+/// Draws the sidebar with `sel` highlighted; `live` is false while it
+/// reads tmux directly (no daemon), shown as `○` before the tally.
+pub fn draw(f: &mut Frame, m: &Model, live: bool, sel: Option<&Sel>) {
     let area = f.area();
     if area.width == 0 || area.height == 0 {
         return;
     }
     let width = area.width as usize;
     let h = area.height.saturating_sub(1) as usize;
-    let (lines, here) = body(m, width);
-    // keep the sidebar's own window in view in a short pane
+    let (lines, here) = body(m, width, sel);
+    // keep the selection, else the sidebar's own window, in view in a
+    // short pane
     let top = here.map_or(0, |i| i.saturating_sub(h.saturating_sub(1)));
     let shown: Vec<Line> = lines.into_iter().skip(top).take(h).collect();
     f.render_widget(
@@ -191,7 +217,7 @@ mod tests {
 
     fn screen(m: &Model, w: u16, h: u16, live: bool) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, m, live)).unwrap();
+        t.draw(|f| draw(f, m, live, None)).unwrap();
         let buf = t.backend().buffer().clone();
         (0..h)
             .map(|y| {
@@ -250,7 +276,7 @@ mod tests {
     fn here_is_highlighted_and_degraded_shows_the_chip() {
         let m = model();
         let mut t = Terminal::new(TestBackend::new(32, 14)).unwrap();
-        t.draw(|f| draw(f, &m, false)).unwrap();
+        t.draw(|f| draw(f, &m, false, None)).unwrap();
         let buf = t.backend().buffer().clone();
         assert_eq!(buf[(3, 7)].bg, Color::DarkGray, "the sidebar's window");
         assert_eq!(buf[(31, 7)].bg, Color::DarkGray, "to the edge");
@@ -266,6 +292,37 @@ mod tests {
         let lines: Vec<&str> = s.lines().collect();
         assert!(lines[2].starts_with("▌  2 a-rather"), "{s}");
         assert!(lines[3].starts_with(" 2s 4w"), "{s}");
+    }
+
+    #[test]
+    fn the_selection_is_reversed_and_kept_in_view() {
+        let m = model();
+        let sel = Sel {
+            needs: false,
+            wid: "@3".into(),
+        };
+        let mut t = Terminal::new(TestBackend::new(32, 14)).unwrap();
+        t.draw(|f| draw(f, &m, true, Some(&sel))).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rev = |x, y| buf[(x, y)].modifier.contains(Modifier::REVERSED);
+        assert!(rev(0, 8) && rev(31, 8), "the ed row, to the edge");
+        assert!(!rev(0, 7) && !rev(0, 6));
+        let needs = Sel {
+            needs: true,
+            wid: "@4".into(),
+        };
+        t.draw(|f| draw(f, &m, true, Some(&needs))).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rev = |x, y| buf[(x, y)].modifier.contains(Modifier::REVERSED);
+        assert!(rev(1, 3) && rev(1, 4), "both lines of ops:0 logs");
+        assert!(!rev(1, 1) && !rev(1, 8));
+        // a 4-row pane scrolls to the selection, not to its own window
+        let mut t = Terminal::new(TestBackend::new(32, 4)).unwrap();
+        t.draw(|f| draw(f, &m, true, Some(&sel))).unwrap();
+        let top: String = (0..10)
+            .map(|x| t.backend().buffer()[(x, 2)].symbol().to_string())
+            .collect();
+        assert!(top.starts_with(" ● 3 ed"), "{top:?}");
     }
 
     #[test]
