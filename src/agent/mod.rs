@@ -442,6 +442,7 @@ pub(crate) mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>(),
             tty: String::new(),
+            ..Default::default()
         }
     }
 

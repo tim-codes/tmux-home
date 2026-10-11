@@ -73,7 +73,7 @@ pub struct Window {
     pub active: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash, Default)]
 pub struct Pane {
     pub id: String,
     pub window_id: String,
@@ -101,6 +101,20 @@ pub struct Pane {
     /// The pane's terminal (`/dev/ttys004`), for stopped-job checks.
     #[serde(default)]
     pub tty: String,
+    /// Geometry in cells, within its window (the popup's layout preview).
+    #[serde(default)]
+    pub left: u32,
+    #[serde(default)]
+    pub top: u32,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    /// The size of the pane's window, in cells.
+    #[serde(default)]
+    pub window_width: u32,
+    #[serde(default)]
+    pub window_height: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
@@ -123,10 +137,10 @@ const REC_END: &str = "\x1e\n";
 // The agent options sit between the fixed fields and the names; a prompt is
 // stored with newlines and `|` replaced, but a literal \x1f in one would
 // shift the fields after it (the record is then misread, not lost).
-const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{?#{@home_role},#{@home_role},#{@pane_role}}\x1f#{pane_tty}\x1f#{@home_role}\x1f";
+const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{?#{@home_role},#{@home_role},#{@pane_role}}\x1f#{pane_tty}\x1f#{@home_role}\x1f#{pane_left}\x1f#{pane_top}\x1f#{pane_width}\x1f#{pane_height}\x1f#{window_width}\x1f#{window_height}\x1f";
 const PANE_TAIL: &str = "#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
 /// Fields before the agent options.
-const HEAD_FIELDS: usize = 13;
+const HEAD_FIELDS: usize = 19;
 /// Fields in a `list-panes` record.
 fn pane_fields() -> usize {
     HEAD_FIELDS + crate::agent::OPTIONS.len() + 3
@@ -229,6 +243,11 @@ fn pane_record(rec: &str) -> Option<PaneRec<'_>> {
     })
 }
 
+/// A geometry field; 0 if tmux left it empty.
+fn num(s: &str) -> u32 {
+    s.parse().unwrap_or(0)
+}
+
 /// Parses `list-panes`/`list-clients` output. An unparseable record is
 /// logged and skipped rather than failing the whole read: one odd pane must
 /// not blank the picture of every other one.
@@ -277,6 +296,12 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
             tty: f[11].to_string(),
             home_role: f[12].to_string(),
             agent_opts: agent_opts_from(&f[HEAD_FIELDS..n - 3]),
+            left: num(f[13]),
+            top: num(f[14]),
+            width: num(f[15]),
+            height: num(f[16]),
+            window_width: num(f[17]),
+            window_height: num(f[18]),
         });
     }
     for rec in records(clients) {

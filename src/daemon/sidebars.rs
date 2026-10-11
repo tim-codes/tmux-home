@@ -377,6 +377,7 @@ mod tests {
             home_role: if home { ROLE.into() } else { String::new() },
             agent_opts: Default::default(),
             tty: String::new(),
+            ..Default::default()
         }
     }
 

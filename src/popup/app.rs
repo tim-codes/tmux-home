@@ -997,6 +997,7 @@ mod tests {
                 home_role: String::new(),
                 agent_opts: Default::default(),
                 tty: String::new(),
+                ..Default::default()
             });
         }
         // a sidebar pane never describes the row
@@ -1013,6 +1014,7 @@ mod tests {
             home_role: String::new(),
             agent_opts: Default::default(),
             tty: String::new(),
+            ..Default::default()
         });
         s.clients.push(Client {
             name: "/dev/ttys1".into(),
