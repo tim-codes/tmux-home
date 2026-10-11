@@ -89,20 +89,20 @@ session pages, a window/pane tree, a column table, a bottom layout preview.*
 ```
   ▶dev ●1   scratch                                                       F1 help
 >                                                                             4/4
-   #     NM     CM       ST                  T    AG         PA             GT
+   #     NM     CM      ST                  T    PA             GT
  ─ NEEDS YOU ─────────────────────────────────────────────────────────────────────
-   0     fix             ◐ waiting                claude
-   └ .0         claude   ◐ waiting           12m  claude     ~/d/app.fix-x  fix/x (wt) ! ≡
+   0     fix
+   └ .0         claude  ◐ waiting           12m  ~/d/app.fix-x  fix/x (wt) ! ≡
  ─ dev ───────────────────────────────────────────────────────────────────────────
-   1     api             ● running                claude ×2
-   ├ .0         claude   ● running           12m  claude     ~/d/api
-▌  └ .1         claude   ● running           12m  claude     ~/d/api
+   1     api
+▌  ├ .0         claude  ● running           12m  ~/d/api        main ! ≡
+   └ .1         fish                             ~/d/api        main ! ≡
  ▶ 3     shell
-   └ .0         fish                                         ~/d/a/src      main +!? ⇡2
+   └ .0         fish                             ~/d/a/src      main +!? ⇕⇡2⇣1
 ──────────────────────────────────────────────────────────────────────────────────
- ● running  ·  claude  ·  run 12m
 ┌──────────────────────────────────────┬─────────────────────────────────────────┐
-│$ cargo test                          │> add the tests                          │
+│.0 claude  ● running  main ! ≡        │.1 fish  main ! ≡                        │
+│> add the tests                       │$ cargo test                             │
 └──────────────────────────────────────┴─────────────────────────────────────────┘
  ⏎ go   ^r rename   ^x close   M-↑↓ move   ^o preview   pfx ( ) session   F1 keys
 ```
@@ -118,7 +118,7 @@ session pages, a window/pane tree, a column table, a bottom layout preview.*
   pages. The filter is scoped to the page; paging keeps and re-applies it.
 - **Filter line:** always focused unless an inline editor is open; the
   count at its right is the page's windows matching / all.
-- **Column header:** dim, htop-style: `# NM CM ST T AG PA GT MS`.
+- **Column header:** dim, htop-style: `# NM CM ST T PA GT`.
 - **List:** a NEEDS YOU group (the page's windows that need you) when there
   is one, then the page's windows in index order. Every window is a row and
   every non-sidebar pane a row beneath it, single-pane windows included.
@@ -127,17 +127,18 @@ session pages, a window/pane tree, a column table, a bottom layout preview.*
   | --- | --- | --- | --- |
   | `#` | index | window index (`▶` before it: the client's window) | `├ .N` / `└ .N` |
   | `NM` | name | window name | pane title, blank when it is the host name |
-  | `CM` | command | — | current command (a tagged agent's version-named binary shows as the agent) |
-  | `ST` | agent state, icon and word | most urgent pane's | the pane's; stale: dim `(ended?)` |
+  | `CM` | command | — | current command (a version-named binary tagged `@home_agent`, else `@pane_agent`, shows as the agent) |
+  | `ST` | agent state, icon and word | — | the pane's; stale: dim `(ended?)` |
   | `T` | run time | — | the agent's |
-  | `AG` | agent kind | `kind ×N` | kind |
   | `PA` | path (short, `~`) | — | cwd |
   | `GT` | git badge | — | the pane cwd's repo |
-  | `MS` | message, rest of the width | — | wait reason (yellow) / prompt (dim) |
+
+  A window row repeats nothing per-pane: attention shows through the NEEDS
+  YOU group, the tab strip's `●N`, `^g` and the pane rows' `ST`.
 
   Widths are computed per page from the content (capped) so values align;
-  columns nothing on the page fills are left out. Narrow widths drop `MS`,
-  then `GT`, `PA`, `T`, `AG`, `CM`, `ST`; `NM` shrinks no further than its
+  columns nothing on the page fills are left out. Narrow widths drop `GT`,
+  then `PA`, `T`, `CM`, `ST`; `NM` shrinks no further than its
   minimum. `F1` lists the legend. Sidebar panes (`@pane_role=sidebar`) are
   never listed or counted.
 - **Preview:** always at the bottom, shown when the popup is ≥ 30 rows,
@@ -154,11 +155,15 @@ session pages, a window/pane tree, a column table, a bottom layout preview.*
   draws the selected window's pane layout — each pane's visible capture
   (`capture-pane -e`) in its rectangle scaled to the preview (the bounding
   box of the non-sidebar panes), inside a frame with tmux-style separators.
-  On a pane row that pane is outlined in magenta and is the one the wheel
-  and `S-↑`/`S-↓` scroll (its capture includes history); on a window row
-  nothing is highlighted or scrolls. The agent and git cards sit above the
-  layout: the lead pane's for a window row, the selected pane's for a pane
-  row. Pane geometry comes from the snapshot (`pane_left/top/width/height`,
+  Each pane's rectangle starts with a static, dim one-line meta band:
+  `.N cmd`, the agent state (icon and word) if an agent pane, and the git
+  badge (branch cut to 20) if its cwd is in a repo, clipped to the pane's
+  width. On a pane row that pane is outlined in magenta (its band drawn
+  undimmed) and is the one the wheel and `S-↑`/`S-↓` scroll (its capture
+  includes history); on a window row nothing is highlighted or scrolls.
+  No agent or git card: the selection changes only the outline, so the
+  preview never shifts as it moves; its height depends on the page's
+  list, never on the selected row. Pane geometry comes from the snapshot (`pane_left/top/width/height`,
   `window_width/height`). Layout recomputes on terminal resize.
 - **Footer:** the handful of keys valid in the current mode.
 
@@ -272,7 +277,7 @@ order.
 | `@pane_status` | `●` running · `◎` background · `◐` waiting (also `notification`) · `○` idle · `✕` error · `·` unknown — always icon **and** word |
 | `@pane_attention` = `notification`, `@pane_wait_reason` | NEEDS YOU section + reason: permission, question (`elicitation_dialog`), teammate idle (`teammate_idle:<name>`), error text |
 | `@pane_started_at` | elapsed time of the **current run** (set at run start, cleared at run end) — not time-in-state |
-| `@pane_prompt` | last prompt (filterable; truncated in list, fuller in card) |
+| `@pane_prompt` | last prompt (filterable; not displayed) |
 | `@pane_subagents` | `+N subagents` |
 | `@pane_bg_cmd` | background command hint |
 | `@pane_worktree_name` / `_branch` | `(wt)` + branch |
@@ -288,9 +293,8 @@ while it carries agent options, tmux-home treats them as **stale**: shown
 dimmed with `(ended?)`, excluded from NEEDS YOU and the tally. Read-only —
 tmux-home never clears another tool's options.
 
-**Agent card** (preview for agent windows): status, run elapsed, wait
-reason, subagents, background command, worktree/branch, permission mode,
-the prompt, then the last lines of the pane.
+**In the preview** an agent pane's meta band shows its state (§5); there
+is no agent card — the prompt and reply are visible in the pane itself.
 
 No fallback when the sidebar isn't installed: windows are listed without an
 agent column.
