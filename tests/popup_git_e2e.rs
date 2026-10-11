@@ -5,7 +5,7 @@ mod common;
 use common::*;
 
 #[test]
-fn badge_on_the_row_and_git_card_in_the_preview() {
+fn badge_on_the_row_and_in_the_preview_band() {
     git_env(); // before the server starts: its daemon inherits it
     let t = TempDir::new("e2e");
     let repo = t.repo("app");
@@ -29,10 +29,9 @@ fn badge_on_the_row_and_git_card_in_the_preview() {
     o.wait_for(r"^ +└ \.0 .*/app +main !\? \|");
     o.keys(&["Down", "Down", "Down", "Down"]);
     o.wait_cursor_on("app");
-    // the card above the pane capture
-    o.wait_for(r"git +main → origin/main  in sync");
-    o.wait_for(r"changes +1 modified · 1 untracked");
-    o.wait_for(r"default +main");
+    // the pane's meta band atop its capture, no git card
+    o.wait_for(r"│\.0 \S+ +main !\? \|");
+    assert!(!o.screen().contains("main → origin/main"), "{}", o.screen());
     // F1: the legend
     o.keys(&["F1"]);
     o.wait_for(r"⚠n stray branches");

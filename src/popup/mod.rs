@@ -16,7 +16,7 @@ use crate::{
     store::Store,
     tmux::snapshot::{Snapshot, read_snapshot},
 };
-use app::{Action, App, Item, Mode, Row};
+use app::{Action, App, Item, Mode, PaneRow, Row};
 use fresh::{Guard, Stamp};
 use preview::Shot;
 use ratatui::{
@@ -871,7 +871,7 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, shot: &Shot, now: u64) {
     f.render_widget(Paragraph::new(Line::from(head).style(dim)), v[2]);
     draw_list(f, app, list, &t, now);
     if let Some(p) = prev {
-        draw_preview(f, app, p, shot, now);
+        draw_preview(f, app, p, shot);
     }
 
     f.render_widget(Paragraph::new(Span::styled(app.footer(), dim)), v[4]);
@@ -1046,50 +1046,46 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, t: &Table, now: u64) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// The preview: the agent and git cards of the selected line (a window
-/// row: its lead pane's; a pane row: that pane's), then the window's pane
-/// layout, each pane's capture in its scaled rectangle; on a pane row
-/// that pane is outlined in magenta and scrolls.
-fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot, now: u64) {
+/// The widest a branch name gets in a pane's meta band.
+const BAND_BRANCH: usize = 20;
+
+/// A pane's meta band, most important first: `.N cmd`, the agent's state
+/// (icon and word), the git badge (its branch cut to `BAND_BRANCH`). The
+/// caller clips it to the pane's width.
+fn band_text(p: &PaneRow) -> String {
+    let mut parts = vec![format!(".{} {}", p.index, p.cmd)];
+    if let Some(a) = &p.agent {
+        let s = a.state.status;
+        let ended = if a.stale { " (ended?)" } else { "" };
+        parts.push(format!("{} {}{ended}", s.icon(), s.word()));
+    }
+    if let Some((_, g)) = &p.git {
+        let badge: Vec<String> = g
+            .badge()
+            .into_iter()
+            .map(|(t, part)| match part {
+                crate::git::badge::Part::Branch => agents::clip(&t, BAND_BRANCH),
+                _ => t,
+            })
+            .collect();
+        parts.push(badge.join(" "));
+    }
+    parts.join("  ")
+}
+
+/// The preview: the window's pane layout, each pane's capture in its
+/// scaled rectangle under a one-line meta band (`band_text`). Nothing in
+/// it depends on which line of the window is selected but the outline:
+/// on a pane row that pane is outlined in magenta (its band drawn
+/// brighter) and scrolls.
+fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let block = Block::default().borders(Borders::TOP).border_style(dim);
-    let mut inner = block.inner(area);
+    let inner = block.inner(area);
     f.render_widget(block, area);
     let (Some(r), pane) = (app.selected().cloned(), app.selected_pane().cloned()) else {
         return;
     };
-    let width = inner.width as usize;
-    let mut cards = Vec::new();
-    match &pane {
-        Some(p) => {
-            if let Some(a) = &p.agent {
-                let one = crate::agent::WindowAgents {
-                    panes: vec![a.clone()],
-                };
-                cards.extend(agents::card(&one, now, width));
-            }
-            if let Some((root, g)) = &p.git {
-                cards.extend(git::card(g, root, width, &app.home));
-            }
-        }
-        None => {
-            if let Some(a) = &r.agents {
-                cards.extend(agents::card(a, now, width));
-            }
-            if let Some((root, g)) = &r.git {
-                cards.extend(git::card(g, root, width, &app.home));
-            }
-        }
-    }
-    // the layout's frame takes the place of the last card's rule
-    cards.pop();
-    if !cards.is_empty() {
-        let keep = (inner.height / 3).max(5);
-        let h = (cards.len() as u16).min(inner.height.saturating_sub(keep));
-        f.render_widget(Paragraph::new(cards), Rect { height: h, ..inner });
-        inner.y += h;
-        inner.height -= h;
-    }
     let geo: Vec<_> = r.panes.iter().map(|p| p.rect).collect();
     let rects = preview::place(&geo, inner);
     let hl = pane
@@ -1101,6 +1097,22 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot, now: u64)
         }
         let lines = shot.panes.get(&p.id).map(Vec::as_slice).unwrap_or(&[]);
         let selected = Some(i) == hl;
+        let band = clip_w(&band_text(p), rect.width as usize);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                band,
+                if selected { Style::default() } else { dim },
+            )),
+            Rect { height: 1, ..*rect },
+        );
+        let rect = &Rect {
+            y: rect.y + 1,
+            height: rect.height - 1,
+            ..*rect
+        };
+        if rect.height == 0 {
+            continue;
+        }
         // the pane's last lines, clipped at the edge (see `preview`); the
         // selected one's scrolled `preview_scroll` lines back, clamped
         let scroll = if selected { app.preview_scroll } else { 0 };
@@ -1447,31 +1459,17 @@ mod tests {
         assert!(line(&s, "~/d/old").contains("legacy ~"), "{s}");
         // window rows carry no path or badge
         assert!(!line(&s, " shell").contains("main"), "{s}");
-        // the card of the selected (current) window: its pane's repo
-        for want in [
-            "git        main → origin/main  ⇡2 ahead ⇣1 behind",
-            "changes    1 staged · 3 modified · 1 untracked",
-            "state      ↻ rebase in progress",
-            "stash      $1",
-            "stray      ⚠2 feat/a, spike",
-            "worktree   ~/d/app (+1 linked)",
-            "default    main",
-        ] {
-            assert!(s.contains(want), "no {want:?} in\n{s}");
-        }
-        // the agent window: agent card, then its worktree's git card
+        // the preview: each pane's band carries its badge, no card
+        let band = line(&s, "│.0 fish");
+        assert!(band.contains("main +!? ⇡2 ⇣1 $1 ⚠2 ↻"), "{s}");
+        assert!(!s.contains("changes    "), "{s}");
         a.select_wid("@0");
         let s = screen(&mut a, 200, 50);
-        let agent = s.find("◐ waiting  ·  claude").expect(&s);
-        let git = s
-            .find("git        fix/x → origin/fix/x  in sync")
-            .expect(&s);
-        assert!(agent < git, "{s}");
-        assert!(s.contains("~/d/app.fix-x (linked; main ~/d/app)"), "{s}");
-        // a stale repo's card says so, from its pane row too
+        assert!(line(&s, "│.0 2.1.283").contains("fix/x (wt) !"), "{s}");
+        // a stale repo's badge ends in ~ in the band too
         a.select_key("@2/%2");
         let s = screen(&mut a, 200, 50);
-        assert!(s.contains("~ stale: the last check timed out"), "{s}");
+        assert!(line(&s, "│.0 fish").contains("legacy ~"), "{s}");
         // filtering matches the branch
         let mut a = app_of(&git_snap());
         for c in "legacy".chars() {
@@ -1718,39 +1716,39 @@ mod tests {
         assert!(t.lines().next().unwrap().contains("dev"), "{t}");
     }
 
+    /// The preview shows an agent's state in its pane's band, never a
+    /// card: no prompt, reply or details.
     #[test]
-    fn agent_card_in_the_preview() {
+    fn agent_state_in_the_band() {
         let mut a = agent_app();
         a.select_wid("@0");
         for (w, h) in [(200, 50), (120, 40)] {
             let s = screen(&mut a, w, h);
-            for want in [
-                "◐ waiting  ·  claude  ·  run 12m",
-                "needs you  permission",
-                "subagents  +2 (Explore, Plan)",
-                "background npm run dev",
-                "worktree   fix-x (fix/x)",
-                "mode       plan",
-                "prompt     please refactor",
-                "line two",
-            ] {
-                assert!(s.contains(want), "{w}x{h}: no {want:?} in\n{s}");
+            let band = line(&s, "│.0 2.1.283");
+            assert!(band.contains("◐ waiting"), "{w}x{h}: {s}");
+            assert!(s.contains("line two"), "{s}");
+            for gone in ["subagents", "background", "please refactor", "·  claude"] {
+                assert!(!s.contains(gone), "{w}x{h}: {gone:?} in\n{s}");
             }
         }
-        // a pane row: that pane's agent
+        // two agents: a band each
         a.select_key("@1/%11");
         let s = screen(&mut a, 200, 50);
-        assert!(s.contains("● running  ·  claude  ·  run 12m"), "{s}");
-        assert!(!s.contains("2 agents"), "one pane's card: {s}");
-        // a stale window's card says so
+        assert!(line(&s, "│.0 2.1.283").contains("● running"), "{s}");
+        assert!(line(&s, ".1 2.1.283").contains("● running"), "{s}");
+        // a stale agent says so
         a.select_wid("@2");
         let s = screen(&mut a, 200, 50);
-        assert!(s.contains("◐ waiting (ended?)  ·  claude"), "{s}");
-        assert!(s.contains("left-over options"), "{s}");
-        // a plain window: no card
+        assert!(line(&s, "│.0 fish").contains("◐ waiting (ended?)"), "{s}");
+        // a plain shell: just its index and command
         a.select_wid("@3");
         let s = screen(&mut a, 200, 50);
-        assert!(!s.contains("·  claude"), "{s}");
+        assert!(
+            line(&s, "│.0 fish")
+                .trim_end_matches(['│', ' '])
+                .ends_with(".0 fish"),
+            "{s}"
+        );
     }
 
     /// ^r (or ^x's confirm) from a pinned copy marks that copy's window

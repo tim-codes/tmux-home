@@ -399,8 +399,8 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
         "another page's: {}",
         o.screen()
     );
-    // ^g pages to beta, onto the pinned copy; the agent card previews it,
-    // with the prompt
+    // ^g pages to beta, onto the pinned copy; the preview's pane band
+    // shows the agent's state
     o.wait_cursor_on("editor");
     o.keys(&["C-g"]);
     o.wait_cursor_on("agent");
@@ -422,8 +422,12 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
         pinned[0].starts_with('▌'),
         "^g lands on the pinned row:\n{screen}"
     );
-    o.wait_for("needs you  permission");
-    o.wait_for("prompt     tidy the changelog");
+    o.wait_for(r"│\.0 \S+ +◐ waiting");
+    assert!(
+        !o.screen().contains("prompt     tidy"),
+        "no agent card:\n{}",
+        o.screen()
+    );
     o.keys(&["Enter"]);
     o.wait_gone("F1 help");
     wait_until("client on beta:agent", || client_at(&s) == "beta:agent");
