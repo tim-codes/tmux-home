@@ -49,7 +49,8 @@ recurring jobs:
   navigation keys match fzf.
 - **Never leave the popup to finish an action.** Every edit — rename,
   confirm close — happens inline in the list. The popup only closes when you
-  switch to something, or press `Esc` on an empty filter.
+  switch to something, press `Esc` on an empty filter, or press the key
+  that opened it again.
 - **Attention floats.** Anything that needs a human is pinned at the top.
 - **tmux is the database.** Read state from tmux formats and the `@pane_*`
   options agent hooks already publish; write through plain tmux commands.
@@ -133,6 +134,7 @@ fire inside it; tmux-home receives those keys.
 | `⏎` | Switch the invoking client to the selection and close |
 | `^g` | Jump to the next item needing attention |
 | `Esc` | Clear filter; if already empty, close |
+| `prefix` + home key | Close, from any mode (the key that opened the popup toggles it). Inside the popup tmux passes the prefix on, so the chord arrives as two keys; the popup learns its prefix and `@home-keys` from `TMUX_HOME_PREFIX` / `TMUX_HOME_KEYS`, set by the binding. The prefix keeps its own meaning (`^a`: cursor to the start; cancels a close prompt; leaves help), so only a home key straight after it closes. An unsaved rename / new-window name is dropped and a pending close is not done. Only single-character home keys count; `prefix2` is not recognised. |
 | `F1` or `^/` | All keys |
 
 Filter tokens (combine with text): `@attn`, `@agent`, `@running`,

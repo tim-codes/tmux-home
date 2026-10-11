@@ -79,7 +79,7 @@ Without TPM: clone the repo, run `cargo build --release` in it, and add
 
 1. Install as above and wait for the build (a minute or so).
 2. `prefix .` opens the popup. Type to filter, `↑`/`↓` to move, `⏎` to
-   switch, `F1` for help, `Esc` to close.
+   switch, `F1` for help, `Esc` (or `prefix .` again) to close.
 3. `prefix e` toggles the sidebar in the current window.
 4. For agent status, add the [Claude Code hooks](#claude-code-hooks).
 
@@ -159,6 +159,7 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | `⏎` | switch to the window and close (an agent window: also focus the agent's pane) |
 | `^g` | jump to the next window that needs you (cycles through NEEDS YOU) |
 | `Esc` | clear the filter; close when it is already empty |
+| `prefix` + home key | close, from any mode: the key that opened the popup (`prefix .` by default) toggles it. Anything but a home key after the prefix acts as usual (`^a` still moves to the start); an unsaved rename or new-window name is dropped, a pending close is not done |
 | `^r` | rename inline (`⏎` saves; `Esc` or an empty name cancels) |
 | `M-r` | back to the automatic name |
 | `^x` | close the window, staying in the popup (see below) |
