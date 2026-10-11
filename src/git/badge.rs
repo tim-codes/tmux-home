@@ -1,14 +1,18 @@
 //! A repo's status as the snapshot carries it (`Snapshot::git`), and the
-//! compact badge drawn from it (spec §6 "Badge symbols").
+//! compact badge drawn from it (README "Git badges").
 //!
-//! `branch (wt) +!?✘ ⇡n ⇣n | $n ⚠n ↻⊟⊞⊘⚑⊗ ~`:
-//! `+` staged · `!` modified · `?` untracked · `✘` conflicts ·
-//! `⇡n ⇣n` ahead/behind upstream · `|` in sync with it · `$n` stashes ·
+//! `branch (wt) +!?= ⇡n ⇣n ≡ $n ⚠n ↻⊟⊞⊘⚑⊗ ~`:
+//! `+` staged · `!` modified · `?` untracked · `=` conflicts ·
+//! `⇡n ⇣n` ahead/behind upstream (both: `⇕⇡n⇣n`) · `≡` in sync with it ·
+//! `$n` stashes ·
 //! `⚠n` stray branches · `↻` operation in progress · `⊟` prunable ·
 //! `⊞` locked · `⊘` detached · `⚑` branch/worktree mismatch ·
 //! `⊗` limited (the repo's config names a command tmux-home can't switch
 //! off: HEAD only) · `~` stale (the last check timed out or failed; the
 //! values are older).
+//! Where a meaning overlaps starship's `git_status`, the symbol is
+//! starship's (`=` conflicted, `⇕` diverged, `≡` up to date — its common
+//! preset); the rest are tmux-home's own.
 //! `↑↓` stay reserved for "vs default branch" (later).
 
 use super::repo::Operation;
@@ -163,20 +167,20 @@ impl RepoStatus {
             v.push((flags, Part::Dirty));
         }
         if self.conflicts > 0 {
-            v.push(("✘".into(), Part::Conflict));
+            v.push(("=".into(), Part::Conflict));
         }
         if self.upstream.is_some() && !self.gone {
             if self.ahead == 0 && self.behind == 0 {
                 if self.phase != Phase::Head {
-                    v.push(("|".into(), Part::InSync));
+                    v.push(("≡".into(), Part::InSync));
                 }
             } else {
-                if self.ahead > 0 {
-                    v.push((format!("⇡{}", self.ahead), Part::Sync));
-                }
-                if self.behind > 0 {
-                    v.push((format!("⇣{}", self.behind), Part::Sync));
-                }
+                let sync = match (self.ahead, self.behind) {
+                    (a, 0) => format!("⇡{a}"),
+                    (0, b) => format!("⇣{b}"),
+                    (a, b) => format!("⇕⇡{a}⇣{b}"),
+                };
+                v.push((sync, Part::Sync));
             }
         }
         if self.stashes > 0 {
@@ -222,10 +226,10 @@ impl RepoStatus {
 }
 
 /// The badge legend (F1 help, README).
-pub const LEGEND: &str = "  git badge       branch (wt) +!?✘ ⇡n⇣n | $n ⚠n ↻⊟⊞⊘⚑⊗ ~
+pub const LEGEND: &str = "  git badge       branch (wt) +!?= ⇡n⇣n ≡ $n ⚠n ↻⊟⊞⊘⚑⊗ ~
                   (wt) linked worktree   + staged   ! modified
-                  ? untracked   ✘ conflicts   ⇡n ⇣n ahead/behind upstream
-                  | in sync with upstream   $n stashes
+                  ? untracked   = conflicts   ⇡n ⇣n ahead/behind upstream
+                  ⇕ diverged (⇕⇡n⇣n)   ≡ in sync with upstream   $n stashes
                   ⚠n stray branches: unpushed, no upstream (or gone),
                      not merged into the default branch (no remote:
                      any branch not merged into the default branch)
@@ -255,7 +259,15 @@ mod tests {
             operation: Some(Operation::Rebase),
             ..RepoStatus::default()
         };
-        assert_eq!(s.badge_text(), "main +!? ⇡2 ⇣1 $1 ⚠2 ↻");
+        assert_eq!(s.badge_text(), "main +!? ⇕⇡2⇣1 $1 ⚠2 ↻");
+        // only one way: no ⇕
+        let ahead = RepoStatus {
+            behind: 0,
+            ..s.clone()
+        };
+        assert_eq!(ahead.badge_text(), "main +!? ⇡2 $1 ⚠2 ↻");
+        let behind = RepoStatus { ahead: 0, ..s };
+        assert_eq!(behind.badge_text(), "main +!? ⇣1 $1 ⚠2 ↻");
     }
 
     #[test]
@@ -271,7 +283,7 @@ mod tests {
             stale: true,
             ..RepoStatus::default()
         };
-        assert_eq!(s.badge_text(), "feat/x (wt) ✘ | ⊞⚑ ~");
+        assert_eq!(s.badge_text(), "feat/x (wt) = ≡ ⊞⚑ ~");
         // HEAD only: no sync claim yet; detached shows ⊘
         let h = RepoStatus {
             branch: "abc1234".into(),

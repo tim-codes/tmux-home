@@ -16,7 +16,7 @@ use crate::{
     store::Store,
     tmux::snapshot::{Snapshot, read_snapshot},
 };
-use app::{Action, App, Item, Mode, Row};
+use app::{Action, App, Item, Mode, PaneRow, Row};
 use fresh::{Guard, Stamp};
 use preview::Shot;
 use ratatui::{
@@ -517,39 +517,28 @@ enum Col {
     Cmd,
     State,
     Time,
-    Agent,
     Path,
     Git,
-    Msg,
 }
 
-const COLS: [Col; 9] = [
+const NCOLS: usize = 7;
+
+const COLS: [Col; NCOLS] = [
     Col::Idx,
     Col::Name,
     Col::Cmd,
     Col::State,
     Col::Time,
-    Col::Agent,
     Col::Path,
     Col::Git,
-    Col::Msg,
 ];
 
-/// Dropped in this order when the row is too narrow (after `Msg`, which
-/// only takes what is left).
-const DROP: [Col; 6] = [
-    Col::Git,
-    Col::Path,
-    Col::Time,
-    Col::Agent,
-    Col::Cmd,
-    Col::State,
-];
+/// Dropped in this order when the row is too narrow.
+const DROP: [Col; 5] = [Col::Git, Col::Path, Col::Time, Col::Cmd, Col::State];
 /// The selection bar, the current-window mark and a space.
 const GUTTER: usize = 3;
 const SEP: &str = "  ";
 const NAME_MIN: usize = 8;
-const MSG_MIN: usize = 8;
 
 impl Col {
     fn label(self) -> &'static str {
@@ -559,19 +548,17 @@ impl Col {
             Col::Cmd => "CM",
             Col::State => "ST",
             Col::Time => "T",
-            Col::Agent => "AG",
             Col::Path => "PA",
             Col::Git => "GT",
-            Col::Msg => "MS",
         }
     }
 
     /// The widest a column gets.
     fn cap(self) -> usize {
         match self {
-            Col::Idx | Col::Msg => usize::MAX,
+            Col::Idx => usize::MAX,
             Col::Name | Col::Path => 24,
-            Col::Cmd | Col::Agent => 12,
+            Col::Cmd => 12,
             Col::State => 18,
             Col::Time => 6,
             Col::Git => 32,
@@ -582,7 +569,7 @@ impl Col {
 /// The column widths of a page; a width of 0 is a column not shown.
 #[derive(Clone, Debug, PartialEq)]
 struct Table {
-    w: [usize; 9],
+    w: [usize; NCOLS],
 }
 
 impl Table {
@@ -590,9 +577,9 @@ impl Table {
         self.w[c as usize] > 0
     }
 
-    /// Columns used (gutter and separators included), `Msg` aside.
+    /// Columns used (gutter and separators included).
     fn used(&self) -> usize {
-        let cols: Vec<usize> = COLS[..8]
+        let cols: Vec<usize> = COLS
             .iter()
             .filter(|&&c| self.on(c))
             .map(|&c| self.w[c as usize])
@@ -633,34 +620,18 @@ fn shows_title(title: &str, host: &str) -> bool {
     !title.trim().is_empty() && title != host && title != short
 }
 
-/// The cells of a line, one per column (empty: nothing to show).
-fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; 9] {
+/// The cells of a line, one per column (empty: nothing to show). A
+/// window row has only `#` and `NM`.
+fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; NCOLS] {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let r = &app.rows[it.row];
-    let mut c: [Vec<Span<'static>>; 9] = Default::default();
+    let mut c: [Vec<Span<'static>>; NCOLS] = Default::default();
     let mut set = |col: Col, s: Span<'static>| c[col as usize] = vec![s];
     match it.pane {
         None => {
             set(Col::Idx, Span::raw(r.index.to_string()));
+            // nothing per-pane: the pane rows below say it
             set(Col::Name, Span::raw(r.name.clone()));
-            if let Some(a) = &r.agents {
-                set(
-                    Col::State,
-                    match a.status() {
-                        Some(s) => agents::state_span(s, false),
-                        None => agents::state_span(a.lead().state.status, true),
-                    },
-                );
-                let n = a.live_count();
-                let kind = match n {
-                    0 | 1 => a.lead().state.kind.name().to_string(),
-                    n => format!("{} ×{n}", a.lead().state.kind.name()),
-                };
-                set(
-                    Col::Agent,
-                    Span::styled(kind, if a.stale() { dim } else { Style::default() }),
-                );
-            }
         }
         Some(pi) => {
             let p = &r.panes[pi];
@@ -681,21 +652,6 @@ fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; 9] {
                 set(Col::State, agents::state_span(a.state.status, a.stale));
                 if let Some(t) = a.state.run_started.filter(|_| a.live()) {
                     set(Col::Time, Span::raw(crate::agent::elapsed(t, now)));
-                }
-                set(
-                    Col::Agent,
-                    Span::styled(
-                        a.state.kind.name().to_string(),
-                        if a.stale { dim } else { Style::default() },
-                    ),
-                );
-                if a.needs_you() {
-                    set(
-                        Col::Msg,
-                        Span::styled(agents::need_reason(a), Style::default().fg(Color::Yellow)),
-                    );
-                } else if let Some(pr) = &a.state.prompt {
-                    set(Col::Msg, Span::styled(pr.replace('\n', " "), dim));
                 }
             }
             set(Col::Path, Span::styled(p.path.clone(), dim));
@@ -727,11 +683,10 @@ fn page_items(app: &App) -> Vec<Item> {
 
 /// The page's column widths in `width` columns: each column as wide as
 /// its widest cell (capped; at least its label), columns nothing fills
-/// left out. `MS` takes what the others leave, if that is enough; too
-/// narrow, it goes, then the others right to left (`DROP`), then `NM`
+/// left out. Too narrow, columns go right to left (`DROP`), then `NM`
 /// gives way down to `NAME_MIN`.
 fn table(app: &App, width: usize, now: u64) -> Table {
-    let mut w = [0usize; 9];
+    let mut w = [0usize; NCOLS];
     for it in page_items(app) {
         for (i, cell) in cells(app, it, now).iter().enumerate() {
             w[i] = w[i].max(spans_width(cell));
@@ -744,10 +699,6 @@ fn table(app: &App, width: usize, now: u64) -> Table {
         }
     }
     let mut t = Table { w };
-    // MS goes first: it shows only if everything else fits
-    let rest = width.saturating_sub(t.used() + SEP.len());
-    let msg = &mut t.w[Col::Msg as usize];
-    *msg = if *msg > 0 && rest >= MSG_MIN { rest } else { 0 };
     for c in DROP {
         if t.used() <= width {
             break;
@@ -761,7 +712,7 @@ fn table(app: &App, width: usize, now: u64) -> Table {
 }
 
 /// A line's cells laid out in the table's columns (after the gutter).
-fn table_spans(t: &Table, cells: [Vec<Span<'static>>; 9]) -> Vec<Span<'static>> {
+fn table_spans(t: &Table, cells: [Vec<Span<'static>>; NCOLS]) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut first = true;
     for (c, cell) in COLS.iter().zip(cells) {
@@ -871,7 +822,7 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, shot: &Shot, now: u64) {
     f.render_widget(Paragraph::new(Line::from(head).style(dim)), v[2]);
     draw_list(f, app, list, &t, now);
     if let Some(p) = prev {
-        draw_preview(f, app, p, shot, now);
+        draw_preview(f, app, p, shot);
     }
 
     f.render_widget(Paragraph::new(Span::styled(app.footer(), dim)), v[4]);
@@ -1046,50 +997,46 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, t: &Table, now: u64) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// The preview: the agent and git cards of the selected line (a window
-/// row: its lead pane's; a pane row: that pane's), then the window's pane
-/// layout, each pane's capture in its scaled rectangle; on a pane row
-/// that pane is outlined in magenta and scrolls.
-fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot, now: u64) {
+/// The widest a branch name gets in a pane's meta band.
+const BAND_BRANCH: usize = 20;
+
+/// A pane's meta band, most important first: `.N cmd`, the agent's state
+/// (icon and word), the git badge (its branch cut to `BAND_BRANCH`). The
+/// caller clips it to the pane's width.
+fn band_text(p: &PaneRow) -> String {
+    let mut parts = vec![format!(".{} {}", p.index, p.cmd)];
+    if let Some(a) = &p.agent {
+        let s = a.state.status;
+        let ended = if a.stale { " (ended?)" } else { "" };
+        parts.push(format!("{} {}{ended}", s.icon(), s.word()));
+    }
+    if let Some((_, g)) = &p.git {
+        let badge: Vec<String> = g
+            .badge()
+            .into_iter()
+            .map(|(t, part)| match part {
+                crate::git::badge::Part::Branch => agents::clip(&t, BAND_BRANCH),
+                _ => t,
+            })
+            .collect();
+        parts.push(badge.join(" "));
+    }
+    parts.join("  ")
+}
+
+/// The preview: the window's pane layout, each pane's capture in its
+/// scaled rectangle under a one-line meta band (`band_text`). Nothing in
+/// it depends on which line of the window is selected but the outline:
+/// on a pane row that pane is outlined in magenta (its band drawn
+/// brighter) and scrolls.
+fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let block = Block::default().borders(Borders::TOP).border_style(dim);
-    let mut inner = block.inner(area);
+    let inner = block.inner(area);
     f.render_widget(block, area);
     let (Some(r), pane) = (app.selected().cloned(), app.selected_pane().cloned()) else {
         return;
     };
-    let width = inner.width as usize;
-    let mut cards = Vec::new();
-    match &pane {
-        Some(p) => {
-            if let Some(a) = &p.agent {
-                let one = crate::agent::WindowAgents {
-                    panes: vec![a.clone()],
-                };
-                cards.extend(agents::card(&one, now, width));
-            }
-            if let Some((root, g)) = &p.git {
-                cards.extend(git::card(g, root, width, &app.home));
-            }
-        }
-        None => {
-            if let Some(a) = &r.agents {
-                cards.extend(agents::card(a, now, width));
-            }
-            if let Some((root, g)) = &r.git {
-                cards.extend(git::card(g, root, width, &app.home));
-            }
-        }
-    }
-    // the layout's frame takes the place of the last card's rule
-    cards.pop();
-    if !cards.is_empty() {
-        let keep = (inner.height / 3).max(5);
-        let h = (cards.len() as u16).min(inner.height.saturating_sub(keep));
-        f.render_widget(Paragraph::new(cards), Rect { height: h, ..inner });
-        inner.y += h;
-        inner.height -= h;
-    }
     let geo: Vec<_> = r.panes.iter().map(|p| p.rect).collect();
     let rects = preview::place(&geo, inner);
     let hl = pane
@@ -1101,6 +1048,22 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot, now: u64)
         }
         let lines = shot.panes.get(&p.id).map(Vec::as_slice).unwrap_or(&[]);
         let selected = Some(i) == hl;
+        let band = clip_w(&band_text(p), rect.width as usize);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                band,
+                if selected { Style::default() } else { dim },
+            )),
+            Rect { height: 1, ..*rect },
+        );
+        let rect = &Rect {
+            y: rect.y + 1,
+            height: rect.height - 1,
+            ..*rect
+        };
+        if rect.height == 0 {
+            continue;
+        }
         // the pane's last lines, clipped at the edge (see `preview`); the
         // selected one's scrolled `preview_scroll` lines back, clamped
         let scroll = if selected { app.preview_scroll } else { 0 };
@@ -1438,40 +1401,26 @@ mod tests {
         // a pane row: command, path, then the badge
         let shell = line(&s, "~/d/a/src");
         assert!(shell.contains("fish"), "{s}");
-        assert!(shell.contains("main +!? ⇡2 ⇣1 $1 ⚠2 ↻"), "{s}");
+        assert!(shell.contains("main +!? ⇕⇡2⇣1 $1 ⚠2 ↻"), "{s}");
         assert!(col(&shell, "main") > col(&shell, "~/d/a/src"), "{s}");
         // the agent's pane: its worktree's badge, pinned copy and session
         // row alike
-        assert_eq!(s.matches("fix/x (wt) ! |").count(), 2, "{s}");
+        assert_eq!(s.matches("fix/x (wt) ! ≡").count(), 2, "{s}");
         // a stale status ends in ~
         assert!(line(&s, "~/d/old").contains("legacy ~"), "{s}");
         // window rows carry no path or badge
         assert!(!line(&s, " shell").contains("main"), "{s}");
-        // the card of the selected (current) window: its pane's repo
-        for want in [
-            "git        main → origin/main  ⇡2 ahead ⇣1 behind",
-            "changes    1 staged · 3 modified · 1 untracked",
-            "state      ↻ rebase in progress",
-            "stash      $1",
-            "stray      ⚠2 feat/a, spike",
-            "worktree   ~/d/app (+1 linked)",
-            "default    main",
-        ] {
-            assert!(s.contains(want), "no {want:?} in\n{s}");
-        }
-        // the agent window: agent card, then its worktree's git card
+        // the preview: each pane's band carries its badge, no card
+        let band = line(&s, "│.0 fish");
+        assert!(band.contains("main +!? ⇕⇡2⇣1 $1 ⚠2 ↻"), "{s}");
+        assert!(!s.contains("changes    "), "{s}");
         a.select_wid("@0");
         let s = screen(&mut a, 200, 50);
-        let agent = s.find("◐ waiting  ·  claude").expect(&s);
-        let git = s
-            .find("git        fix/x → origin/fix/x  in sync")
-            .expect(&s);
-        assert!(agent < git, "{s}");
-        assert!(s.contains("~/d/app.fix-x (linked; main ~/d/app)"), "{s}");
-        // a stale repo's card says so, from its pane row too
+        assert!(line(&s, "│.0 claude").contains("fix/x (wt) !"), "{s}");
+        // a stale repo's badge ends in ~ in the band too
         a.select_key("@2/%2");
         let s = screen(&mut a, 200, 50);
-        assert!(s.contains("~ stale: the last check timed out"), "{s}");
+        assert!(line(&s, "│.0 fish").contains("legacy ~"), "{s}");
         // filtering matches the branch
         let mut a = app_of(&git_snap());
         for c in "legacy".chars() {
@@ -1487,7 +1436,7 @@ mod tests {
     fn badges_are_never_cut() {
         let mut snap = git_snap();
         snap.git.repos.get_mut("/home/u/dev/app").unwrap().stray = 12;
-        let pieces = "main +!? ⇡2 ⇣1 $1 ⚠12 ↻";
+        let pieces = "main +!? ⇕⇡2⇣1 $1 ⚠12 ↻";
         for w in (40u16..=200).step_by(4) {
             let mut a = app_of(&snap);
             let s = screen(&mut a, w, 50);
@@ -1517,7 +1466,7 @@ mod tests {
             "prefix )  (     next / previous session page",
             "columns",
             "NM              window name / pane title",
-            "MS              — / why it needs you",
+            "GT              — / git badge",
             "git badge",
             "⚠n stray branches",
             "~ stale",
@@ -1526,6 +1475,9 @@ mod tests {
             assert!(s.contains(want), "no {want:?} in\n{s}");
         }
         assert!(!s.contains("s:<session>"), "{s}");
+        for gone in ["AG ", "MS "] {
+            assert!(!s.contains(gone), "{gone:?} in\n{s}");
+        }
     }
 
     #[test]
@@ -1541,15 +1493,16 @@ mod tests {
                 .position(|l| l.contains("─ NEEDS YOU ─"))
                 .unwrap();
             assert!(lines[needs + 1].contains("fix"), "{s}");
-            assert!(lines[needs + 1].contains("◐ waiting"), "{s}");
+            assert!(!lines[needs + 1].contains("◐ waiting"), "{s}");
             assert!(lines[needs + 2].contains("└ .0"), "{s}");
-            assert!(lines[needs + 2].contains("permission"), "{s}");
+            assert!(!lines[needs + 2].contains("permission"), "no MS: {s}");
             assert!(lines[needs + 3].contains("─ dev ─"), "{s}");
-            // the window: its most urgent state, the kind ×N; its panes:
-            // each one's state and run time
+            // the window row: just index and name; its panes: each one's
+            // state and run time
             let api = line(&s, " api");
-            assert!(
-                api.contains("● running") && api.contains("claude ×2"),
+            assert_eq!(
+                api.split_whitespace().collect::<Vec<_>>(),
+                ["1", "api"],
                 "{s}"
             );
             assert!(!api.contains("12m"), "no run time on a window: {s}");
@@ -1567,14 +1520,18 @@ mod tests {
             for p in &api_panes {
                 assert!(p.contains("● running") && p.contains("12m"), "{s}");
             }
-            assert!(line(&s, " old").contains("◐ waiting (ended?)"), "{s}");
+            assert!(line(&s, " old").ends_with("old"), "{s}");
+            assert!(
+                line(&s, "└ .0         fish").contains("◐ waiting (ended?)"),
+                "{s}"
+            );
             // the fix window is listed twice: pinned, and in its session
-            assert_eq!(s.matches(" fix ").count(), 2, "{s}");
+            assert_eq!(s.lines().filter(|l| l.ends_with(" fix")).count(), 2, "{s}");
             assert!(line(&s, "> ").ends_with("4/4"), "windows, not lines: {s}");
         }
-        // the prompt shows (dim) on a pane row when nothing is waiting
+        // no prompt on a pane row (the pane shows it)
         let s = screen(&mut a, 200, 50);
-        assert!(line(&s, "├ .0").contains("add the tests"), "{s}");
+        assert!(!s.contains("add the tests"), "{s}");
     }
 
     /// The column header names the columns over the cells they head; the
@@ -1584,7 +1541,7 @@ mod tests {
         let mut a = app_of(&git_snap());
         let s = screen(&mut a, 200, 50);
         let head = s.lines().nth(2).unwrap().to_string();
-        let labels = ["#", "NM", "CM", "ST", "T", "AG", "PA", "GT", "MS"];
+        let labels = ["#", "NM", "CM", "ST", "T", "PA", "GT"];
         let words: Vec<(usize, &str)> = head
             .char_indices()
             .filter(|&(i, c)| c != ' ' && (i == 0 || head[..i].ends_with(' ')))
@@ -1608,16 +1565,12 @@ mod tests {
             .lines()
             .filter(|l| l.contains("└ .0") || l.contains("├ .0"))
         {
-            let cmd = if l.contains("fish") {
-                "fish"
-            } else {
-                "2.1.283"
-            };
+            let cmd = if l.contains("fish") { "fish" } else { "claude" };
             assert_eq!(col(l, cmd), at[2], "{l:?}\n{s}");
-            let path = if l.contains('~') { "~" } else { " / " };
+            let path = if l.contains('~') { "~" } else { " /" };
             assert_eq!(
-                col(l, path) + usize::from(path == " / "),
-                at[6],
+                col(l, path) + usize::from(path == " /"),
+                at[5],
                 "{l:?}\n{s}"
             );
         }
@@ -1625,18 +1578,13 @@ mod tests {
             assert_eq!(col(l, "●"), at[3], "{l:?}\n{s}");
         }
         let pane = line(&s, "~/d/a/src");
-        assert_eq!(col(&pane, "main"), at[7], "{s}");
-        let wait = s
-            .lines()
-            .find(|l| l.contains("permission") && l.contains("└"))
-            .unwrap();
-        assert_eq!(col(wait, "permission"), at[8], "{s}");
+        assert_eq!(col(&pane, "main"), at[6], "{s}");
         // the header is dim
         let buf = render(&mut a, 200, 50, &Shot::default());
         assert!(buf[(4, 2)].modifier.contains(Modifier::DIM));
     }
 
-    /// Narrow: columns go right to left (MS, GT, PA, T, …); # and NM stay.
+    /// Narrow: columns go right to left (GT, PA, T, …); # and NM stay.
     #[test]
     fn narrow_widths_drop_columns_right_to_left() {
         let head = |w| {
@@ -1649,9 +1597,9 @@ mod tests {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         };
-        let all = ["#", "NM", "CM", "ST", "T", "AG", "PA", "GT", "MS"];
+        let all = ["#", "NM", "CM", "ST", "T", "PA", "GT"];
         assert_eq!(head(200), all);
-        let order = ["MS", "GT", "PA", "T", "AG", "CM", "ST"];
+        let order = ["GT", "PA", "T", "CM", "ST"];
         let mut last = 0;
         for w in (30..200).rev().step_by(3) {
             let h = head(w);
@@ -1718,39 +1666,129 @@ mod tests {
         assert!(t.lines().next().unwrap().contains("dev"), "{t}");
     }
 
+    /// The preview shows an agent's state in its pane's band, never a
+    /// card: no prompt, reply or details.
     #[test]
-    fn agent_card_in_the_preview() {
+    fn agent_state_in_the_band() {
         let mut a = agent_app();
         a.select_wid("@0");
         for (w, h) in [(200, 50), (120, 40)] {
             let s = screen(&mut a, w, h);
-            for want in [
-                "◐ waiting  ·  claude  ·  run 12m",
-                "needs you  permission",
-                "subagents  +2 (Explore, Plan)",
-                "background npm run dev",
-                "worktree   fix-x (fix/x)",
-                "mode       plan",
-                "prompt     please refactor",
-                "line two",
-            ] {
-                assert!(s.contains(want), "{w}x{h}: no {want:?} in\n{s}");
+            let band = line(&s, "│.0 claude");
+            assert!(band.contains("◐ waiting"), "{w}x{h}: {s}");
+            assert!(s.contains("line two"), "{s}");
+            for gone in ["subagents", "background", "please refactor", "·  claude"] {
+                assert!(!s.contains(gone), "{w}x{h}: {gone:?} in\n{s}");
             }
         }
-        // a pane row: that pane's agent
+        // two agents: a band each
         a.select_key("@1/%11");
         let s = screen(&mut a, 200, 50);
-        assert!(s.contains("● running  ·  claude  ·  run 12m"), "{s}");
-        assert!(!s.contains("2 agents"), "one pane's card: {s}");
-        // a stale window's card says so
+        assert!(line(&s, "│.0 claude").contains("● running"), "{s}");
+        assert!(line(&s, ".1 claude").contains("● running"), "{s}");
+        // a stale agent says so
         a.select_wid("@2");
         let s = screen(&mut a, 200, 50);
-        assert!(s.contains("◐ waiting (ended?)  ·  claude"), "{s}");
-        assert!(s.contains("left-over options"), "{s}");
-        // a plain window: no card
+        assert!(line(&s, "│.0 fish").contains("◐ waiting (ended?)"), "{s}");
+        // a plain shell: just its index and command
         a.select_wid("@3");
         let s = screen(&mut a, 200, 50);
-        assert!(!s.contains("·  claude"), "{s}");
+        assert!(
+            line(&s, "│.0 fish")
+                .trim_end_matches(['│', ' '])
+                .ends_with(".0 fish"),
+            "{s}"
+        );
+    }
+
+    /// Window `@1` of the agent fixture as an agent pane (`%1`, in a
+    /// repo) beside a plain shell (`%11`).
+    fn mixed_snap() -> Snapshot {
+        use crate::agent::tests::pane;
+        use crate::git::badge::{Phase, RepoStatus};
+        let mut s = agent_snap();
+        let i = s.panes.iter().position(|p| p.id == "%11").unwrap();
+        let mut shell = pane("%11", "fish", &[]);
+        shell.window_id = "@1".into();
+        shell.index = 1;
+        shell.active = false;
+        s.panes[i] = shell;
+        for p in s.panes.iter_mut().filter(|p| p.window_id == "@1") {
+            let left = p.index == 0;
+            (p.left, p.top, p.height) = (if left { 0 } else { 101 }, 0, 50);
+            p.width = if left { 100 } else { 99 };
+        }
+        let agent = s.panes.iter_mut().find(|p| p.id == "%1").unwrap();
+        agent.current_path = "/home/u/dev/app".into();
+        s.git
+            .paths
+            .insert("/home/u/dev/app".into(), "/home/u/dev/app".into());
+        s.git.repos.insert(
+            "/home/u/dev/app".into(),
+            RepoStatus {
+                branch: "main".into(),
+                phase: Phase::Refs,
+                upstream: Some("origin/main".into()),
+                modified: 2,
+                ..RepoStatus::default()
+            },
+        );
+        s
+    }
+
+    /// The preview below its rule: the selection changes only which
+    /// pane is outlined, never a row of text or the split. Every pane
+    /// carries its one-line meta band (index, command, agent state, git),
+    /// and no agent or git card is drawn.
+    #[test]
+    fn the_preview_never_shifts_with_the_selection() {
+        let mut a = app_of(&mixed_snap());
+        let (w, h) = (120u16, 40u16);
+        let below = |a: &mut App| {
+            let s = screen(a, w, h);
+            let r = rule_row(&s, w);
+            (
+                r,
+                s.lines().skip(r).map(String::from).collect::<Vec<_>>(),
+                s,
+            )
+        };
+        a.select_wid("@1");
+        let (r0, win, s) = below(&mut a);
+        a.select_key("@1/%1");
+        let (r1, agent, _) = below(&mut a);
+        a.select_key("@1/%11");
+        let (r2, shell, _) = below(&mut a);
+        assert_eq!((r0, r1), (r1, r2), "the split moved\n{s}");
+        assert_eq!(win, agent, "window row vs agent pane");
+        assert_eq!(agent, shell, "agent pane vs shell pane");
+        // one band per pane, on the row under the frame's top edge
+        let band = &agent[2];
+        assert!(
+            band.starts_with("│.0 claude  ● running  main !"),
+            "{band:?}\n{s}"
+        );
+        assert!(band.contains("│.1 fish"), "{band:?}");
+        // the captures start below the bands
+        assert!(agent[3].contains("line one"), "{:?}", &agent[..4]);
+        // no cards
+        let preview = agent.join("\n");
+        for gone in [
+            "·  claude",
+            "prompt",
+            "add the tests",
+            "changes",
+            "worktree",
+        ] {
+            assert!(!preview.contains(gone), "{gone:?} in\n{preview}");
+        }
+        // the selected pane's band is the brighter one
+        let shot = shot_of(&a, "line one\nline two");
+        let buf = render(&mut a, w, h, &shot);
+        let y = (r2 + 2) as u16;
+        let x = |pat: &str| col(band, pat) as u16;
+        assert!(buf[(x(".0"), y)].modifier.contains(Modifier::DIM));
+        assert!(!buf[(x(".1"), y)].modifier.contains(Modifier::DIM));
     }
 
     /// ^r (or ^x's confirm) from a pinned copy marks that copy's window

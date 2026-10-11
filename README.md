@@ -152,20 +152,20 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 ```
   ▶dev ●1   scratch                                                       F1 help
 >                                                                             4/4
-   #     NM     CM       ST                  T    AG         PA             GT
+   #     NM     CM      ST                  T    PA             GT
  ─ NEEDS YOU ─────────────────────────────────────────────────────────────────────
-   0     fix             ◐ waiting                claude
-   └ .0         claude   ◐ waiting           12m  claude     ~/d/app.fix-x  fix/x (wt) ! |
+   0     fix
+   └ .0         claude  ◐ waiting           12m  ~/d/app.fix-x  fix/x (wt) ! ≡
  ─ dev ───────────────────────────────────────────────────────────────────────────
-   1     api             ● running                claude ×2
-   ├ .0         claude   ● running           12m  claude     ~/d/api
-▌  └ .1         claude   ● running           12m  claude     ~/d/api
+   1     api
+▌  ├ .0         claude  ● running           12m  ~/d/api        main ! ≡
+   └ .1         fish                             ~/d/api        main ! ≡
  ▶ 3     shell
-   └ .0         fish                                         ~/d/a/src      main +!? ⇡2
+   └ .0         fish                             ~/d/a/src      main +!? ⇕⇡2⇣1
 ──────────────────────────────────────────────────────────────────────────────────
- ● running  ·  claude  ·  run 12m
 ┌──────────────────────────────────────┬─────────────────────────────────────────┐
-│$ cargo test                          │> add the tests                          │
+│.0 claude  ● running  main ! ≡        │.1 fish  main ! ≡                        │
+│> add the tests                       │$ cargo test                             │
 └──────────────────────────────────────┴─────────────────────────────────────────┘
 ```
 
@@ -176,16 +176,15 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
   deliberately a prefixed chord rather than a bare key; list navigation
   never pages.
 - **Rows**: every window, and under it every pane but sidebars (single-pane
-  windows too). A window row shows its index, name, its most urgent agent
-  state and the agent kind (`×N` live agents); a pane row shows `├ .N` /
-  `└ .N`, its title (blank when it is just the host name), command, agent
-  state, run time and kind, directory, git badge, and why it needs you
-  (yellow) or its last prompt (dim). Claude Code's executable is named
-  after its version; a pane tmux-home's hooks tagged shows `claude` there
-  instead.
-- **Columns** (`# NM CM ST T AG PA GT MS`, dim, under the filter) are sized
+  windows too). A window row shows only its index and name (per-pane
+  facts are on the pane rows); a pane row shows `├ .N` / `└ .N`, its title
+  (blank when it is just the host name), command, agent state, run time,
+  directory and git badge. Claude Code's executable is named after its
+  version; a pane tagged as an agent (`@home_agent`, else the legacy
+  `@pane_agent`) shows the agent's name there instead.
+- **Columns** (`# NM CM ST T PA GT`, dim, under the filter) are sized
   per page from what they hold, so values line up. Narrow terminals drop
-  `MS`, then `GT`, `PA`, `T`, `AG`, `CM`, `ST`; `#` and the name stay.
+  `GT`, then `PA`, `T`, `CM`, `ST`; `#` and the name stay.
   `F1` lists the legend.
 
 ## Keys
@@ -235,10 +234,12 @@ it (automatic again). It draws the selected window's whole pane layout:
 each pane's visible screen, captured with `capture-pane -e` in its own
 colours and attributes (bold, dim, italic, underline, reverse), placed in
 its rectangle scaled to the preview, inside a frame with tmux-style
-separators (sidebar panes are left out). On a window row no pane is
-highlighted; on a pane row that pane is outlined in magenta, and the agent
-and git cards above the layout are that pane's (on a window row: the lead
-agent's pane's).
+separators (sidebar panes are left out). Every pane's rectangle starts
+with a dim one-line band: `.N` and its command, its agent's state (icon
+and word) and its git badge, cut at the pane's edge. On a window row no
+pane is highlighted; on a pane row that pane is outlined in magenta and
+its band drawn brighter. Nothing else changes with the selection, so
+moving between a window's panes never shifts the preview.
 
 The selected pane is captured with up to `@home-preview-history` lines of
 scrollback (default 2000; `0`: the visible screen only). It opens at the
@@ -262,14 +263,12 @@ Agent state comes from tmux-home's own Claude Code hooks (`@home_*`, below)
 or, for panes they haven't touched, from the `@pane_*` options
 [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s hooks
 publish (read-only: tmux-home never writes or clears those). An agent
-pane's row shows status icon **and** word, the current run's elapsed time,
-the agent kind and the wait reason or prompt; its window's row shows the
-most urgent state and the kind (`claude ×2` for two agents). Windows whose
+pane's row shows status icon **and** word, the current run's elapsed time
+and, as its command, the agent kind. Windows whose
 agent is waiting, errored or has a pending notification are also pinned in
 a **NEEDS YOU** group at the top of their session's page, and counted on its
-tab (`●1`). The preview of an agent window starts with an agent card:
-status, run time, wait reason, subagents, background command, worktree,
-permission mode and the prompt (or last reply), then the window's layout.
+tab (`●1`). In the preview an agent pane's band shows its state; its prompt
+and reply are on screen in the pane itself.
 
 An agent whose pane has moved on (the agent crashed and left its options
 behind: Claude counts as alive only while its pane runs its versioned binary,
@@ -279,21 +278,19 @@ agent column.
 
 ### Git badges
 
-Each window row ends in a compact badge for the git repo its pane is in
-(an agent window: the repo, or linked worktree, its lead agent works in, in
-place of the hook's `(wt) <branch>`), e.g. `main +!? ⇡2 ⇣1 $1 ⚠2 ↻`. The
-preview of a window in a repo gets a git card spelling it out: branch →
-upstream, ahead/behind, changes, operation in progress, stashes, stray
-branches by name, worktree (linked, main, locked…) and the default branch.
+Each pane row ends in a compact badge for the git repo (or linked
+worktree) its directory is in, e.g. `main +!? ⇕⇡2⇣1 $1 ⚠2 ↻`; the pane's
+band in the preview repeats it.
 
 | Symbol | Meaning |
 | --- | --- |
 | `main` | branch (the short commit when detached) |
 | `(wt)` | a linked worktree (`git worktree add`) |
 | `+` `!` `?` | staged, modified, untracked files |
-| `✘` | conflicts |
+| `=` | conflicts |
 | `⇡n` `⇣n` | commits ahead of / behind the upstream |
-| `\|` | in sync with the upstream |
+| `⇕⇡n⇣n` | diverged: both ahead of and behind the upstream |
+| `≡` | in sync with the upstream |
 | `$n` | stashes |
 | `⚠n` | stray branches: commits on no remote, no upstream (or a gone one), not merged into the default branch; in a repo with no remote, every branch other than the default one that isn't merged into it |
 | `↻` | merge, rebase, cherry-pick, revert or bisect in progress |
@@ -301,8 +298,10 @@ branches by name, worktree (linked, main, locked…) and the default branch.
 | `⊗` | limited: the repo's config names a command under a key that can't be switched off; only HEAD is shown, no status runs |
 | `~` | stale: the last check timed out or failed (the values are older) |
 
-`F1` shows the same legend. The symbols follow worktrunk's `wt list`;
-`↑↓` are reserved for "vs default branch" (later).
+`F1` shows the same legend. Where a meaning overlaps starship's
+`git_status`, the symbol is starship's (`+ ! ? = $ ⇡ ⇣ ⇕`, and `≡` from its
+common preset), so a prompt and the badge read alike; the rest are
+tmux-home's own. `↑↓` are reserved for "vs default branch" (later).
 
 The daemon computes badges in a task of its own, off the tmux poll's path,
 keyed by repo root (windows in one repo share one status). A repo is

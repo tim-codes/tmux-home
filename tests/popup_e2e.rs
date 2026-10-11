@@ -399,8 +399,8 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
         "another page's: {}",
         o.screen()
     );
-    // ^g pages to beta, onto the pinned copy; the agent card previews it,
-    // with the prompt
+    // ^g pages to beta, onto the pinned copy; the preview's pane band
+    // shows the agent's state
     o.wait_cursor_on("editor");
     o.keys(&["C-g"]);
     o.wait_cursor_on("agent");
@@ -409,21 +409,25 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
     let pinned = needs_you_rows(&screen);
     assert_eq!(pinned.len(), 1, "{screen}");
     assert!(
-        pinned[0].contains("agent") && pinned[0].contains("◐ waiting"),
+        pinned[0].contains("agent") && !pinned[0].contains("◐ waiting"),
         "{screen}"
     );
     assert!(
         screen
             .lines()
-            .any(|l| l.contains(" .0") && l.contains("permission")),
-        "the reason on its pane row:\n{screen}"
+            .any(|l| l.contains(" .0") && l.contains("◐ waiting")),
+        "the state on its pane row:\n{screen}"
     );
     assert!(
         pinned[0].starts_with('▌'),
         "^g lands on the pinned row:\n{screen}"
     );
-    o.wait_for("needs you  permission");
-    o.wait_for("prompt     tidy the changelog");
+    o.wait_for(r"│\.0 \S+ +◐ waiting");
+    assert!(
+        !o.screen().contains("prompt     tidy"),
+        "no agent card:\n{}",
+        o.screen()
+    );
     o.keys(&["Enter"]);
     o.wait_gone("F1 help");
     wait_until("client on beta:agent", || client_at(&s) == "beta:agent");
@@ -472,8 +476,13 @@ fn answered_while_its_pinned_copy_is_selected() {
     );
     o.wait_gone("NEEDS YOU");
     o.wait_cursor_on("agent");
-    let row = o.cursor_row().unwrap();
-    assert!(row.contains("● running"), "{row}");
+    let screen = o.screen();
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains(" .0") && l.contains("● running")),
+        "the state on its pane row:\n{screen}"
+    );
     assert_eq!(
         row_windows(&o.screen()),
         ["logs", "build", "agent"],
@@ -493,7 +502,8 @@ fn waiting_filter_and_stale_agent() {
     }
     o.open_popup();
     o.wait_for("beta ●1");
-    o.wait_for(r"win two .*\(ended\?\)");
+    o.wait_for(r"win two$");
+    o.wait_for(r"[└├] \.0 .*\(ended\?\)");
     let screen = o.screen();
     assert!(!screen.contains("NEEDS YOU"), "{screen}");
     assert!(
