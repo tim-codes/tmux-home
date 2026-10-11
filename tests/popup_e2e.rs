@@ -402,7 +402,7 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
         "another page's: {}",
         o.screen()
     );
-    // ^g pages to beta, onto the pinned copy; the preview's pane band
+    // ^g pages to beta, onto the pinned copy; the preview's pane banner
     // shows the agent's state
     o.wait_cursor_on("editor");
     o.keys(&["C-g"]);

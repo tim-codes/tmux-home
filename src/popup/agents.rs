@@ -1,5 +1,5 @@
 //! How agents look in the popup (SPEC §7): the state cells of the table
-//! (and of the preview's pane bands). Status is always icon **and**
+//! (and of the preview's pane banners). Status is always icon **and**
 //! word, never colour alone; a stale agent is dimmed and says `(ended?)`.
 
 use crate::agent::Status;

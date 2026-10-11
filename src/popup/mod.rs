@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod app;
+pub mod banner;
 pub mod filter;
 pub mod fresh;
 pub mod git;
@@ -16,7 +17,7 @@ use crate::{
     store::Store,
     tmux::snapshot::{Snapshot, read_snapshot},
 };
-use app::{Action, App, Item, Mode, PaneRow, Row};
+use app::{Action, App, Item, Mode, Row};
 use fresh::{Guard, Stamp};
 use preview::Shot;
 use ratatui::{
@@ -817,7 +818,7 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, shot: &Shot, now: u64) {
     f.render_widget(Paragraph::new(Line::from(head).style(dim)), v[2]);
     draw_list(f, app, list, &t, now);
     if let Some(p) = prev {
-        draw_preview(f, app, p, shot);
+        draw_preview(f, app, p, shot, now);
     }
 
     f.render_widget(Paragraph::new(Span::styled(app.footer(), dim)), v[4]);
@@ -995,39 +996,13 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, t: &Table, now: u64) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// The widest a branch name gets in a pane's meta band.
-const BAND_BRANCH: usize = 20;
-
-/// A pane's meta band, most important first: `.N cmd`, the agent's state
-/// (icon and word), the git badge (its branch cut to `BAND_BRANCH`). The
-/// caller clips it to the pane's width.
-fn band_text(p: &PaneRow) -> String {
-    let mut parts = vec![format!(".{} {}", p.index, p.cmd)];
-    if let Some(a) = &p.agent {
-        let s = a.state.status;
-        let ended = if a.stale { " (ended?)" } else { "" };
-        parts.push(format!("{} {}{ended}", s.icon(), s.word()));
-    }
-    if let Some((_, g)) = &p.git {
-        let badge: Vec<String> = g
-            .badge()
-            .into_iter()
-            .map(|(t, part)| match part {
-                crate::git::badge::Part::Branch => agents::clip(&t, BAND_BRANCH),
-                _ => t,
-            })
-            .collect();
-        parts.push(badge.join(" "));
-    }
-    parts.join("  ")
-}
-
 /// The preview: the window's pane layout, each pane's capture in its
-/// scaled rectangle under a one-line meta band (`band_text`). Nothing in
-/// it depends on which line of the window is selected but the outline:
-/// on a pane row that pane is outlined in magenta (its band drawn
-/// brighter) and scrolls.
-fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot) {
+/// scaled rectangle under its banner (`banner`), every banner of the
+/// layout the same height. Nothing in it depends on which line of the
+/// window is selected but the outline: on a pane row that pane is
+/// outlined in magenta (its banner drawn brighter) and scrolls. `now`:
+/// Unix seconds (run times).
+fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot, now: u64) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let (Some(r), pane) = (app.selected().cloned(), app.selected_pane().cloned()) else {
         return;
@@ -1037,23 +1012,38 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot) {
     let hl = pane
         .as_ref()
         .and_then(|p| r.panes.iter().position(|x| x.id == p.id));
+    let shortest = rects
+        .iter()
+        .filter(|r| r.width > 0)
+        .map(|r| r.height)
+        .filter(|&h| h > 0)
+        .min()
+        .unwrap_or(0);
+    let bh = banner::height(shortest);
     for (i, (p, rect)) in r.panes.iter().zip(&rects).enumerate() {
         if rect.width == 0 || rect.height == 0 {
             continue;
         }
         let lines = shot.panes.get(&p.id).map(Vec::as_slice).unwrap_or(&[]);
         let selected = Some(i) == hl;
-        let band = clip_w(&band_text(p), rect.width as usize);
+        let bh = bh.min(rect.height);
         f.render_widget(
-            Paragraph::new(Span::styled(
-                band,
-                if selected { Style::default() } else { dim },
+            Paragraph::new(banner::lines(
+                p,
+                &app.home,
+                now,
+                rect.width as usize,
+                bh,
+                selected,
             )),
-            Rect { height: 1, ..*rect },
+            Rect {
+                height: bh,
+                ..*rect
+            },
         );
         let rect = &Rect {
-            y: rect.y + 1,
-            height: rect.height - 1,
+            y: rect.y + bh,
+            height: rect.height - bh,
             ..*rect
         };
         if rect.height == 0 {
@@ -1405,17 +1395,25 @@ mod tests {
         assert!(line(&s, "~/d/old").contains("legacy ~"), "{s}");
         // window rows carry no path or badge
         assert!(!line(&s, " shell").contains("main"), "{s}");
-        // the preview: each pane's band carries its badge, no card
-        let band = line(&s, "│.0 fish");
-        assert!(band.contains("main +!? ⇕⇡2⇣1 $1 ⚠2 ↻"), "{s}");
+        // the preview: each pane's banner spells the status out, no card
+        let git = line(&s, "│main → ");
+        assert!(
+            git.contains("│main → origin/main ⇕⇡2⇣1  +1 !3 ?1  $1  ↻ rebase"),
+            "{s}"
+        );
+        assert!(
+            line(&s, "│~/dev/app/src").contains("1 worktree  ⚠2 stray"),
+            "{s}"
+        );
         assert!(!s.contains("changes    "), "{s}");
         a.select_wid("@0");
         let s = screen(&mut a, 200, 50);
-        assert!(line(&s, "│.0 claude").contains("fix/x (wt) !"), "{s}");
-        // a stale repo's badge ends in ~ in the band too
+        assert!(line(&s, "│fix/x").contains("!"), "{s}");
+        assert!(line(&s, "(wt) ←").contains("~/d/app"), "{s}");
+        // a stale repo says so in the banner too
         a.select_key("@2/%2");
         let s = screen(&mut a, 200, 50);
-        assert!(line(&s, "│.0 fish").contains("legacy ~"), "{s}");
+        assert!(line(&s, "│legacy").contains("~ stale"), "{s}");
         // filtering matches the branch
         let mut a = app_of(&git_snap());
         for c in "legacy".chars() {
@@ -1661,22 +1659,22 @@ mod tests {
         assert!(t.lines().next().unwrap().contains("dev"), "{t}");
     }
 
-    /// The preview shows an agent's state in its pane's band, never a
+    /// The preview shows an agent's state in its pane's banner, never a
     /// card: no prompt, reply or details.
     #[test]
-    fn agent_state_in_the_band() {
+    fn agent_state_in_the_banner() {
         let mut a = agent_app();
         a.select_wid("@0");
         for (w, h) in [(200, 50), (120, 40)] {
             let s = screen(&mut a, w, h);
-            let band = line(&s, "│.0 claude");
-            assert!(band.contains("◐ waiting"), "{w}x{h}: {s}");
+            let first = line(&s, "│.0 claude");
+            assert!(first.contains("◐ waiting"), "{w}x{h}: {s}");
             assert!(s.contains("line two"), "{s}");
             for gone in ["subagents", "background", "please refactor", "·  claude"] {
                 assert!(!s.contains(gone), "{w}x{h}: {gone:?} in\n{s}");
             }
         }
-        // two agents: a band each
+        // two agents: a banner each
         a.select_key("@1/%11");
         let s = screen(&mut a, 200, 50);
         assert!(line(&s, "│.0 claude").contains("● running"), "{s}");
@@ -1696,8 +1694,9 @@ mod tests {
         );
     }
 
-    /// Window `@1` of the agent fixture as an agent pane (`%1`, in a
-    /// repo) beside a plain shell (`%11`).
+    /// Window `@1` of the agent fixture as an agent pane (`%1`, running
+    /// `claude-opus-5-5` in a linked worktree of `~/dev/app`) beside a
+    /// plain shell outside any repo (`%11`, in `/tmp`).
     fn mixed_snap() -> Snapshot {
         use crate::agent::tests::pane;
         use crate::git::badge::{Phase, RepoStatus};
@@ -1707,83 +1706,163 @@ mod tests {
         shell.window_id = "@1".into();
         shell.index = 1;
         shell.active = false;
+        shell.current_path = "/tmp".into();
         s.panes[i] = shell;
         for p in s.panes.iter_mut().filter(|p| p.window_id == "@1") {
             let left = p.index == 0;
             (p.left, p.top, p.height) = (if left { 0 } else { 101 }, 0, 50);
             p.width = if left { 100 } else { 99 };
         }
+        let started = (NOW - 12 * 60).to_string();
         let agent = s.panes.iter_mut().find(|p| p.id == "%1").unwrap();
-        agent.current_path = "/home/u/dev/app".into();
-        s.git
-            .paths
-            .insert("/home/u/dev/app".into(), "/home/u/dev/app".into());
+        agent.agent_opts = [
+            ("@home_agent", "claude"),
+            ("@home_status", "running"),
+            ("@home_run_started", started.as_str()),
+            ("@home_model", "claude-opus-5-5"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let wt = "/home/u/dev/app.wt/banner";
+        agent.current_path = wt.into();
+        s.git.paths.insert(wt.into(), wt.into());
         s.git.repos.insert(
-            "/home/u/dev/app".into(),
+            wt.into(),
             RepoStatus {
-                branch: "main".into(),
+                branch: "feat/banner".into(),
+                linked: true,
+                main_root: Some("/home/u/dev/app".into()),
                 phase: Phase::Refs,
-                upstream: Some("origin/main".into()),
+                upstream: Some("origin/feat/banner".into()),
+                ahead: 2,
                 modified: 2,
+                untracked: 1,
+                stashes: 1,
+                default_branch: Some("main".into()),
                 ..RepoStatus::default()
             },
         );
         s
     }
 
-    /// The preview below the list: the selection changes only which
-    /// pane is outlined, never a row of text or the split. Every pane
-    /// carries its one-line meta band (index, command, agent state, git),
-    /// and no agent or git card is drawn.
+    /// The (selected) preview frame's rows of a drawn screen, from its
+    /// top edge.
+    fn below(a: &mut App, w: u16, h: u16) -> (usize, Vec<String>, String) {
+        let s = screen(a, w, h);
+        let r = rule_row(&s, w);
+        (r, s.lines().skip(r).map(String::from).collect(), s)
+    }
+
+    /// The preview below the list: the selection changes only which pane
+    /// is outlined, never a row of text or the split. Every pane carries a
+    /// banner of the same height (an agent pane in a worktree, a shell
+    /// outside any repo), and no agent or git card is drawn.
     #[test]
     fn the_preview_never_shifts_with_the_selection() {
         let mut a = app_of(&mixed_snap());
-        let (w, h) = (120u16, 40u16);
-        let below = |a: &mut App| {
-            let s = screen(a, w, h);
-            let r = rule_row(&s, w);
-            (
-                r,
-                s.lines().skip(r).map(String::from).collect::<Vec<_>>(),
-                s,
-            )
+        for (w, h) in [(120u16, 40u16), (200, 60), (80, 30)] {
+            a.select_wid("@1");
+            let (r0, win, s) = below(&mut a, w, h);
+            a.select_key("@1/%1");
+            let (r1, agent, _) = below(&mut a, w, h);
+            a.select_key("@1/%11");
+            let (r2, shell, _) = below(&mut a, w, h);
+            assert_eq!((r0, r1), (r1, r2), "{w}x{h}: the split moved\n{s}");
+            assert_eq!(win, agent, "{w}x{h}: window row vs agent pane");
+            assert_eq!(agent, shell, "{w}x{h}: agent pane vs shell pane");
+            // both captures start on the same row, under 4 banner rows
+            let one = agent.iter().position(|l| l.contains("line one")).unwrap();
+            assert_eq!(one, 1 + banner::MAX as usize, "{w}x{h}:\n{s}");
+            assert_eq!(agent[one].matches("line one").count(), 2, "{s}");
+            assert_eq!(
+                agent[one - 1].matches('┄').count() as u16,
+                w - 3,
+                "the rules\n{s}"
+            );
+        }
+        let (_, rows, s) = below(&mut a, 120, 40);
+        let left = |l: &str| {
+            l.chars()
+                .skip(1)
+                .take(58)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
         };
-        a.select_wid("@1");
-        let (r0, win, s) = below(&mut a);
-        a.select_key("@1/%1");
-        let (r1, agent, _) = below(&mut a);
-        a.select_key("@1/%11");
-        let (r2, shell, _) = below(&mut a);
-        assert_eq!((r0, r1), (r1, r2), "the split moved\n{s}");
-        assert_eq!(win, agent, "window row vs agent pane");
-        assert_eq!(agent, shell, "agent pane vs shell pane");
-        // one band per pane, on the row under the frame's top edge
-        let band = &agent[1];
-        assert!(
-            band.starts_with("│.0 claude  ● running  main !"),
-            "{band:?}\n{s}"
+        let right = |l: &str| {
+            l.chars()
+                .skip(61)
+                .collect::<String>()
+                .trim_end_matches(['│', ' '])
+                .to_string()
+        };
+        assert_eq!(left(&rows[1]), ".0 claude  ● running  12m  opus 5.5", "{s}");
+        assert_eq!(
+            left(&rows[2]),
+            "feat/banner → origin/feat/banner ⇡2  !2 ?1  $1",
+            "{s}"
         );
-        assert!(band.contains("│.1 fish"), "{band:?}");
-        // the captures start below the bands
-        assert!(agent[2].contains("line one"), "{:?}", &agent[..4]);
-        // no cards
-        let preview = agent.join("\n");
-        for gone in [
-            "·  claude",
-            "prompt",
-            "add the tests",
-            "changes",
-            "worktree",
-        ] {
+        assert_eq!(
+            left(&rows[3]),
+            "~/dev/app.wt/banner  (wt) ← ~/d/app  default main",
+            "{s}"
+        );
+        assert_eq!(right(&rows[1]), ".1 fish", "{s}");
+        assert_eq!(right(&rows[2]), "/tmp", "{s}");
+        assert_eq!(right(&rows[3]), "", "{s}");
+        // no cards, no prompt or reply
+        let preview = rows.join("\n");
+        for gone in ["·  claude", "prompt", "add the tests"] {
             assert!(!preview.contains(gone), "{gone:?} in\n{preview}");
         }
-        // the selected pane's band is the brighter one
+        // the selected pane's banner is the brighter one
         let shot = shot_of(&a, "line one\nline two");
-        let buf = render(&mut a, w, h, &shot);
-        let y = (r2 + 1) as u16;
-        let x = |pat: &str| col(band, pat) as u16;
-        assert!(buf[(x(".0"), y)].modifier.contains(Modifier::DIM));
-        assert!(!buf[(x(".1"), y)].modifier.contains(Modifier::DIM));
+        let buf = render(&mut a, 120, 40, &shot);
+        let top = rule_row(&text_of(&buf), 120) as u16;
+        for y in top + 1..top + 1 + banner::MAX {
+            assert!(buf[(4, y)].modifier.contains(Modifier::DIM), "y={y}");
+        }
+        assert!(!buf[(64, top + 1)].modifier.contains(Modifier::DIM));
+        assert!(!buf[(61, top + 2)].modifier.contains(Modifier::DIM));
+    }
+
+    /// Narrow panes drop whole pieces, least important first; short ones
+    /// shrink every banner of the layout alike before the capture goes.
+    #[test]
+    fn banners_fit_narrow_and_short_panes() {
+        let mut a = app_of(&mixed_snap());
+        a.select_key("@1/%1");
+        let (_, rows, s) = below(&mut a, 64, 40);
+        let left = |l: &str| {
+            let l: String = l.chars().skip(1).collect();
+            l.split('│').next().unwrap().trim_end().to_string()
+        };
+        assert_eq!(left(&rows[1]), ".0 claude  ● running  12m", "{s}");
+        assert_eq!(left(&rows[2]), "feat/banner ⇡2  !2 ?1  $1", "{s}");
+        assert_eq!(left(&rows[3]), "~/d/a/banner  (wt) ← ~/d/app", "{s}");
+        // short: under 7 rows a pane's banner sheds the rule, then lines,
+        // in both panes alike; the capture keeps 3 rows while it can
+        let mut seen = std::collections::BTreeSet::new();
+        for pct in 1..=40 {
+            a.preview_pct = Some(pct);
+            let s = screen(&mut a, 120, 40);
+            let top = rule_row(&s, 120);
+            let lines: Vec<&str> = s.lines().collect();
+            let bottom = lines.iter().rposition(|l| l.starts_with('└')).unwrap();
+            let rows = (bottom - top - 1) as u16;
+            let bh = banner::height(rows) as usize;
+            seen.insert(bh);
+            assert_eq!(lines[top + 1].matches(".0 claude").count(), 1, "{s}");
+            assert_eq!(lines[top + 1].matches(".1 fish").count(), 1, "{s}");
+            if rows > bh as u16 {
+                let body = lines[top + 1 + bh..bottom].join("\n");
+                assert_eq!(body.matches("line two").count(), 2, "rows={rows}:\n{s}");
+                assert!(rows - bh as u16 >= 3.min(rows - 1), "rows={rows}");
+            }
+            assert_eq!(s.contains('┄'), bh == 4, "rows={rows}:\n{s}");
+        }
+        assert!(seen.len() >= 3, "{seen:?}");
     }
 
     /// ^r (or ^x's confirm) from a pinned copy marks that copy's window
