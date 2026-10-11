@@ -258,6 +258,78 @@ impl LineEdit {
     }
 }
 
+/// The key chord that opens the popup (tmux prefix, then one of the
+/// `@home-keys`). Inside the popup tmux does not see the prefix, so the
+/// chord arrives here as two keys; pressing it again closes the popup, so
+/// the key toggles.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Chord {
+    pub prefix: (KeyCode, KeyModifiers),
+    pub keys: Vec<char>,
+}
+
+impl Chord {
+    /// From tmux's `prefix` option (`C-a`, `M-x`, `x`) and the
+    /// whitespace-separated `@home-keys`. Only single-character keys can
+    /// arrive as typed text, so others (`F5`, `C-h`) are skipped. None if
+    /// the prefix is unusable (`None`, `C-Space`) or no key is left.
+    pub fn parse(prefix: &str, keys: &str) -> Option<Chord> {
+        let (mods, rest) = if let Some(r) = prefix.strip_prefix("C-") {
+            (KeyModifiers::CONTROL, r)
+        } else if let Some(r) = prefix.strip_prefix("M-") {
+            (KeyModifiers::ALT, r)
+        } else {
+            (KeyModifiers::NONE, prefix)
+        };
+        let mut cs = rest.chars();
+        let (Some(c), None) = (cs.next(), cs.next()) else {
+            return None;
+        };
+        // a control character arrives as its lowercase letter
+        let c = if mods == KeyModifiers::CONTROL {
+            c.to_ascii_lowercase()
+        } else {
+            c
+        };
+        let keys: Vec<char> = keys
+            .split_whitespace()
+            .filter_map(|w| {
+                let mut cs = w.chars();
+                match (cs.next(), cs.next()) {
+                    (Some(c), None) => Some(c),
+                    _ => None,
+                }
+            })
+            .collect();
+        if keys.is_empty() {
+            return None;
+        }
+        Some(Chord {
+            prefix: (KeyCode::Char(c), mods),
+            keys,
+        })
+    }
+
+    /// From the popup's environment, set by the plugin's binding:
+    /// `TMUX_HOME_PREFIX` and `TMUX_HOME_KEYS`.
+    pub fn from_env() -> Option<Chord> {
+        Chord::parse(
+            &std::env::var("TMUX_HOME_PREFIX").ok()?,
+            &std::env::var("TMUX_HOME_KEYS").ok()?,
+        )
+    }
+
+    fn is_prefix(&self, k: &KeyEvent) -> bool {
+        let m = k.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT);
+        k.code == self.prefix.0 && m == self.prefix.1
+    }
+
+    fn is_home_key(&self, k: &KeyEvent) -> bool {
+        let m = k.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT);
+        matches!(k.code, KeyCode::Char(c) if m.is_empty() && self.keys.contains(&c))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
     List,
@@ -345,6 +417,10 @@ pub struct App {
     /// `visible`) for each window row, and the list's x range.
     pub list_hits: Vec<(u16, usize)>,
     pub list_x: std::ops::Range<u16>,
+    /// The open-key chord; pressing it closes the popup (see `Chord`).
+    pub chord: Option<Chord>,
+    /// The last key was the chord's prefix.
+    armed: bool,
     matcher: Matcher,
 }
 
@@ -377,6 +453,8 @@ impl App {
             preview_rows: 0,
             list_hits: vec![],
             list_x: 0..0,
+            chord: None,
+            armed: false,
             matcher: Matcher::new(Config::DEFAULT),
         }
     }
@@ -651,6 +729,17 @@ impl App {
     }
 
     pub fn key(&mut self, k: KeyEvent) -> Action {
+        // The open-key chord closes, in every mode (an unsaved rename or
+        // new-window name is dropped, a pending close is not done). The
+        // prefix itself is still handled as usual below (^a: cursor to the
+        // start), so anything but a home key after it acts as it always did.
+        if let Some(c) = &self.chord {
+            let armed = std::mem::take(&mut self.armed);
+            if armed && c.is_home_key(&k) {
+                return Action::Quit;
+            }
+            self.armed = c.is_prefix(&k);
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         match &mut self.mode {
@@ -849,6 +938,7 @@ pub const HELP: &str = "tmux-home — keys
   ⏎               switch to the selected window and close
   ^g              jump to the next window that needs you (NEEDS YOU)
   Esc             clear the filter; close if it is already empty
+  prefix + key    the key that opened the popup closes it, from any mode
   ^r              rename the window inline (⏎ save, Esc/empty cancel)
   M-r             reset the window to its automatic name
   ^x              close the window; asks first (y/N) if anything but a
@@ -1534,5 +1624,103 @@ mod tests {
             Action::None,
             "next row is another session"
         );
+    }
+
+    fn chord_app() -> App {
+        let mut a = app();
+        a.chord = Chord::parse("C-a", ".");
+        a
+    }
+
+    #[test]
+    fn chord_parses_prefix_and_single_char_keys() {
+        let c = Chord::parse("C-a", "w f").unwrap();
+        assert_eq!(c.prefix, (KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(c.keys, vec!['w', 'f']);
+        let c = Chord::parse("C-B", ". F5 C-h").unwrap();
+        assert_eq!(c.prefix, (KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(c.keys, vec!['.'], "only single characters can be typed");
+        assert_eq!(
+            Chord::parse("M-x", "h").unwrap().prefix,
+            (KeyCode::Char('x'), KeyModifiers::ALT)
+        );
+        assert_eq!(Chord::parse("None", "."), None);
+        assert_eq!(Chord::parse("C-Space", "."), None);
+        assert_eq!(Chord::parse("C-a", ""), None);
+        assert_eq!(Chord::parse("C-a", "F5"), None);
+    }
+
+    #[test]
+    fn the_open_chord_closes_the_list() {
+        let mut a = chord_app();
+        assert_eq!(a.key(ctrl('a')), Action::Redraw);
+        assert_eq!(a.key(key(KeyCode::Char('.'))), Action::Quit);
+        // also with a filter typed: no '.' lands in it first
+        let mut a = chord_app();
+        typed(&mut a, "bu");
+        a.key(ctrl('a'));
+        assert_eq!(a.key(key(KeyCode::Char('.'))), Action::Quit);
+        assert_eq!(a.filter.as_string(), "bu");
+    }
+
+    #[test]
+    fn the_prefix_then_another_key_acts_as_before() {
+        let mut a = chord_app();
+        typed(&mut a, "ld");
+        // ^a still moves the filter's cursor to the start
+        a.key(ctrl('a'));
+        assert_eq!(a.filter.cur, 0);
+        // a non-home key after it is handled as usual: typed at the start
+        assert_eq!(a.key(key(KeyCode::Char('b'))), Action::Redraw);
+        typed(&mut a, "u");
+        assert_eq!(a.filter.as_string(), "buld");
+        // a home key not straight after the prefix is just text
+        typed(&mut a, ".");
+        assert_eq!(a.filter.as_string(), "bu.ld");
+        // ^a then a non-home key, then the home key: typed
+        a.key(ctrl('a'));
+        a.key(key(KeyCode::Right));
+        typed(&mut a, ".");
+        assert_eq!(a.filter.as_string(), "b.u.ld");
+        // ^a ^a .: the second ^a re-arms
+        a.key(ctrl('a'));
+        a.key(ctrl('a'));
+        assert_eq!(a.key(key(KeyCode::Char('.'))), Action::Quit);
+    }
+
+    #[test]
+    fn without_a_chord_the_home_key_is_typed() {
+        let mut a = app();
+        a.key(ctrl('a'));
+        assert_eq!(a.key(key(KeyCode::Char('.'))), Action::Redraw);
+        assert_eq!(a.filter.as_string(), ".");
+    }
+
+    #[test]
+    fn the_open_chord_closes_from_every_mode() {
+        use crate::ops::ClosePlan;
+        // rename: the unsaved name is dropped
+        let mut a = chord_app();
+        a.key(ctrl('r'));
+        typed(&mut a, "x");
+        a.key(ctrl('a'));
+        assert_eq!(a.key(key(KeyCode::Char('.'))), Action::Quit);
+        // new window
+        let mut a = chord_app();
+        a.key(alt(KeyCode::Char('n')));
+        a.key(ctrl('a'));
+        assert_eq!(a.key(key(KeyCode::Char('.'))), Action::Quit);
+        // close confirm: ^a cancels it (as any key does), then '.' closes
+        // the popup; the window is not closed
+        let mut a = chord_app();
+        a.close_plan("@2", ClosePlan::Ask("busy".into()));
+        assert!(matches!(a.mode, Mode::Confirm { .. }));
+        assert_eq!(a.key(ctrl('a')), Action::Redraw);
+        assert_eq!(a.key(key(KeyCode::Char('.'))), Action::Quit);
+        // help
+        let mut a = chord_app();
+        a.key(key(KeyCode::F(1)));
+        a.key(ctrl('a'));
+        assert_eq!(a.key(key(KeyCode::Char('.'))), Action::Quit);
     }
 }
