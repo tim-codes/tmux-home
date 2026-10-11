@@ -93,6 +93,7 @@ feature runs. Shown with their defaults:
 ```tmux
 set -g @home-keys '.'               # prefix keys for the popup; '' binds nothing
 set -g @home-preview-history 2000   # scrollback lines the preview captures (0: screen only)
+set -g @home-preview-pct ''         # preview size, % of list+preview; unset: auto (M-j/M-k/M-= set it)
 set -g @home-sidebar-keys 'e E'     # sidebar: this window, whole session ('' = none, '-' skips one)
 set -g @home-sidebar-width 32       # columns, or a percentage (20%)
 set -g @home-sidebar-side left      # or right
@@ -210,16 +211,27 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | `^t` | reopen the last closed window |
 | `M-↑` `M-↓` | move the window up / down within its session |
 | `M-n` | new window after the selection, named inline (empty: automatic name) |
+| `^o` | toggle the preview |
+| `M-k` `M-j` | preview larger / smaller: the list/preview divider up / down 5% (the list and the preview keep 5 rows each). `M-k` shows a hidden preview; `M-j` never hides it. Remembered across opens |
+| `M-=` | preview back to its automatic size |
+| `F1` `^/` | help |
 
 Window keys (`^r`, `M-r`, `^x`, `M-↑↓`, `M-n`) act on a pane row's window.
-| `^o` | toggle the preview |
-| `F1` `^/` | help |
+The preview keys work in the list only; the rename and new-window editors
+ignore them.
 
 ### Preview
 
-The preview sits below the list, always: it takes the bottom half when the
-popup is at least 30 rows tall, and is hidden below that until `^o` (which
-also hides a shown one). It draws the selected window's whole pane layout:
+The preview sits below the list, always. It shows when the popup is at
+least 30 rows tall, and is hidden below that until `^o` (which also hides a
+shown one; `M-k` shows it too). Its size is automatic: the list gets the
+page's lines plus 2 blank rows and the preview the rest, recomputed on every
+draw, so paging to a smaller session or filtering grows it; when that would
+leave the preview under a third of the area (or 5 rows), the two split it in
+half and the list scrolls. `M-k` / `M-j` move the divider 5% up / down from
+wherever it is, keeping 5 rows each side; the size is then fixed and kept in
+the server option `@home-preview-pct` for the next popup, until `M-=` unsets
+it (automatic again). It draws the selected window's whole pane layout:
 each pane's visible screen, captured with `capture-pane -e` in its own
 colours and attributes (bold, dim, italic, underline, reverse), placed in
 its rectangle scaled to the preview, inside a frame with tmux-style

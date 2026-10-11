@@ -470,9 +470,13 @@ pub enum Action {
         name: String,
     },
     Redraw,
+    /// The preview's size changed (M-j/M-k: a share of the list and
+    /// preview area) or went back to automatic (M-=, None): remember it
+    /// in `@home-preview-pct`.
+    PreviewPct(Option<u16>),
 }
 
-pub const FOOTER_LIST: &str = " ⏎ go   ^r rename   M-r auto-name   ^x close   ^t reopen   M-↑↓ move   M-n new   ^o preview   pfx ( ) session   Esc clear/close   F1 keys";
+pub const FOOTER_LIST: &str = " ⏎ go   ^r rename   M-r auto-name   ^x close   ^t reopen   M-↑↓ move   M-n new   ^o preview   M-j/k size   pfx ( ) session   Esc clear/close   F1 keys";
 pub const FOOTER_EDIT: &str = " ⏎ save   Esc cancel   (empty name cancels)";
 pub const FOOTER_NEW: &str = " ⏎ create   Esc cancel   (empty = automatic name)";
 pub const FOOTER_CLOSE: &str = " y close   any other key or Esc cancels";
@@ -520,6 +524,13 @@ pub struct App {
     pub mode: Mode,
     pub notice: Option<String>,
     pub preview_flip: bool,
+    /// The preview's share of the list and preview area, in percent, set
+    /// with M-j/M-k; None: sized to the list (see `popup::preview_height`).
+    pub preview_pct: Option<u16>,
+    /// Rows of the list and preview area at the last draw (0: not drawn).
+    pub split_area: u16,
+    /// Rows of the preview at the last draw; None: hidden.
+    pub split_prev: Option<u16>,
     /// `$HOME`, for shortening paths in the preview's cards.
     pub home: String,
     /// The host name: a pane title that is just this isn't shown.
@@ -541,6 +552,23 @@ pub struct App {
     /// The last key was the chord's prefix.
     armed: bool,
     matcher: Matcher,
+}
+
+/// The list and the preview each keep at least this many rows, when the
+/// area has room for both.
+pub const PREVIEW_MIN_ROWS: u16 = 5;
+
+/// Percentage points M-j / M-k move the list/preview divider.
+pub const PREVIEW_STEP: u16 = 5;
+
+/// The preview's rows for `pct` percent of `avail` rows (before clamping).
+pub fn pct_rows(avail: u16, pct: u16) -> u16 {
+    (u32::from(avail) * u32::from(pct.min(100)) / 100) as u16
+}
+
+/// `@home-preview-pct` as the popup takes it: 1..=99, else auto.
+pub fn parse_preview_pct(v: &str) -> Option<u16> {
+    v.trim().parse().ok().filter(|p| (1..=99).contains(p))
 }
 
 /// Lines the preview moves per mouse-wheel notch.
@@ -590,6 +618,9 @@ impl App {
             mode: Mode::List,
             notice: None,
             preview_flip: false,
+            preview_pct: None,
+            split_area: 0,
+            split_prev: None,
             home: String::new(),
             host: String::new(),
             page: 10,
@@ -1167,6 +1198,12 @@ impl App {
             }
             KeyCode::Char('t') if ctrl => return Action::Reopen,
             KeyCode::Char('o') if ctrl => self.preview_flip = !self.preview_flip,
+            KeyCode::Char('k') if alt && !ctrl => return self.resize_preview(true),
+            KeyCode::Char('j') if alt && !ctrl => return self.resize_preview(false),
+            KeyCode::Char('=') if alt && !ctrl => {
+                self.preview_pct = None;
+                return Action::PreviewPct(None);
+            }
             KeyCode::F(1) => self.mode = Mode::Help,
             KeyCode::Char('/') | KeyCode::Char('7') if ctrl => self.mode = Mode::Help,
             _ => {
@@ -1180,6 +1217,43 @@ impl App {
             }
         }
         Action::Redraw
+    }
+
+    /// M-k (`up`: the divider up, the preview larger) / M-j (down,
+    /// smaller), by `PREVIEW_STEP` points of the area at the last draw,
+    /// from the split shown (auto or set); the list and the preview keep
+    /// `PREVIEW_MIN_ROWS` each, and nothing moves when they can't. M-k on
+    /// a hidden preview shows it (as ^o does); M-j never hides it.
+    fn resize_preview(&mut self, up: bool) -> Action {
+        let avail = self.split_area;
+        let Some(prev) = self.split_prev else {
+            if up && avail > 0 {
+                self.preview_flip = !self.preview_flip;
+                return Action::Redraw;
+            }
+            return Action::None;
+        };
+        let fits = |p: &u16| {
+            let r = pct_rows(avail, *p);
+            r >= PREVIEW_MIN_ROWS && avail - r >= PREVIEW_MIN_ROWS
+        };
+        let (Some(lo), Some(hi)) = ((1..=99).find(fits), (1..=99).rev().find(fits)) else {
+            return Action::None;
+        };
+        let cur = self.preview_pct.unwrap_or_else(|| {
+            ((u32::from(prev) * 100 + u32::from(avail) / 2) / u32::from(avail)) as u16
+        });
+        let new = if up {
+            cur.saturating_add(PREVIEW_STEP)
+        } else {
+            cur.saturating_sub(PREVIEW_STEP)
+        }
+        .clamp(lo, hi);
+        if self.preview_pct == Some(new) {
+            return Action::None;
+        }
+        self.preview_pct = Some(new);
+        Action::PreviewPct(Some(new))
     }
 
     /// M-↑/M-↓: swap the selected line's window with the window above /
@@ -1269,6 +1343,11 @@ pub const HELP: &str = "tmux-home — keys   (press any key to return)
   M-↑ M-↓         move the window up / down within its session
   M-n             new window after the selection (inline name)
   ^o              toggle the preview
+  M-k M-j         preview larger / smaller (the list/preview divider up /
+                  down 5%; each keeps 5 rows); M-k shows a hidden
+                  preview; remembered across opens (@home-preview-pct)
+  M-=             back to the automatic size: the list's lines plus 2,
+                  the preview the rest (half if it would get under a third)
   F1  ^/          this help
   (window keys act on a pane row's window)";
 
@@ -1671,6 +1750,14 @@ mod tests {
             Action::ResetName("@3".into())
         );
         assert_eq!(a.mode, Mode::List, "the popup stays in the list");
+    }
+
+    #[test]
+    fn preview_pct_option_values() {
+        assert_eq!(parse_preview_pct("35\n"), Some(35));
+        for v in ["", "0", "100", "-5", "auto", "50%"] {
+            assert_eq!(parse_preview_pct(v), None, "{v:?}");
+        }
     }
 
     #[test]
