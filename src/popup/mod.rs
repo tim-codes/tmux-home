@@ -1401,18 +1401,18 @@ mod tests {
         // a pane row: command, path, then the badge
         let shell = line(&s, "~/d/a/src");
         assert!(shell.contains("fish"), "{s}");
-        assert!(shell.contains("main +!? ⇡2 ⇣1 $1 ⚠2 ↻"), "{s}");
+        assert!(shell.contains("main +!? ⇕⇡2⇣1 $1 ⚠2 ↻"), "{s}");
         assert!(col(&shell, "main") > col(&shell, "~/d/a/src"), "{s}");
         // the agent's pane: its worktree's badge, pinned copy and session
         // row alike
-        assert_eq!(s.matches("fix/x (wt) ! |").count(), 2, "{s}");
+        assert_eq!(s.matches("fix/x (wt) ! ≡").count(), 2, "{s}");
         // a stale status ends in ~
         assert!(line(&s, "~/d/old").contains("legacy ~"), "{s}");
         // window rows carry no path or badge
         assert!(!line(&s, " shell").contains("main"), "{s}");
         // the preview: each pane's band carries its badge, no card
         let band = line(&s, "│.0 fish");
-        assert!(band.contains("main +!? ⇡2 ⇣1 $1 ⚠2 ↻"), "{s}");
+        assert!(band.contains("main +!? ⇕⇡2⇣1 $1 ⚠2 ↻"), "{s}");
         assert!(!s.contains("changes    "), "{s}");
         a.select_wid("@0");
         let s = screen(&mut a, 200, 50);
@@ -1436,7 +1436,7 @@ mod tests {
     fn badges_are_never_cut() {
         let mut snap = git_snap();
         snap.git.repos.get_mut("/home/u/dev/app").unwrap().stray = 12;
-        let pieces = "main +!? ⇡2 ⇣1 $1 ⚠12 ↻";
+        let pieces = "main +!? ⇕⇡2⇣1 $1 ⚠12 ↻";
         for w in (40u16..=200).step_by(4) {
             let mut a = app_of(&snap);
             let s = screen(&mut a, w, 50);

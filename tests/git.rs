@@ -317,7 +317,7 @@ async fn merge_conflict_shows_conflicts_and_the_operation() {
     assert_eq!(st.operation, Some(Operation::Merge));
     assert_eq!(st.conflicts, 1);
     // `other` is unmerged in a repo with no remote: stray too
-    assert_eq!(st.badge_text(), "main ✘ ⚠1 ↻");
+    assert_eq!(st.badge_text(), "main = ⚠1 ↻");
 }
 
 #[tokio::test]
@@ -447,7 +447,7 @@ async fn stray_branches_exclude_integrated_ones() {
     let mut names = st.stray_names.clone();
     names.sort();
     assert_eq!(names, ["old", "spike"], "{st:?}");
-    assert_eq!(st.badge_text(), "main | ⚠2");
+    assert_eq!(st.badge_text(), "main ≡ ⚠2");
 }
 
 // ---- fast-first stages -------------------------------------------------------
@@ -467,7 +467,7 @@ async fn stages_fill_the_status_in_order() {
     let s = git::read_status(&Git::default(), &p).await.unwrap();
     git::apply_status(&mut st, &s);
     assert_eq!(st.phase, Phase::Status);
-    assert_eq!(st.badge_text(), "main ! |");
+    assert_eq!(st.badge_text(), "main ! ≡");
     let mut memo = RefsMemo::default();
     memo.refresh(&Git::default(), &p).await.unwrap();
     git::apply_refs(&mut st, &memo.fields, &p);

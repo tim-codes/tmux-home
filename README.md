@@ -155,7 +155,7 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
    #     NM     CM       ST                  T    AG         PA             GT
  ─ NEEDS YOU ─────────────────────────────────────────────────────────────────────
    0     fix             ◐ waiting                claude
-   └ .0         claude   ◐ waiting           12m  claude     ~/d/app.fix-x  fix/x (wt) ! |
+   └ .0         claude   ◐ waiting           12m  claude     ~/d/app.fix-x  fix/x (wt) ! ≡
  ─ dev ───────────────────────────────────────────────────────────────────────────
    1     api             ● running                claude ×2
    ├ .0         claude   ● running           12m  claude     ~/d/api
@@ -281,7 +281,7 @@ agent column.
 
 Each window row ends in a compact badge for the git repo its pane is in
 (an agent window: the repo, or linked worktree, its lead agent works in, in
-place of the hook's `(wt) <branch>`), e.g. `main +!? ⇡2 ⇣1 $1 ⚠2 ↻`. The
+place of the hook's `(wt) <branch>`), e.g. `main +!? ⇕⇡2⇣1 $1 ⚠2 ↻`. The
 preview of a window in a repo gets a git card spelling it out: branch →
 upstream, ahead/behind, changes, operation in progress, stashes, stray
 branches by name, worktree (linked, main, locked…) and the default branch.
@@ -291,9 +291,10 @@ branches by name, worktree (linked, main, locked…) and the default branch.
 | `main` | branch (the short commit when detached) |
 | `(wt)` | a linked worktree (`git worktree add`) |
 | `+` `!` `?` | staged, modified, untracked files |
-| `✘` | conflicts |
+| `=` | conflicts |
 | `⇡n` `⇣n` | commits ahead of / behind the upstream |
-| `\|` | in sync with the upstream |
+| `⇕⇡n⇣n` | diverged: both ahead of and behind the upstream |
+| `≡` | in sync with the upstream |
 | `$n` | stashes |
 | `⚠n` | stray branches: commits on no remote, no upstream (or a gone one), not merged into the default branch; in a repo with no remote, every branch other than the default one that isn't merged into it |
 | `↻` | merge, rebase, cherry-pick, revert or bisect in progress |
@@ -301,8 +302,10 @@ branches by name, worktree (linked, main, locked…) and the default branch.
 | `⊗` | limited: the repo's config names a command under a key that can't be switched off; only HEAD is shown, no status runs |
 | `~` | stale: the last check timed out or failed (the values are older) |
 
-`F1` shows the same legend. The symbols follow worktrunk's `wt list`;
-`↑↓` are reserved for "vs default branch" (later).
+`F1` shows the same legend. Where a meaning overlaps starship's
+`git_status`, the symbol is starship's (`+ ! ? = $ ⇡ ⇣ ⇕`, and `≡` from its
+common preset), so a prompt and the badge read alike; the rest are
+tmux-home's own. `↑↓` are reserved for "vs default branch" (later).
 
 The daemon computes badges in a task of its own, off the tmux poll's path,
 keyed by repo root (windows in one repo share one status). A repo is

@@ -92,7 +92,7 @@ session pages, a window/pane tree, a column table, a bottom layout preview.*
    #     NM     CM       ST                  T    AG         PA             GT
  ─ NEEDS YOU ─────────────────────────────────────────────────────────────────────
    0     fix             ◐ waiting                claude
-   └ .0         claude   ◐ waiting           12m  claude     ~/d/app.fix-x  fix/x (wt) ! |
+   └ .0         claude   ◐ waiting           12m  claude     ~/d/app.fix-x  fix/x (wt) ! ≡
  ─ dev ───────────────────────────────────────────────────────────────────────────
    1     api             ● running                claude ×2
    ├ .0         claude   ● running           12m  claude     ~/d/api

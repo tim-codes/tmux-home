@@ -26,11 +26,11 @@ fn badge_on_the_row_and_in_the_preview_band() {
     o.open_popup();
     // the app window's pane row: command, path, then the badge (pushed
     // by the daemon)
-    o.wait_for(r"^ +└ \.0 .*/app +main !\? \|");
+    o.wait_for(r"^ +└ \.0 .*/app +main !\? ≡");
     o.keys(&["Down", "Down", "Down", "Down"]);
     o.wait_cursor_on("app");
     // the pane's meta band atop its capture, no git card
-    o.wait_for(r"│\.0 \S+ +main !\? \|");
+    o.wait_for(r"│\.0 \S+ +main !\? ≡");
     assert!(!o.screen().contains("main → origin/main"), "{}", o.screen());
     // F1: the legend
     o.keys(&["F1"]);
