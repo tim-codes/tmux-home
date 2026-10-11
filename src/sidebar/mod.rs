@@ -1,7 +1,9 @@
-//! `tmux-home sidebar` (spec §8): a narrow, read-only pane that shows what
-//! needs you across the server and the windows of its own session, live
-//! from the daemon's snapshots (a direct read every second without one).
-//! `tmux-home sidebar-toggle` adds and removes these panes.
+//! `tmux-home sidebar` (spec §8): a narrow pane that shows what needs you
+//! across the server and the windows of its own session, live from the
+//! daemon's snapshots (a direct read every second without one). Focused,
+//! it takes the popup's movement keys: `↑`/`↓` (`^p`/`^n`, `k`/`j`) move a
+//! selection, `⏎` switches to the selected window, `Esc` hands the focus
+//! back. `tmux-home sidebar-toggle` adds and removes these panes.
 //!
 //! A sidebar pane is marked `@home_role=sidebar`: by whoever creates it
 //! (the toggle, the daemon's auto-create) and by the sidebar process itself
@@ -15,10 +17,12 @@ pub mod view;
 
 use crate::{
     client,
+    ops::Tx,
     popup::{fresh::Stamp, spawn_feed},
     tmux::Tmux,
 };
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use model::{Entry, Sel};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
     path::{Path, PathBuf},
     sync::mpsc::TryRecvError,
@@ -256,11 +260,97 @@ pub fn revive_age() -> u64 {
         .unwrap_or(15)
 }
 
+/// What a key does in a focused sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    Up,
+    Down,
+    /// Switch to the selected window.
+    Go,
+    /// Hand the focus back to the window's last pane.
+    Back,
+    /// Close the sidebar.
+    Quit,
+}
+
+/// The popup's movement keys: `↑`/`^p`/`k`, `↓`/`^n`/`j`, `⏎`, `Esc`; and
+/// `q`. Everything else (and every key release) is ignored.
+pub fn key(k: &KeyEvent) -> Option<Key> {
+    if k.kind == KeyEventKind::Release {
+        return None;
+    }
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let plain = !k
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match k.code {
+        KeyCode::Up => Some(Key::Up),
+        KeyCode::Down => Some(Key::Down),
+        KeyCode::Enter => Some(Key::Go),
+        KeyCode::Esc => Some(Key::Back),
+        KeyCode::Char('p') if ctrl => Some(Key::Up),
+        KeyCode::Char('n') if ctrl => Some(Key::Down),
+        KeyCode::Char('k') if plain => Some(Key::Up),
+        KeyCode::Char('j') if plain => Some(Key::Down),
+        KeyCode::Char('q') if plain => Some(Key::Quit),
+        _ => None,
+    }
+}
+
+/// Hands the focus in the sidebar's window back: its last pane, else its
+/// first pane that isn't a sidebar.
+fn give_back(t: &Tmux, me: &str) {
+    if t.run(&["last-pane", "-t", me]).is_ok() {
+        return;
+    }
+    if let Ok(ps) = panes(t, me, false)
+        && let Some((_, p, _)) = ps.iter().find(|(_, p, side)| !side && p != me)
+    {
+        let _ = t.run(&["select-pane", "-t", p]);
+    }
+}
+
+/// The client to switch: the one showing the sidebar's session that was
+/// active last (the one whose keys just reached us).
+fn client_of(t: &Tmux, me: &str) -> Option<String> {
+    let sid = t
+        .run(&["display-message", "-p", "-t", me, "#{session_id}"])
+        .ok()?;
+    let out = t
+        .run(&[
+            "list-clients",
+            "-t",
+            sid.trim(),
+            "-F",
+            "#{client_activity}\x1f#{client_name}",
+        ])
+        .ok()?;
+    out.lines()
+        .filter_map(|l| {
+            let (a, c) = l.split_once('\x1f')?;
+            Some((a.parse::<u64>().unwrap_or(0), c.to_string()))
+        })
+        .max_by_key(|(a, _)| *a)
+        .map(|(_, c)| c)
+}
+
+/// `⏎` on `e`: the sidebar's window gets its real pane back (so coming
+/// back to it doesn't land in the sidebar), then the client goes to `e`'s
+/// window.
+fn go(t: &Tmux, socket: &Path, me: &str, e: &Entry) {
+    give_back(t, me);
+    let client = client_of(t, me);
+    let _ = Tx::new(socket.to_path_buf()).switch_to(client.as_deref(), &e.sid, &e.wid);
+}
+
 /// `tmux-home sidebar [--managed]`: renders until `q` or until its server
-/// goes. It never asks for the mouse and ignores every other key.
-/// `--managed` (the pane `sidebar-toggle` or auto-create made, or that
-/// resurrect restored) marks its pane `@home_role=sidebar`, and `q` then
-/// closes the pane; run by hand, it marks nothing and `q` just exits.
+/// goes. It never asks for the mouse. Focused, the movement keys select a
+/// window, `⏎` switches to it and `Esc` hands the focus back (see the
+/// module docs); the selection shows while the pane has the focus or a
+/// key has moved it. `--managed` (the pane `sidebar-toggle` or
+/// auto-create made, or that resurrect restored) marks its pane
+/// `@home_role=sidebar`, and `q` then closes the pane; run by hand, it
+/// marks nothing and `q` just exits.
 pub fn run(socket: Option<PathBuf>, managed: bool) -> anyhow::Result<()> {
     let socket = client::current_socket(socket)
         .ok_or_else(|| anyhow::anyhow!("not inside tmux and no --socket"))?;
@@ -277,10 +367,11 @@ pub fn run(socket: Option<PathBuf>, managed: bool) -> anyhow::Result<()> {
         .run(&["display-message", "-p", "#{start_time}"])
         .ok()
         .and_then(|s| s.trim().parse().ok());
-    let feed = spawn_feed(socket, "sidebar", start.map(|s| s + revive_age()));
+    let feed = spawn_feed(socket.clone(), "sidebar", start.map(|s| s + revive_age()));
     let mut term = ratatui::init();
     let result = (|| -> anyhow::Result<()> {
         let mut m = model::Model::default();
+        let mut sel: Option<Sel> = None;
         let mut live = false;
         let mut dirty = true;
         loop {
@@ -298,29 +389,56 @@ pub fn run(socket: Option<PathBuf>, managed: bool) -> anyhow::Result<()> {
                 dirty |= now_live != live;
                 live = now_live;
                 let next = model::Model::build(&f.snap, &me, &home);
+                // focus in: start on the sidebar's own window; focus out:
+                // drop the selection (only on a change: a key may beat
+                // the snapshot that shows the focus arriving)
+                if next.focused && !m.focused && sel.is_none() {
+                    sel = next.here();
+                    dirty = true;
+                } else if !next.focused && m.focused && sel.is_some() {
+                    sel = None;
+                    dirty = true;
+                }
                 dirty |= next != m;
                 m = next;
             }
             if dirty {
-                term.draw(|f| view::draw(f, &m, live))?;
+                term.draw(|f| view::draw(f, &m, live, sel.as_ref()))?;
                 dirty = false;
             }
             if event::poll(TICK)? {
                 match event::read()? {
-                    Event::Key(k)
-                        if k.kind != KeyEventKind::Release
-                            && k.code == KeyCode::Char('q')
-                            && !k
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        // the pane, not just this process: a pane
-                        // resurrect restored runs us in a shell
-                        if managed {
-                            let _ = t.run(&["kill-pane", "-t", &me]);
+                    Event::Key(k) => match key(&k) {
+                        Some(Key::Up) => {
+                            sel = m.step(sel.as_ref(), -1);
+                            dirty = true;
                         }
-                        return Ok(());
-                    }
+                        Some(Key::Down) => {
+                            sel = m.step(sel.as_ref(), 1);
+                            dirty = true;
+                        }
+                        Some(Key::Go) => {
+                            let s = sel.take().or_else(|| m.here());
+                            if let Some(e) = s.as_ref().and_then(|s| m.entry(s)) {
+                                go(&t, &socket, &me, e);
+                            }
+                            dirty = true;
+                        }
+                        Some(Key::Back) => {
+                            sel = None;
+                            give_back(&t, &me);
+                            dirty = true;
+                        }
+                        Some(Key::Quit) => {
+                            // the pane, not just this process: a pane
+                            // resurrect restored runs us in a shell
+                            if managed {
+                                let _ = t.run(&["kill-pane", "-t", &me]);
+                            }
+                            return Ok(());
+                        }
+                        None => {}
+                    },
                     Event::Resize(..) => dirty = true,
                     _ => {}
                 }
@@ -367,6 +485,29 @@ mod tests {
             p("@2", "%6", true),
         ];
         assert_eq!(decide(&all), Toggle::Remove(vec!["%5".into(), "%6".into()]));
+    }
+
+    #[test]
+    fn keys_are_the_popups_movement_keys() {
+        let k = |code, mods| key(&KeyEvent::new(code, mods));
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+        assert_eq!(k(KeyCode::Up, none), Some(Key::Up));
+        assert_eq!(k(KeyCode::Char('p'), ctrl), Some(Key::Up));
+        assert_eq!(k(KeyCode::Char('k'), none), Some(Key::Up));
+        assert_eq!(k(KeyCode::Down, none), Some(Key::Down));
+        assert_eq!(k(KeyCode::Char('n'), ctrl), Some(Key::Down));
+        assert_eq!(k(KeyCode::Char('j'), none), Some(Key::Down));
+        assert_eq!(k(KeyCode::Enter, none), Some(Key::Go));
+        assert_eq!(k(KeyCode::Esc, none), Some(Key::Back));
+        assert_eq!(k(KeyCode::Char('q'), none), Some(Key::Quit));
+        assert_eq!(k(KeyCode::Char('q'), ctrl), None);
+        assert_eq!(k(KeyCode::Char('j'), KeyModifiers::ALT), None);
+        assert_eq!(k(KeyCode::Char('x'), none), None);
+        assert_eq!(k(KeyCode::Char('p'), none), None);
+        let mut up = KeyEvent::new(KeyCode::Up, none);
+        up.kind = KeyEventKind::Release;
+        assert_eq!(key(&up), None);
     }
 
     #[test]

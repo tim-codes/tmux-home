@@ -81,12 +81,13 @@ fn newline_in_pane_path_round_trips() {
 fn unparseable_record_is_skipped() {
     let opts = "\x1f".repeat(tmux_home::agent::OPTIONS.len());
     let good = format!(
-        "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1f\x1f/dev/ttys9\x1f\x1f{opts}alpha\x1ft\x1fw\x1e\n"
+        "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1f\x1f/dev/ttys9\x1f\x1f0\x1f0\x1f80\x1f24\x1f80\x1f24\x1f{opts}alpha\x1ft\x1fw\x1e\n"
     );
     let panes = format!("garbage\x1e\n{good}");
     let snap = tmux_home::tmux::snapshot::parse(&panes, "also garbage\x1e\n");
     assert_eq!(snap.panes.len(), 1);
     assert_eq!(snap.panes[0].tty, "/dev/ttys9");
+    assert_eq!((snap.panes[0].width, snap.panes[0].height), (80, 24));
     assert_eq!(snap.windows[0].name, "w");
     assert!(snap.clients.is_empty());
 }
@@ -129,4 +130,26 @@ fn agent_options_are_read_and_hashed() {
     assert_eq!(read_snapshot(&t).unwrap().sections(), h1, "no tick");
     s.tmux(&["set-option", "-p", "-t", pane, "@pane_status", "waiting"]);
     assert_ne!(read_snapshot(&t).unwrap().sections(), h1);
+}
+
+/// Each pane's place in its window, and the window's size: what the
+/// popup's preview lays the window out from.
+#[test]
+fn pane_geometry_is_read() {
+    let s = common::TestServer::start();
+    s.tmux(&["resize-window", "-t", "alpha:0", "-x", "100", "-y", "30"]);
+    s.tmux(&["split-window", "-d", "-h", "-l", "40", "-t", "alpha:0"]);
+    let snap = read_snapshot(&Tmux::new(s.socket.clone())).unwrap();
+    let mut panes: Vec<_> = snap.panes.iter().collect();
+    panes.sort_by_key(|p| p.index);
+    let geo: Vec<_> = panes
+        .iter()
+        .map(|p| (p.left, p.top, p.width, p.height))
+        .collect();
+    assert_eq!(geo, [(0, 0, 59, 30), (60, 0, 40, 30)]);
+    assert!(
+        panes
+            .iter()
+            .all(|p| (p.window_width, p.window_height) == (100, 30))
+    );
 }

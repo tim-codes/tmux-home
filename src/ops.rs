@@ -137,11 +137,15 @@ impl Tx {
     }
 
     /// A pane with escape sequences (`-e`: colours and attributes) and up
-    /// to `history` lines of scrollback above its visible part.
+    /// to `history` lines of scrollback above its visible part (0: the
+    /// visible part only).
     pub fn capture_styled(&self, pane: &str, history: usize) -> String {
         let start = format!("-{history}");
-        self.run(&["capture-pane", "-p", "-e", "-S", &start, "-t", pane])
-            .unwrap_or_default()
+        let mut args = vec!["capture-pane", "-p", "-e", "-t", pane];
+        if history > 0 {
+            args.extend(["-S", &start]);
+        }
+        self.run(&args).unwrap_or_default()
     }
 
     /// Visible text of a pane, trailing blank lines trimmed.

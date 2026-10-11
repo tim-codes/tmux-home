@@ -24,9 +24,10 @@ fn badge_on_the_row_and_git_card_in_the_preview() {
         repo.to_str().unwrap(),
     ]);
     o.open_popup();
-    // the row: command, path, then the badge (pushed by the daemon)
-    o.wait_for(r"^[ ▌]alpha +\d+  app .* main !\? \|");
-    o.keys(&["Down", "Down"]);
+    // the app window's pane row: command, path, then the badge (pushed
+    // by the daemon)
+    o.wait_for(r"^ +└ \.0 .*/app +main !\? \|");
+    o.keys(&["Down", "Down", "Down", "Down"]);
     o.wait_cursor_on("app");
     // the card above the pane capture
     o.wait_for(r"git +main → origin/main  in sync");

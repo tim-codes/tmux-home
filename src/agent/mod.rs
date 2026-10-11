@@ -126,7 +126,7 @@ impl AgentKind {
 }
 
 /// `^\d+\.\d+\.\d+$`.
-fn is_version(s: &str) -> bool {
+pub(crate) fn is_version(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     parts.len() == 3
         && parts
@@ -442,6 +442,7 @@ pub(crate) mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>(),
             tty: String::new(),
+            ..Default::default()
         }
     }
 

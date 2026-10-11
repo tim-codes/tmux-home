@@ -1,6 +1,8 @@
-//! The preview pane's text: a `capture-pane -e` capture parsed into styled
-//! lines (colours, bold, dim, italic, underline, reverse kept), and the
-//! window of it the preview shows at a scroll offset.
+//! The preview: the selected window's pane layout, each pane's
+//! `capture-pane -e` capture parsed into styled lines (colours, bold, dim,
+//! italic, underline, reverse kept) and placed in its rectangle scaled to
+//! the preview, with tmux-style borders; and the window of a capture the
+//! preview shows at a scroll offset.
 //!
 //! Lines are clipped at the preview's right edge, never wrapped: the capture
 //! is already laid out at the pane's width (tmux wraps it; `-J` is not
@@ -9,7 +11,118 @@
 //! the preview the bottom of the pane.
 
 use ansi_to_tui::IntoText;
-use ratatui::text::{Line, Span};
+use ratatui::{
+    layout::Rect,
+    text::{Line, Span},
+};
+use std::collections::HashMap;
+
+/// The captures the preview draws from, by pane ID: each pane's visible
+/// part (a selected pane's with history above it).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Shot {
+    pub panes: HashMap<String, Vec<Line<'static>>>,
+}
+
+/// Where each pane goes in `area`: the panes' bounding box (in window
+/// cells; a sidebar left out leaves no gap) scaled into `area` less a
+/// one-cell frame. Neighbours share their one-cell separator, as in tmux,
+/// so the rectangles tile the frame's inside exactly. Panes without a
+/// geometry (all zero) are stacked top to bottom instead.
+pub fn place(rects: &[(u32, u32, u32, u32)], area: Rect) -> Vec<Rect> {
+    if rects.is_empty() || area.width < 3 || area.height < 3 {
+        return vec![Rect::default(); rects.len()];
+    }
+    let stacked: Vec<(u32, u32, u32, u32)>;
+    let rects = if rects.iter().all(|r| r.2 == 0 || r.3 == 0) {
+        stacked = (0..rects.len() as u32)
+            .map(|i| (0, i * 25, 80, 24))
+            .collect();
+        &stacked[..]
+    } else {
+        rects
+    };
+    let (iw, ih) = (area.width as u32 - 2, area.height as u32 - 2);
+    let minx = rects.iter().map(|r| r.0).min().unwrap_or(0);
+    let miny = rects.iter().map(|r| r.1).min().unwrap_or(0);
+    let maxx = rects.iter().map(|r| r.0 + r.2).max().unwrap_or(1);
+    let maxy = rects.iter().map(|r| r.1 + r.3).max().unwrap_or(1);
+    let (bw, bh) = ((maxx - minx).max(1), (maxy - miny).max(1));
+    // one axis: [start, end) in the inside, sharing separators
+    let span = |lo: u32, len: u32, min: u32, max: u32, b: u32, inner: u32| {
+        let s = |v: u32| v.saturating_sub(min) * inner / b;
+        let a = if lo <= min { 0 } else { s(lo - 1) + 1 };
+        let z = if lo + len >= max { inner } else { s(lo + len) };
+        (a, z.max(a))
+    };
+    rects
+        .iter()
+        .map(|&(l, t, w, h)| {
+            let (x0, x1) = span(l, w, minx, maxx, bw, iw);
+            let (y0, y1) = span(t, h, miny, maxy, bh, ih);
+            Rect::new(
+                area.x + 1 + x0 as u16,
+                area.y + 1 + y0 as u16,
+                (x1 - x0) as u16,
+                (y1 - y0) as u16,
+            )
+        })
+        .collect()
+}
+
+/// The border cells of `area` around the placed `panes`: every cell no
+/// pane covers, as a box-drawing character joined to its neighbours, and
+/// whether it outlines pane `hl` (drawn highlighted).
+pub fn borders(area: Rect, panes: &[Rect], hl: Option<usize>) -> Vec<(u16, u16, char, bool)> {
+    let inside = |x: u16, y: u16| {
+        panes
+            .iter()
+            .any(|r| x >= r.x && x < r.right() && y >= r.y && y < r.bottom())
+    };
+    let border = |x: i32, y: i32| {
+        x >= area.x as i32
+            && y >= area.y as i32
+            && x < area.right() as i32
+            && y < area.bottom() as i32
+            && !inside(x as u16, y as u16)
+    };
+    let outline = |x: u16, y: u16| {
+        hl.and_then(|i| panes.get(i)).is_some_and(|r| {
+            let (x0, y0) = (r.x as i32 - 1, r.y as i32 - 1);
+            let (x1, y1) = (r.right() as i32, r.bottom() as i32);
+            let (x, y) = (x as i32, y as i32);
+            (x0..=x1).contains(&x)
+                && (y0..=y1).contains(&y)
+                && (x == x0 || x == x1 || y == y0 || y == y1)
+        })
+    };
+    let mut out = Vec::new();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let (xi, yi) = (x as i32, y as i32);
+            if !border(xi, yi) {
+                continue;
+            }
+            let (u, d) = (border(xi, yi - 1), border(xi, yi + 1));
+            let (l, r) = (border(xi - 1, yi), border(xi + 1, yi));
+            let c = match (u, d, l, r) {
+                (true, true, true, true) => '┼',
+                (true, true, false, true) => '├',
+                (true, true, true, false) => '┤',
+                (false, true, true, true) => '┬',
+                (true, false, true, true) => '┴',
+                (false, true, false, true) => '┌',
+                (false, true, true, false) => '┐',
+                (true, false, false, true) => '└',
+                (true, false, true, false) => '┘',
+                (true, _, false, false) | (_, true, false, false) => '│',
+                (false, false, _, _) => '─',
+            };
+            out.push((x, y, c, outline(x, y)));
+        }
+    }
+    out
+}
 
 /// Tab stops every 8 columns, as in a terminal.
 const TAB: usize = 8;
@@ -142,6 +255,56 @@ fn sanitize(line: &mut Line<'static>) {
 mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier};
+
+    /// A 100x30 window split left/right at 59|40, the right half split
+    /// top/bottom at 14|15, placed in a 52x17 area (inside: 50x15).
+    #[test]
+    fn panes_are_scaled_into_the_frame_sharing_separators() {
+        let rects = [(0, 0, 59, 30), (60, 0, 40, 14), (60, 15, 40, 15)];
+        let area = Rect::new(10, 5, 52, 17);
+        let got = place(&rects, area);
+        assert_eq!(got[0], Rect::new(11, 6, 29, 15));
+        // the separator column is x=40: the right panes start after it
+        assert_eq!(got[1].x, 41);
+        assert_eq!(got[1].right(), 61);
+        assert_eq!(got[1].y, 6);
+        assert_eq!(got[2].y, got[1].bottom() + 1, "one separator row");
+        assert_eq!(got[2].bottom(), 21);
+        // the borders: a frame, the separators, joined
+        let b = borders(area, &got, None);
+        let at = |x, y| b.iter().find(|c| (c.0, c.1) == (x, y)).map(|c| c.2);
+        assert_eq!(at(10, 5), Some('┌'));
+        assert_eq!(at(40, 5), Some('┬'));
+        assert_eq!(at(40, got[1].bottom()), Some('├'));
+        assert_eq!(at(61, got[1].bottom()), Some('┤'));
+        assert_eq!(at(40, 21), Some('┴'));
+        assert_eq!(at(20, 20), None, "inside a pane");
+        assert!(b.iter().all(|c| !c.3), "nothing highlighted");
+        // the bottom-right pane highlighted: its outline only
+        let b = borders(area, &got, Some(2));
+        let hl: Vec<_> = b.iter().filter(|c| c.3).collect();
+        assert!(hl.iter().all(|c| c.0 >= 40 && c.1 >= got[1].bottom()));
+        assert_eq!(
+            hl.len(),
+            2 * (got[2].width as usize + 2) + 2 * got[2].height as usize
+        );
+    }
+
+    /// A sidebar left out of the layout leaves no gap: the rest fills the
+    /// frame; panes without geometry are stacked.
+    #[test]
+    fn the_bounding_box_fills_the_frame() {
+        let got = place(&[(31, 0, 169, 50)], Rect::new(0, 0, 40, 10));
+        assert_eq!(got, [Rect::new(1, 1, 38, 8)]);
+        let got = place(&[(0, 0, 0, 0), (0, 0, 0, 0)], Rect::new(0, 0, 40, 11));
+        assert_eq!(got[0].y, 1);
+        assert_eq!(got[1].y, got[0].bottom() + 1);
+        assert_eq!(got[1].bottom(), 10);
+        assert_eq!(
+            place(&[(0, 0, 9, 9)], Rect::new(0, 0, 2, 2)),
+            [Rect::default()]
+        );
+    }
 
     fn plain(l: &Line) -> String {
         l.spans.iter().map(|s| s.content.as_ref()).collect()

@@ -1,6 +1,7 @@
-//! The preview in the real popup: colours from `capture-pane -e`, and the
-//! mouse wheel scrolling it (never the list), through a client on a
-//! throwaway server; plus the cost of a 2000-line capture.
+//! The preview in the real popup: the window's layout, colours from
+//! `capture-pane -e`, and the mouse wheel scrolling the selected pane
+//! (never the list), through a client on a throwaway server; plus the
+//! cost of a 2000-line capture.
 mod common;
 use common::*;
 use std::time::Instant;
@@ -19,10 +20,8 @@ fn print_rows(s: &TestServer, target: &str, n: usize) {
     ]);
 }
 
-/// The cursor row's list part (the side preview shares the screen row).
 fn cursor_row(o: &Outer) -> Option<String> {
     o.cursor_row()
-        .map(|l| l.split('│').next().unwrap_or_default().to_string())
 }
 
 /// The outer screen with escape sequences (`capture-pane -e`).
@@ -44,6 +43,13 @@ fn the_preview_is_coloured_and_the_wheel_scrolls_only_it() {
     o.open_popup();
     o.wait_cursor_on("editor");
     o.wait_for(r"│ROW0300 plain");
+    // a window row: the wheel does nothing
+    o.typed("\x1b[<64;20;10M");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(o.screen().contains("ROW0300 plain"), "{}", o.screen());
+    // its pane row: the pane is outlined and scrolls
+    o.keys(&["Down"]);
+    o.wait_cursor_on_pane("bash|sh|zsh");
     // the preview's cells carry the pane's red: the outer capture has the
     // SGR right before the text
     let red = regex::Regex::new(r"\x1b\[31m(\x1b\[[0-9;]*m)*ROW0300").unwrap();
@@ -60,10 +66,10 @@ fn the_preview_is_coloured_and_the_wheel_scrolls_only_it() {
     let before = cursor_row(&o);
     o.typed("\x1b[<64;20;10M");
     o.wait_for(r"│ROW0297 plain");
-    o.wait_for(r"↑3$");
-    o.typed("\x1b[<64;150;20M");
+    o.wait_for(r"↑3 │$");
+    o.typed("\x1b[<64;150;40M");
     o.wait_for(r"│ROW0294 plain");
-    o.wait_for(r"↑6$");
+    o.wait_for(r"↑6 │$");
     assert!(!o.screen().contains("ROW0300"), "{}", o.screen());
     assert_eq!(cursor_row(&o), before, "the list didn't move");
     // wheel down: back towards the end
@@ -73,15 +79,19 @@ fn the_preview_is_coloured_and_the_wheel_scrolls_only_it() {
     // Shift-↑ a line; then a selection change returns to the latest
     o.keys(&["S-Up"]);
     o.wait_for(r"│ROW0296 plain");
-    o.wait_for(r"↑4$");
+    o.wait_for(r"↑4 │$");
     o.keys(&["Down"]);
     o.wait_cursor_on("win two");
     o.keys(&["Up"]);
-    o.wait_cursor_on("editor");
+    o.wait_cursor_on_pane("");
     o.wait_for(r"│ROW0300 plain");
-    o.wait_gone(r"↑\d+$");
-    // a click on a row selects it
-    o.typed("\x1b[<0;20;4M\x1b[<0;20;4m");
+    o.wait_gone(r"↑\d+ │$");
+    // the outline: magenta (SGR 35) borders around the selected pane
+    let raw = styled_screen(&o);
+    assert!(raw.contains("\x1b[35m┌"), "{raw:?}");
+    // a click on a row selects it (row 6: tabs, prompt, header, editor,
+    // its pane, then win two)
+    o.typed("\x1b[<0;20;6M\x1b[<0;20;6m");
     o.wait_cursor_on("win two");
     assert!(o.popup_open());
 }

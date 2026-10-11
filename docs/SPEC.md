@@ -83,41 +83,74 @@ fire inside it; tmux-home receives those keys.
 
 ## 5. Layout
 
+*Revised 2026-10-11 (docs/superpowers/specs/2026-10-11-paged-tree-table.md):
+session pages, a window/pane tree, a column table, a bottom layout preview.*
+
 ```
- tmux-home   main ▸ 2  ·  agents: 1 waiting · 1 running · 6 idle      F1 help
- > dotf▏                                                        (12/31 windows)
- ─ NEEDS YOU ───────────────────────────────────────────────────────────────
- ◐ scratch 4  dotfiles-fix      claude  waiting      permission: Bash(rm -rf…)
- ─ main ─────────────────────────────────────────── attached · 3 windows ──
-   1  lighthouse            fish     ~/d/lighthouse        main
- ▶ 2  dotfiles              nvim     ~/d/dotfiles          main ✚
-   3  api-refactor          ● running 12m  claude ×2       feat/api  (wt)
- ─ scratch ────────────────────────────────────────────────── 11 windows ──
-   1  scratch               fish     ~
-   4  dotfiles-fix          ◐ waiting      claude          fix/x     (wt)
-   …
- ───────────────────────────────────────────────────────────────────────────
- │ preview: capture of the selected window's active pane                  │
- │ (agent windows: agent card — see §7)                                   │
- ───────────────────────────────────────────────────────────────────────────
- ⏎ go   ^r rename   ^x close   M-↑↓ move   ^o preview   F1 all keys
+  ▶dev ●1   scratch                                                       F1 help
+>                                                                             4/4
+   #     NM     CM       ST                  T    AG         PA             GT
+ ─ NEEDS YOU ─────────────────────────────────────────────────────────────────────
+   0     fix             ◐ waiting                claude
+   └ .0         claude   ◐ waiting           12m  claude     ~/d/app.fix-x  fix/x (wt) ! |
+ ─ dev ───────────────────────────────────────────────────────────────────────────
+   1     api             ● running                claude ×2
+   ├ .0         claude   ● running           12m  claude     ~/d/api
+▌  └ .1         claude   ● running           12m  claude     ~/d/api
+ ▶ 3     shell
+   └ .0         fish                                         ~/d/a/src      main +!? ⇡2
+──────────────────────────────────────────────────────────────────────────────────
+ ● running  ·  claude  ·  run 12m
+┌──────────────────────────────────────┬─────────────────────────────────────────┐
+│$ cargo test                          │> add the tests                          │
+└──────────────────────────────────────┴─────────────────────────────────────────┘
+ ⏎ go   ^r rename   ^x close   M-↑↓ move   ^o preview   pfx ( ) session   F1 keys
 ```
 
-- **Header:** current location, agent tally by status, match count.
-- **Filter line:** always focused unless an inline editor is open.
-- **List:** grouped by session (the invoking client's session first, then by
-  name), windows in index order. Row: index, name, then either the active
-  pane's command + short path + git branch, or — for agent windows — status
-  icon + word + run elapsed + agent count. `(wt)` marks a worktree, `✚` dirty.
-  *Implemented (pass 5b):* the git part is a compact badge at the row's end
-  (`main +!? ⇡2 ⇣1 $1 ⚠2 ↻`; symbols in the README and `F1`), computed by
-  the daemon; see the design spec §6.
-- **Panes** hidden by default; `M-→` / `M-←` expand / collapse a window.
-  Windows with more than one agent pane show a `×N` count. Sidebar panes
-  (`@pane_role=sidebar`) are never listed or counted.
-- **Preview:** right half at ≥ 160 columns, bottom third at ≥ 30 rows,
-  otherwise hidden (the half-height dropdown gets the list only). `^o`
-  toggles. Layout recomputes on terminal resize.
+- **Tab strip** (the header): every session by name; the page shown
+  reversed and bold, the client's session `▶`, `●N` (yellow) its windows
+  that need you; `(direct)` in degraded mode, `F1 help` at the right. Tabs
+  that don't fit around the page shown give way (`‹` `›`).
+- **Session pages:** the list shows one session. It opens on the client's
+  session (no client: the first by name). `prefix )` / `prefix (` page,
+  wrapping — tmux's own next/previous-session keys, recognised the way the
+  open-key chord is (§6), deliberately not a bare key; list navigation never
+  pages. The filter is scoped to the page; paging keeps and re-applies it.
+- **Filter line:** always focused unless an inline editor is open; the
+  count at its right is the page's windows matching / all.
+- **Column header:** dim, htop-style: `# NM CM ST T AG PA GT MS`.
+- **List:** a NEEDS YOU group (the page's windows that need you) when there
+  is one, then the page's windows in index order. Every window is a row and
+  every non-sidebar pane a row beneath it, single-pane windows included.
+
+  | col | meaning | window row | pane row |
+  | --- | --- | --- | --- |
+  | `#` | index | window index (`▶` before it: the client's window) | `├ .N` / `└ .N` |
+  | `NM` | name | window name | pane title, blank when it is the host name |
+  | `CM` | command | — | current command (a tagged agent's version-named binary shows as the agent) |
+  | `ST` | agent state, icon and word | most urgent pane's | the pane's; stale: dim `(ended?)` |
+  | `T` | run time | — | the agent's |
+  | `AG` | agent kind | `kind ×N` | kind |
+  | `PA` | path (short, `~`) | — | cwd |
+  | `GT` | git badge | — | the pane cwd's repo |
+  | `MS` | message, rest of the width | — | wait reason (yellow) / prompt (dim) |
+
+  Widths are computed per page from the content (capped) so values align;
+  columns nothing on the page fills are left out. Narrow widths drop `MS`,
+  then `GT`, `PA`, `T`, `AG`, `CM`, `ST`; `NM` shrinks no further than its
+  minimum. `F1` lists the legend. Sidebar panes (`@pane_role=sidebar`) are
+  never listed or counted.
+- **Preview:** always at the bottom: half the list area when the popup is
+  ≥ 30 rows, else hidden unless `^o` (which also hides a shown one). It
+  draws the selected window's pane layout — each pane's visible capture
+  (`capture-pane -e`) in its rectangle scaled to the preview (the bounding
+  box of the non-sidebar panes), inside a frame with tmux-style separators.
+  On a pane row that pane is outlined in magenta and is the one the wheel
+  and `S-↑`/`S-↓` scroll (its capture includes history); on a window row
+  nothing is highlighted or scrolls. The agent and git cards sit above the
+  layout: the lead pane's for a window row, the selected pane's for a pane
+  row. Pane geometry comes from the snapshot (`pane_left/top/width/height`,
+  `window_width/height`). Layout recomputes on terminal resize.
 - **Footer:** the handful of keys valid in the current mode.
 
 ## 6. Interaction
@@ -127,18 +160,20 @@ fire inside it; tmux-home receives those keys.
 | Key | Action |
 | --- | --- |
 | printable keys | Filter (fuzzy over session, name, path, branch, command, agent prompt) |
-| `↑` `↓`, `^p` `^n`, `^k` `^j` | Move selection |
+| `↑` `↓`, `^p` `^n`, `^k` `^j` | Move selection over windows and panes (wraps within the page) |
+| `prefix )` / `prefix (` | Next / previous session page (wraps; §5) |
 | `PgUp` `PgDn` | Page |
 | `←` `→`, `Home` `End` | Edit the filter (Cmd+←/→ send Home/End) |
-| `M-→` / `M-←` | Expand / collapse window panes |
-| `⏎` | Switch the invoking client to the selection and close |
-| `^g` | Jump to the next item needing attention |
+| `⏎` | Switch the invoking client to the selection and close (a pane row: also select that pane) |
+| `^g` | Jump to the next window needing attention, paging to its session |
 | `Esc` | Clear filter; if already empty, close |
 | `prefix` + home key | Close, from any mode (the key that opened the popup toggles it). Inside the popup tmux passes the prefix on, so the chord arrives as two keys; the popup learns its prefix and `@home-keys` from `TMUX_HOME_PREFIX` / `TMUX_HOME_KEYS`, set by the binding. The prefix keeps its own meaning (`^a`: cursor to the start; cancels a close prompt; leaves help), so only a home key straight after it closes. An unsaved rename / new-window name is dropped and a pending close is not done. Only single-character home keys count; `prefix2` is not recognised. |
 | `F1` or `^/` | All keys |
 
 Filter tokens (combine with text): `@attn`, `@agent`, `@running`,
-`@waiting`, `@idle`, `@error`, `s:<session>`.
+`@waiting`, `@background`, `@idle`, `@error`. (`s:<session>` is gone:
+paging replaces it.) Window actions (rename, close, move, new) act on a
+pane row's window.
 
 **Switching across clients.** `⏎` onto a window in a different session than
 the invoking client's (e.g. from the `scratch` dropdown to a `main` window)

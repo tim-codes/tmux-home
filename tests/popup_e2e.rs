@@ -1,6 +1,7 @@
 //! The real popup, opened with tmux-home's binding through a client on a
 //! throwaway server and read back with capture-pane: list, filter, rename,
-//! auto-name, preview, help, switching and layout (bash suite port, part 1).
+//! auto-name, preview, help, switching, session pages and pane rows
+//! (bash suite port, part 1).
 mod common;
 use common::*;
 use std::{
@@ -10,8 +11,17 @@ use std::{
 };
 use tmux_home::paths::Paths;
 
+/// A full-width rule with the layout's frame right under it: the
+/// preview, below the list.
+fn bottom_preview(screen: &str, cols: usize) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    lines.windows(2).any(|w| {
+        w[0].chars().count() == cols && w[0].chars().all(|c| c == '─') && w[1].starts_with('┌')
+    })
+}
+
 #[test]
-fn opens_grouped_with_header_and_side_preview() {
+fn opens_on_the_client_session_with_tabs_and_bottom_preview() {
     let (_env, s, o) = popup_fixture();
     assert!(
         !s.tmux(&["list-clients", "-F", "#{client_name}"])
@@ -19,19 +29,28 @@ fn opens_grouped_with_header_and_side_preview() {
             .is_empty()
     );
     o.open_popup();
-    o.wait_for("tmux-home +alpha ▸ 0");
+    o.wait_for(r"^  ▶alpha   beta  ");
+    o.wait_for(r"^ +# +NM ");
     let screen = o.screen();
-    assert_eq!(row_sessions(&screen), ["alpha", "alpha", "beta", "beta"]);
+    assert_eq!(row_windows(&screen), ["editor", "win two"], "{screen}");
     assert!(
-        regex::Regex::new(r"(?m)^▌alpha ▶ +0  editor")
+        regex::Regex::new(r"(?m)^▌▶ 0 +editor")
             .unwrap()
             .is_match(&screen),
         "current window marked and selected:\n{screen}"
     );
-    assert!(screen.contains('│'), "side preview at 200 cols:\n{screen}");
+    assert!(
+        regex::Regex::new(r"(?m)^   └ \.0 ")
+            .unwrap()
+            .is_match(&screen),
+        "a pane row under each window:\n{screen}"
+    );
+    assert!(bottom_preview(&screen, 200), "{screen}");
     // beta:logs previews its main pane, never its (active) sidebar
-    o.keys(&["Down", "Down"]);
+    o.keys(&["C-b", ")"]);
     o.wait_cursor_on("logs");
+    o.wait_for(r"^> .*2/2");
+    assert_eq!(row_windows(&o.screen()), ["logs", "build"]);
     o.wait_for("MAIN-PANE-MARKER");
     assert!(!o.screen().contains("SIDEBAR-MARKER"), "{}", o.screen());
 }
@@ -40,27 +59,97 @@ fn opens_grouped_with_header_and_side_preview() {
 fn filter_esc_and_navigation() {
     let (_env, _s, o) = popup_fixture();
     o.open_popup();
-    o.typed("bui");
-    o.wait_for(r"^> bui .*1/4");
-    assert_eq!(row_sessions(&o.screen()), ["beta"], "only beta build left");
-    o.wait_cursor_on("build");
+    o.typed("win");
+    o.wait_for(r"^> win .*1/2");
+    assert_eq!(row_windows(&o.screen()), ["win two"]);
+    o.wait_cursor_on("win two");
     o.keys(&["Escape"]);
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     assert!(o.popup_open(), "Esc on a filter only clears it");
     o.wait_cursor_on("editor");
+    // windows and their pane rows, wrapping within the page
     for (k, name) in [
-        ("C-n", "win two"),
-        ("C-j", "logs"),
-        ("Down", "build"),
-        ("C-p", "logs"),
-        ("C-k", "win two"),
-        ("Up", "editor"),
-        ("Up", "build"), // cycles
-        ("Down", "editor"),
+        ("C-n", None),
+        ("C-j", Some("win two")),
+        ("Down", None),
+        ("Down", Some("editor")), // cycles, never to beta
+        ("C-p", None),
+        ("C-k", Some("win two")),
+        ("Up", None),
+        ("Up", Some("editor")),
     ] {
         o.keys(&[k]);
-        o.wait_cursor_on(name);
+        match name {
+            Some(n) => o.wait_cursor_on(n),
+            None => o.wait_cursor_on_pane(""),
+        }
     }
+}
+
+/// `prefix )` / `prefix (` page through the sessions, keeping the filter;
+/// a bare paren is just text.
+#[test]
+fn prefix_parens_page_the_sessions() {
+    let (_env, s, o) = popup_fixture();
+    s.tmux(&["new-session", "-d", "-s", "gamma", "-n", "gwin"]);
+    o.open_popup();
+    o.wait_for(r"^  ▶alpha   beta   gamma ");
+    o.keys(&["C-b", ")"]);
+    o.wait_cursor_on("logs");
+    o.keys(&["C-b", ")"]);
+    o.wait_cursor_on("gwin");
+    o.wait_for(r"^> .*1/1");
+    o.keys(&["C-b", ")"]);
+    o.wait_cursor_on("editor");
+    o.keys(&["C-b", "("]);
+    o.wait_cursor_on("gwin");
+    o.keys(&["C-b", "("]);
+    o.wait_cursor_on("logs");
+    // the filter stays, applied to each page
+    o.typed("ui");
+    o.wait_for(r"^> ui .*1/2");
+    o.wait_cursor_on("build");
+    o.keys(&["C-b", "("]);
+    o.wait_for(r"^> ui .*0/2");
+    o.keys(&["C-b", ")"]);
+    o.wait_for(r"^> ui .*1/2");
+    o.wait_cursor_on("build");
+    o.typed(")");
+    o.wait_for(r"^> ui\) .*0/2");
+    assert!(o.popup_open());
+}
+
+/// ⏎ on a pane row switches to its window and selects that pane.
+#[test]
+fn enter_on_a_pane_row_selects_that_pane() {
+    let (_env, s, o) = popup_fixture();
+    let first = fmt(&s, "alpha:editor", "#{pane_id}");
+    let second = s
+        .tmux(&[
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "alpha:editor",
+        ])
+        .trim()
+        .to_string();
+    s.tmux(&["select-window", "-t", "alpha:win two"]);
+    o.open_popup();
+    o.wait_cursor_on("win two");
+    o.wait_for(r"^   ├ \.0 ");
+    o.keys(&["Up"]);
+    o.wait_cursor_on_pane("");
+    o.wait_for(r"^▌  └ \.1 ");
+    o.keys(&["Enter"]);
+    o.wait_gone("F1 help");
+    wait_until("client on alpha:editor", || client_at(&s) == "alpha:editor");
+    wait_until("the second pane focused", || {
+        fmt(&s, "alpha:editor", "#{pane_id}") == second
+    });
+    assert_ne!(first, second);
 }
 
 #[test]
@@ -70,7 +159,7 @@ fn the_open_key_toggles_the_popup() {
     // inside the popup tmux passes the prefix on: `C-b .` reaches it as two
     // keys, and closes it rather than typing '.' into the filter
     o.typed("bu");
-    o.wait_for(r"^> bu .*/4");
+    o.wait_for(r"^> bu .*/2");
     o.keys(&["C-b", "."]);
     o.wait_gone(r"^> bu ");
     assert!(!o.popup_open(), "{}", o.screen());
@@ -97,42 +186,42 @@ fn rename_inline() {
     wait_until("renamed by ID", || {
         fmt(&s, &target, "#{window_name}") == "renamed (x)+y, z"
     });
-    o.wait_for(r"^> +.*4/4");
-    o.wait_for(r"▶ +0  renamed \(x\)\+y, z");
+    o.wait_for(r"^> +.*2/2");
+    o.wait_for(r"▶ 0 +renamed \(x\)\+y, z");
     // the pre-fill round-trips ( ) + ,
     o.keys(&["C-r"]);
     o.wait_for(r"^rename › renamed \(x\)\+y, z");
     o.keys(&["Escape"]);
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     assert_eq!(fmt(&s, &target, "#{window_name}"), "renamed (x)+y, z");
     // an empty name cancels
     o.keys(&["C-r"]);
     o.wait_for("^rename › renamed");
     o.keys(&["C-u"]);
     o.keys(&["Enter"]);
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     assert_eq!(fmt(&s, &target, "#{window_name}"), "renamed (x)+y, z");
     // a filter with ( ) + survives an editor round-trip
     o.typed("(x)+");
-    o.wait_for(r"^> \(x\)\+ .*1/4");
+    o.wait_for(r"^> \(x\)\+ .*1/2");
     o.keys(&["C-r"]);
     o.wait_for("^rename › renamed");
     o.keys(&["Escape"]);
-    o.wait_for(r"^> \(x\)\+ .*1/4");
+    o.wait_for(r"^> \(x\)\+ .*1/2");
     o.keys(&["Escape"]);
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
     // renaming a filtered selection hits that window; the filter stays
     o.typed("win");
-    o.wait_for(r"^> win .*1/4");
+    o.wait_for(r"^> win .*1/2");
     o.keys(&["C-r"]);
     o.wait_for("^rename › win two");
     o.keys(&["BSpace", "BSpace", "BSpace"]);
     o.typed("2");
     o.keys(&["Enter"]);
     wait_until("win 2", || fmt(&s, "alpha:1", "#{window_name}") == "win 2");
-    o.wait_for(r"^> win .*1/4");
+    o.wait_for(r"^> win .*1/2");
     o.keys(&["Escape"]);
-    o.wait_for(r"^> +.*4/4");
+    o.wait_for(r"^> +.*2/2");
 }
 
 #[test]
@@ -147,14 +236,14 @@ fn reset_preview_toggle_and_help() {
     });
     assert!(o.popup_open());
     o.keys(&["C-o"]);
-    o.wait_gone("│");
+    o.wait_gone("┌");
     o.keys(&["C-o"]);
-    o.wait_for("│");
+    o.wait_for("┌");
     for k in ["F1", "C-/"] {
         o.keys(&[k]);
         o.wait_for("press any key to return");
         o.keys(&["q"]);
-        o.wait_for(r"^> +.*4/4");
+        o.wait_for(r"^> +.*2/2");
     }
 }
 
@@ -162,8 +251,9 @@ fn reset_preview_toggle_and_help() {
 fn enter_switches_and_esc_closes() {
     let (_env, s, o) = popup_fixture();
     o.open_popup();
+    o.keys(&["C-b", ")"]);
     o.typed("build");
-    o.wait_for(r"^> build .*1/4");
+    o.wait_for(r"^> build .*1/2");
     o.keys(&["Enter"]);
     o.wait_gone("F1 help");
     let want = fmt(&s, "beta:build", "#{session_id} #{window_id}");
@@ -173,28 +263,20 @@ fn enter_switches_and_esc_closes() {
             == want
     });
     o.open_popup();
-    o.wait_for("tmux-home +beta ▸ 1");
-    assert_eq!(
-        row_sessions(&o.screen()),
-        ["beta", "beta", "alpha", "alpha"]
-    );
+    o.wait_for(r"^  alpha   ▶beta ");
+    assert_eq!(row_windows(&o.screen()), ["logs", "build"]);
     o.wait_cursor_on("build");
     o.keys(&["Escape"]);
     o.wait_gone("F1 help");
 }
 
 #[test]
-fn layout_150x40_has_no_side_preview() {
+fn the_preview_is_at_the_bottom_when_narrow_too() {
     let (_env, _s, o) = popup_fixture_sized(150, 40);
     o.open_popup();
+    o.wait_for("┌");
     let screen = o.screen();
-    assert!(!screen.contains('│'), "{screen}");
-    assert!(
-        screen
-            .lines()
-            .any(|l| l.chars().count() >= 150 && l.chars().all(|c| c == '─')),
-        "bottom preview border:\n{screen}"
-    );
+    assert!(bottom_preview(&screen, 150), "{screen}");
 }
 
 /// A tiny terminal still draws the popup, and every mode's keys work
@@ -214,11 +296,15 @@ fn tiny_terminal_keeps_running() {
         &["q"],
     ] {
         o.keys(keys);
-        assert!(o.screen().contains("tmux-home"), "{}", o.screen());
+        let screen = o.screen();
+        assert!(
+            screen.contains("F1 help") || screen.contains("tmux-home"),
+            "{screen}"
+        );
     }
     o.wait_for(r"^> ");
     o.keys(&["Escape"]);
-    o.wait_gone("tmux-home");
+    o.wait_gone("F1 help");
 }
 
 /// The cursor opens on the client's current window even when the daemon's
@@ -280,20 +366,21 @@ const WAITING: &[(&str, &str)] = &[
     ("@pane_prompt", "tidy the changelog"),
 ];
 
-/// Lines between the NEEDS YOU header and the next header.
+/// The window rows between the NEEDS YOU header and the next header.
 fn needs_you_rows(screen: &str) -> Vec<String> {
     screen
         .lines()
         .skip_while(|l| !l.contains("─ NEEDS YOU ─"))
         .skip(1)
-        .take_while(|l| !l.contains("─ sessions ─"))
+        .take_while(|l| !l.starts_with(" ─"))
+        .filter(|l| !l.contains(" ├ .") && !l.contains(" └ ."))
         .map(str::to_string)
         .collect()
 }
 
-/// An agent starting to wait while the popup is open is pinned in NEEDS
-/// YOU (the poll picks the option up), counted in the header, and ^g
-/// jumps to it; ⏎ there switches to its window.
+/// An agent starting to wait while the popup is open is counted on its
+/// session's tab (the poll picks the option up), and ^g pages there and
+/// jumps to it, pinned in NEEDS YOU; ⏎ there switches to its window.
 #[test]
 fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
     let (_env, s, o) = popup_fixture();
@@ -303,9 +390,20 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
     s.tmux(&["split-window", "-t", "beta:agent"]);
     assert_ne!(fmt(&s, "beta:agent", "#{pane_id}"), agent_pane);
     o.open_popup();
-    o.wait_for(r"^> .*5/5");
-    assert!(!o.screen().contains("NEEDS YOU"), "{}", o.screen());
+    o.wait_for(r"^> .*2/2");
+    assert!(!o.screen().contains('●'), "{}", o.screen());
     fake_agent(&s, "agent", WAITING);
+    o.wait_for(r"^  ▶alpha   beta ●1 ");
+    assert!(
+        !o.screen().contains("NEEDS YOU"),
+        "another page's: {}",
+        o.screen()
+    );
+    // ^g pages to beta, onto the pinned copy; the agent card previews it,
+    // with the prompt
+    o.wait_cursor_on("editor");
+    o.keys(&["C-g"]);
+    o.wait_cursor_on("agent");
     o.wait_for("─ NEEDS YOU ─");
     let screen = o.screen();
     let pinned = needs_you_rows(&screen);
@@ -314,16 +412,14 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
         pinned[0].contains("agent") && pinned[0].contains("◐ waiting"),
         "{screen}"
     );
-    assert!(pinned[0].contains("permission"), "{screen}");
-    assert!(screen.contains("agents: 1 waiting"), "{screen}");
-    // the agent card previews it, with the prompt
-    o.wait_cursor_on("editor");
-    o.keys(&["C-g"]);
-    o.wait_cursor_on("agent");
-    let screen = o.screen();
-    assert_eq!(
-        needs_you_rows(&screen).first().map(|l| l.starts_with('▌')),
-        Some(true),
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains(" .0") && l.contains("permission")),
+        "the reason on its pane row:\n{screen}"
+    );
+    assert!(
+        pinned[0].starts_with('▌'),
         "^g lands on the pinned row:\n{screen}"
     );
     o.wait_for("needs you  permission");
@@ -344,16 +440,18 @@ fn close_from_a_pinned_copy() {
     fake_agent(&s, "agent", WAITING);
     let target = wid(&s, "beta:agent");
     o.open_popup();
-    o.wait_for("─ NEEDS YOU ─");
+    o.wait_for("beta ●1");
     o.keys(&["C-g"]);
     o.wait_cursor_on("agent");
+    o.wait_for("─ NEEDS YOU ─");
     o.keys(&["C-x"]);
     o.wait_for(r#"^close "agent"\? agent still working — running: claude \(y/N\)"#);
     o.keys(&["y"]);
     wait_until("window closed", || !window_ids(&s).contains(&target));
-    o.wait_for(r"^> .*4/4");
+    o.wait_for(r"^> .*2/2");
     o.wait_gone("NEEDS YOU");
-    o.wait_cursor_on("editor");
+    o.wait_gone("●");
+    o.wait_cursor_on("logs");
 }
 
 /// The agent is answered while its pinned copy is selected: the group
@@ -363,9 +461,10 @@ fn answered_while_its_pinned_copy_is_selected() {
     let (_env, s, o) = popup_fixture();
     fake_agent(&s, "agent", WAITING);
     o.open_popup();
-    o.wait_for("─ NEEDS YOU ─");
+    o.wait_for("beta ●1");
     o.keys(&["C-g"]);
     o.wait_cursor_on("agent");
+    o.wait_for("─ NEEDS YOU ─");
     fake_agent(
         &s,
         "agent",
@@ -375,12 +474,16 @@ fn answered_while_its_pinned_copy_is_selected() {
     o.wait_cursor_on("agent");
     let row = o.cursor_row().unwrap();
     assert!(row.contains("● running"), "{row}");
-    assert!(row.starts_with("▌beta"), "in its session: {row}");
+    assert_eq!(
+        row_windows(&o.screen()),
+        ["logs", "build", "agent"],
+        "in its session"
+    );
 }
 
 /// `@waiting` keeps only the waiting agent's window; an agent whose pane
 /// is back at its shell is shown dimmed with "(ended?)", and is neither
-/// pinned nor counted.
+/// pinned nor counted on its tab.
 #[test]
 fn waiting_filter_and_stale_agent() {
     let (_env, s, o) = popup_fixture();
@@ -389,14 +492,12 @@ fn waiting_filter_and_stale_agent() {
         s.tmux(&["set-option", "-p", "-t", "alpha:win two", k, v]);
     }
     o.open_popup();
-    o.wait_for("─ NEEDS YOU ─");
+    o.wait_for("beta ●1");
     o.wait_for(r"win two .*\(ended\?\)");
     let screen = o.screen();
-    assert_eq!(needs_you_rows(&screen).len(), 1, "{screen}");
+    assert!(!screen.contains("NEEDS YOU"), "{screen}");
     assert!(
-        regex::Regex::new(r"(?m)agents: 1 waiting( |$)")
-            .unwrap()
-            .is_match(&screen),
+        screen.contains("▶alpha  "),
         "the stale agent isn't counted:\n{screen}"
     );
     // dimmed: SGR 2 on the stale cell
@@ -409,14 +510,16 @@ fn waiting_filter_and_stale_agent() {
         "{stale:?}"
     );
     o.typed("@waiting");
-    o.wait_for(r"^> @waiting .*1/5");
+    o.wait_for(r"^> @waiting .*0/2");
+    o.keys(&["C-b", ")"]);
+    o.wait_for(r"^> @waiting .*1/3");
     let screen = o.screen();
     assert!(!screen.contains("win two"), "{screen}");
     assert_eq!(
-        screen.lines().filter(|l| l.contains("  agent ")).count(),
-        2,
+        row_windows(&screen),
+        ["agent", "agent"],
         "pinned and in its session:\n{screen}"
     );
-    o.typed(" s:alpha");
-    o.wait_for(r"^> @waiting s:alpha .*0/5");
+    o.typed(" zzz");
+    o.wait_for(r"^> @waiting zzz .*0/3");
 }

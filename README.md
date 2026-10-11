@@ -6,22 +6,24 @@ where to go.
 
 ## Features
 
-- **Popup home screen** (`prefix .`): every session and window, grouped,
-  with a type-first fuzzy filter and a live, coloured preview of the
-  selected pane. Switch, rename inline, reorder, create, close (with a
+- **Popup home screen** (`prefix .`): one session per page (a tab strip
+  across the top, `prefix )` / `prefix (` to page), every window with its
+  panes beneath it in an aligned table, a type-first fuzzy filter and a
+  live, coloured preview of the selected window's whole pane layout. Switch, rename inline, reorder, create, close (with a
   confirm when something is still running) and reopen closed windows, all
   without leaving the popup.
 - **Coding-agent awareness**: Claude Code sessions show their status
-  (running, waiting, idle, error, background) and run time on their window's
-  row; windows waiting on you are pinned under **NEEDS YOU**, and `^g` jumps
-  to the next one. Fed by tmux-home's own Claude Code hooks, or read-only
+  (running, waiting, idle, error, background) and run time on their pane's
+  row; windows waiting on you are pinned under **NEEDS YOU** and counted on
+  their session's tab, and `^g` jumps to the next one, on any page. Fed by tmux-home's own Claude Code hooks, or read-only
   from [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s
   pane options.
 - **Git badges**: branch, dirty state, ahead/behind, stashes, stray branches
   and operations in progress for each window's repo, computed read-only in
   the background.
-- **Sidebar** (`prefix e` / `prefix E`): a narrow, read-only, always-on view
-  of the same state for one window or a whole session.
+- **Sidebar** (`prefix e` / `prefix E`): a narrow, always-on view of the
+  same state for one window or a whole session; focus it to move through
+  its windows and switch.
 - **tmux-resurrect integration**: sidebars come back after a restore, and
   (opt-in) Claude Code sessions are resumed in the panes they ran in.
 
@@ -144,20 +146,62 @@ Don't point a development build at your live tmux server: each build
 restarts the other's daemon on every request (one per server, one build at
 a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 
+## Layout
+
+```
+  ▶dev ●1   scratch                                                       F1 help
+>                                                                             4/4
+   #     NM     CM       ST                  T    AG         PA             GT
+ ─ NEEDS YOU ─────────────────────────────────────────────────────────────────────
+   0     fix             ◐ waiting                claude
+   └ .0         claude   ◐ waiting           12m  claude     ~/d/app.fix-x  fix/x (wt) ! |
+ ─ dev ───────────────────────────────────────────────────────────────────────────
+   1     api             ● running                claude ×2
+   ├ .0         claude   ● running           12m  claude     ~/d/api
+▌  └ .1         claude   ● running           12m  claude     ~/d/api
+ ▶ 3     shell
+   └ .0         fish                                         ~/d/a/src      main +!? ⇡2
+──────────────────────────────────────────────────────────────────────────────────
+ ● running  ·  claude  ·  run 12m
+┌──────────────────────────────────────┬─────────────────────────────────────────┐
+│$ cargo test                          │> add the tests                          │
+└──────────────────────────────────────┴─────────────────────────────────────────┘
+```
+
+- **Tab strip**: every session by name; the page shown is reversed and
+  bold, the client's session marked `▶`, `●N` counts its windows that need
+  you. The popup opens on the client's session (no client: the first).
+  `prefix )` / `prefix (` page — tmux's own next/previous-session keys,
+  deliberately a prefixed chord rather than a bare key; list navigation
+  never pages.
+- **Rows**: every window, and under it every pane but sidebars (single-pane
+  windows too). A window row shows its index, name, its most urgent agent
+  state and the agent kind (`×N` live agents); a pane row shows `├ .N` /
+  `└ .N`, its title (blank when it is just the host name), command, agent
+  state, run time and kind, directory, git badge, and why it needs you
+  (yellow) or its last prompt (dim). Claude Code's executable is named
+  after its version; a pane tmux-home's hooks tagged shows `claude` there
+  instead.
+- **Columns** (`# NM CM ST T AG PA GT MS`, dim, under the filter) are sized
+  per page from what they hold, so values line up. Narrow terminals drop
+  `MS`, then `GT`, `PA`, `T`, `AG`, `CM`, `ST`; `#` and the name stay.
+  `F1` lists the legend.
+
 ## Keys
 
 | Key | Action |
 | --- | --- |
-| type | filter (session, index, name, command, path, agent kind, git branch; agent prompts word by word) and tokens, below |
-| `↑` `↓` `^p` `^n` `^k` `^j` | move (wraps) |
+| type | filter the page (index, name, command, path, title, agent kind, git branch; agent prompts word by word) and tokens, below. A window is shown when it or one of its panes matches, then with all its panes |
+| `prefix )` `prefix (` | next / previous session page (wraps); the filter is kept and applies to the new page |
+| `↑` `↓` `^p` `^n` `^k` `^j` | move over windows and panes (wraps within the page) |
 | `PgUp` `PgDn` | page |
-| `S-↑` `S-↓` | scroll the preview a line (the list stays put) |
-| `S-PgUp` `S-PgDn` | scroll the preview half a page |
-| mouse wheel | scroll the preview, 3 lines a notch, wherever the pointer is; never the list |
+| `S-↑` `S-↓` | scroll the selected pane in the preview a line (on a pane row; the list stays put) |
+| `S-PgUp` `S-PgDn` | scroll it half a page |
+| mouse wheel | scroll the selected pane, 3 lines a notch, wherever the pointer is; never the list; nothing on a window row |
 | click | select the row clicked |
 | `←` `→` `Home` `End` `^a` `^e` `^u` `^w` | edit the filter |
-| `⏎` | switch to the window and close (an agent window: also focus the agent's pane) |
-| `^g` | jump to the next window that needs you (cycles through NEEDS YOU) |
+| `⏎` | switch to the window and close: on a pane row also select that pane, on an agent window's row focus the agent's pane |
+| `^g` | jump to the next window that needs you, paging to its session if needed |
 | `Esc` | clear the filter; close when it is already empty |
 | `prefix` + home key | close, from any mode: the key that opened the popup (`prefix .` by default) toggles it. Anything but a home key after the prefix acts as usual (`^a` still moves to the start); an unsaved rename or new-window name is dropped, a pending close is not done |
 | `^r` | rename inline (`⏎` saves; `Esc` or an empty name cancels) |
@@ -166,42 +210,54 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | `^t` | reopen the last closed window |
 | `M-↑` `M-↓` | move the window up / down within its session |
 | `M-n` | new window after the selection, named inline (empty: automatic name) |
+
+Window keys (`^r`, `M-r`, `^x`, `M-↑↓`, `M-n`) act on a pane row's window.
 | `^o` | toggle the preview |
 | `F1` `^/` | help |
 
 ### Preview
 
-The preview shows the selected window's pane in its own colours and
-attributes (bold, dim, italic, underline, reverse), captured with
-`capture-pane -e` together with up to `@home-preview-history` lines of its
-scrollback (default 2000; `0` captures only the visible screen). It opens at
-the latest output; the wheel, `S-↑`/`S-↓` and `S-PgUp`/`S-PgDn` scroll back
+The preview sits below the list, always: it takes the bottom half when the
+popup is at least 30 rows tall, and is hidden below that until `^o` (which
+also hides a shown one). It draws the selected window's whole pane layout:
+each pane's visible screen, captured with `capture-pane -e` in its own
+colours and attributes (bold, dim, italic, underline, reverse), placed in
+its rectangle scaled to the preview, inside a frame with tmux-style
+separators (sidebar panes are left out). On a window row no pane is
+highlighted; on a pane row that pane is outlined in magenta, and the agent
+and git cards above the layout are that pane's (on a window row: the lead
+agent's pane's).
+
+The selected pane is captured with up to `@home-preview-history` lines of
+scrollback (default 2000; `0`: the visible screen only). It opens at the
+latest output; the wheel, `S-↑`/`S-↓` and `S-PgUp`/`S-PgDn` scroll back
 through the history, a `↑n` tag in its top-right corner says how far, and
-moving the selection returns to the latest output. Lines are clipped at the
-preview's edge, not wrapped, so one pane line is one preview row and a TUI's
-columns stay lined up. The selected pane is captured again every second, and
-only once the selection has rested on it for 60 ms, so holding `↓` doesn't
-capture every pane passed; a 2000-line capture and parse takes about 16 ms.
+moving the selection returns to the latest output. Lines are clipped at a
+pane's edge, not wrapped, so a TUI's columns stay lined up. The window is
+captured again every second, and only once the selection has rested on it
+for 60 ms, so holding `↓` doesn't capture every window passed; a 2000-line
+capture and parse takes about 16 ms.
 
 Filter tokens combine with text: `@attn` (needs you), `@agent` (any agent
 window, stale ones included), `@running`, `@waiting`, `@background`,
-`@idle`, `@error` (either of the statuses given), `s:<session>` (session name prefix, any
-case). For example `@waiting s:main api`.
+`@idle`, `@error` (either of the statuses given). For example
+`@waiting api`. The filter applies to the session page shown; paging picks
+the session.
 
 ### Agents
 
 Agent state comes from tmux-home's own Claude Code hooks (`@home_*`, below)
 or, for panes they haven't touched, from the `@pane_*` options
 [tmux-agent-sidebar](https://github.com/hiroppy/tmux-agent-sidebar)'s hooks
-publish (read-only: tmux-home never writes or clears those). An agent window's row shows
-status icon **and** word, the current run's elapsed time and the agent kind
-(`● running  12m  claude ×2` for two agents), in place of command and path.
-Windows whose agent is waiting, errored or has a pending notification are
-also pinned in a **NEEDS YOU** group above the sessions, with the reason;
-the header carries a tally (`agents: 1 waiting · 2 running`). The preview of
-an agent window starts with an agent card: status, run time, wait reason,
-subagents, background command, worktree, permission mode and the prompt (or
-last reply), then the pane's last lines.
+publish (read-only: tmux-home never writes or clears those). An agent
+pane's row shows status icon **and** word, the current run's elapsed time,
+the agent kind and the wait reason or prompt; its window's row shows the
+most urgent state and the kind (`claude ×2` for two agents). Windows whose
+agent is waiting, errored or has a pending notification are also pinned in
+a **NEEDS YOU** group at the top of their session's page, and counted on its
+tab (`●1`). The preview of an agent window starts with an agent card:
+status, run time, wait reason, subagents, background command, worktree,
+permission mode and the prompt (or last reply), then the window's layout.
 
 An agent whose pane has moved on (the agent crashed and left its options
 behind: Claude counts as alive only while its pane runs its versioned binary,
@@ -473,30 +529,45 @@ any does, else off everywhere; other sessions are never touched). From a
 shell or your own binding: `tmux-home sidebar-toggle [--session] [--window
 <target>]`.
 
-The sidebar is a narrow, read-only pane (`@home-sidebar-width`, default 32
-columns, at the `@home-sidebar-side` edge, full height):
+The sidebar is a narrow pane (`@home-sidebar-width`, default 32 columns,
+at the `@home-sidebar-side` edge, full height):
 
 ```
 ─ NEEDS YOU ───────────────────
  ◐ main:1 api
    permission
 ─ main ────────────────────────
- ◐ 1 api
-▌  2 web  main ! ⇡1
- ● 3 editor  feat/x +?
+ ◐ 1 api     waiting
+▌  2 web     main ! ⇡1
+ ● 3 editor  running feat/x +? ⇣2
+             $1
  2s 7w · 1 waiting · 1 running
 ```
 
 Windows that need you, server-wide, with the reason; then the windows of
-its own session, each with its agent status icon, index, name and git
-badge (whole pieces dropped as the width shrinks), the window it lives in
-highlighted; a tally at the bottom (sessions, windows, live agents by
-status; `○` while it reads tmux directly, without the daemon). It updates
-live from the daemon. It never takes focus and never captures the mouse;
-it ignores every key except `q`, which closes it. Sidebar panes are marked
-`@home_role=sidebar` and left out of the popup's rows, `^x`'s close check
-and `^t`'s reopen snapshot (as are tmux-agent-sidebar's `@pane_role`
-panes).
+its own session as a table, the window it lives in highlighted. The first
+column (agent status icon, index, name) is the same width on every row: the
+longest name, at most half the sidebar. The second column holds the tags,
+the agent's state word and the git badge's pieces; what doesn't fit wraps,
+whole pieces at a time, onto lines aligned under it, and a window with no
+agent and no repo has none. A tally sits at the bottom (sessions, windows,
+live agents by status; `○` while it reads tmux directly, without the
+daemon). It updates live from the daemon. It never takes focus by itself
+and never captures the mouse.
+
+Move into it (`prefix ←`/`→`, or however you change panes) and it takes the
+popup's movement keys:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓`, `^p` / `^n`, `k` / `j` | Move the selection (it starts on the sidebar's own window) over NEEDS YOU and the session's windows |
+| `⏎` | Switch to the selected window; the sidebar's window gets its last pane back, so returning there doesn't land in the sidebar |
+| `Esc` | Hand the focus back to the window's last pane |
+| `q` | Close the sidebar |
+
+Sidebar panes are marked `@home_role=sidebar` and left out of the popup's
+rows, `^x`'s close check and `^t`'s reopen snapshot (as are
+tmux-agent-sidebar's `@pane_role` panes).
 
 With `@home-sidebar-auto on`, the daemon adds a sidebar to each window
 created from then on, except in sessions named in `@home-sidebar-exclude`

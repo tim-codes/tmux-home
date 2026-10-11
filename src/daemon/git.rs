@@ -698,6 +698,7 @@ mod tests {
             home_role: String::new(),
             agent_opts: Default::default(),
             tty: String::new(),
+            ..Default::default()
         }
     }
 
