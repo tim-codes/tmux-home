@@ -162,9 +162,11 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
    └ .1         fish                             ~/d/api        main ! ≡
  ▶ 3     shell
    └ .0         fish                             ~/d/a/src      main +!? ⇕⇡2⇣1
-──────────────────────────────────────────────────────────────────────────────────
 ┌──────────────────────────────────────┬─────────────────────────────────────────┐
-│.0 claude  ● running  main ! ≡        │.1 fish  main ! ≡                        │
+│.0 claude  ● running  12m  opus 5.5   │.1 fish                                  │
+│main → origin/main ≡  !1              │main → origin/main ≡  !1                 │
+│~/dev/api                             │~/dev/api                                │
+│┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄│┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄│
 │> add the tests                       │$ cargo test                             │
 └──────────────────────────────────────┴─────────────────────────────────────────┘
 ```
@@ -224,7 +226,7 @@ ignore them.
 The preview sits below the list, always. It shows when the popup is at
 least 30 rows tall, and is hidden below that until `^o` (which also hides a
 shown one; `M-k` shows it too). Its size is automatic: the list gets the
-page's lines plus 2 blank rows and the preview the rest, recomputed on every
+page's lines and the preview the rest, recomputed on every
 draw, so paging to a smaller session or filtering grows it; when that would
 leave the preview under a third of the area (or 5 rows), the two split it in
 half and the list scrolls. `M-k` / `M-j` move the divider 5% up / down from
@@ -234,11 +236,28 @@ it (automatic again). It draws the selected window's whole pane layout:
 each pane's visible screen, captured with `capture-pane -e` in its own
 colours and attributes (bold, dim, italic, underline, reverse), placed in
 its rectangle scaled to the preview, inside a frame with tmux-style
-separators (sidebar panes are left out). Every pane's rectangle starts
-with a dim one-line band: `.N` and its command, its agent's state (icon
-and word) and its git badge, cut at the pane's edge. On a window row no
+separators (sidebar panes are left out); its top edge is the divider, right
+under the list. Every pane's rectangle starts with a banner of up to three
+dim lines and a dotted rule:
+
+1. `.N` and its command; an agent's state (icon and word), run time and
+   model (`opus 5.5`)
+2. git: branch `→` upstream and sync (`≡`, `⇡n⇣n`, `gone`), changes
+   (`+n` staged, `!n` modified, `?n` untracked, `=n` conflicts), `$n`
+   stashes, an operation in progress (`↻ rebase`), `⊗ limited`, `~ stale`
+3. where: the cwd (shortened when tight), `(wt) ← main worktree` for a
+   linked worktree or the main one's linked count, `⚠n stray`,
+   `⚑ mismatch`, `⊟ prunable`, `⊞ locked`, and the default branch when
+   it isn't the one checked out
+
+A pane outside a repo shows its cwd on the second line. Every banner of a
+layout is the same height whatever its pane, with missing lines left blank;
+when the panes are short they all shed the rule, then lines, before the
+capture loses its last rows. A narrow pane drops whole pieces, the least
+important first. Everything in a banner comes from the daemon's snapshot
+(the hooks' agent state, the git task's status). On a window row no
 pane is highlighted; on a pane row that pane is outlined in magenta and
-its band drawn brighter. Nothing else changes with the selection, so
+its banner drawn brighter. Nothing else changes with the selection, so
 moving between a window's panes never shifts the preview.
 
 The selected pane is captured with up to `@home-preview-history` lines of
@@ -267,8 +286,8 @@ pane's row shows status icon **and** word, the current run's elapsed time
 and, as its command, the agent kind. Windows whose
 agent is waiting, errored or has a pending notification are also pinned in
 a **NEEDS YOU** group at the top of their session's page, and counted on its
-tab (`●1`). In the preview an agent pane's band shows its state; its prompt
-and reply are on screen in the pane itself.
+tab (`●1`). In the preview an agent pane's banner shows its state, run time
+and model; its prompt and reply are on screen in the pane itself.
 
 An agent whose pane has moved on (the agent crashed and left its options
 behind: Claude counts as alive only while its pane runs its versioned binary,
@@ -280,7 +299,7 @@ agent column.
 
 Each pane row ends in a compact badge for the git repo (or linked
 worktree) its directory is in, e.g. `main +!? ⇕⇡2⇣1 $1 ⚠2 ↻`; the pane's
-band in the preview repeats it.
+banner in the preview spells it out over two lines.
 
 | Symbol | Meaning |
 | --- | --- |

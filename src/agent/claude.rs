@@ -43,6 +43,8 @@ use super::adapter::{AgentAdapter, Change, Prior, Writes};
 use super::home::Key;
 use super::sidebar::MAX_PROMPT;
 use serde_json::Value;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
 pub struct Claude;
 
@@ -157,6 +159,11 @@ fn meta(w: &mut Writes, p: &Value) {
         w.set(Key::PermissionMode, mode);
     }
     w.set_or_unset(Key::SessionId, s(p, "session_id"));
+    // SessionStart names it; a Stop gets it from the transcript (`enrich`)
+    let model = s(p, "model");
+    if !model.is_empty() {
+        w.set(Key::Model, sanitize(model));
+    }
     let wt = p.get("worktree").filter(|v| v.is_object());
     let (name, branch) = wt.map_or(("", ""), |o| (s(o, "name"), s(o, "branch")));
     w.set_or_unset(Key::WorktreeName, name);
@@ -179,6 +186,43 @@ fn resume_meta(w: &mut Writes, p: &Value, prior: &Prior, session_start: bool) {
         w.set_or_unset(Key::Cwd, s(p, "cwd"));
     }
     w.set_or_unset(Key::ConfigDir, prior.config_dir.as_deref().unwrap_or(""));
+}
+
+/// How much of a transcript's end `last_model` reads: one bounded read
+/// per Stop, never the whole file (transcripts run to many megabytes).
+const TRANSCRIPT_TAIL: u64 = 512 * 1024;
+
+/// The model of the last assistant entry in the transcript at `path`,
+/// from its last `TRANSCRIPT_TAIL` bytes; `None` when unreadable or none
+/// is that recent.
+pub fn last_model(path: &Path) -> Option<String> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(TRANSCRIPT_TAIL);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.take(TRANSCRIPT_TAIL).read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    // a read from the middle starts mid-line: that line is skipped
+    let text = if start > 0 {
+        text.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        &text
+    };
+    model_in_tail(text)
+}
+
+/// The model of the last assistant entry among JSONL `lines` (Claude
+/// Code's `<synthetic>` placeholder entries skipped).
+fn model_in_tail(lines: &str) -> Option<String> {
+    lines
+        .lines()
+        .rev()
+        .filter(|l| l.contains("\"model\""))
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| s(v, "type") == "assistant")
+        .filter_map(|v| v.get("message").map(|m| s(m, "model").to_string()))
+        .find(|m| !m.is_empty() && !m.starts_with('<'))
 }
 
 /// `clear_run_state`.
@@ -227,6 +271,21 @@ impl AgentAdapter for Claude {
 
     fn config_env(&self) -> Option<&'static str> {
         Some("CLAUDE_CONFIG_DIR")
+    }
+
+    /// A Stop of the main context: the model of the transcript's latest
+    /// assistant entry (it follows `/model` switches, which fire no hook).
+    fn enrich(&self, event: &str, p: &mut Value) {
+        if event != "Stop" || from_subagent(p) || !s(p, "model").is_empty() {
+            return;
+        }
+        let path = s(p, "transcript_path");
+        if path.is_empty() {
+            return;
+        }
+        if let (Some(m), Some(o)) = (last_model(Path::new(path)), p.as_object_mut()) {
+            o.insert("model".into(), Value::String(m));
+        }
     }
 
     fn on_hook(&self, event: &str, p: &Value, prior: &Prior, now: u64) -> Vec<Change> {
@@ -484,6 +543,77 @@ mod tests {
 
     const T1: &str =
         "/home/user/.claude/projects/-home-user-project/00000000-0000-4000-8000-000000000001.jsonl";
+
+    const TAIL: &str = include_str!("../../tests/fixtures/claude/transcript_tail.jsonl");
+
+    /// The transcript's last real assistant entry names the model: not a
+    /// `<synthetic>` one, not a tool result or text that says "model".
+    #[test]
+    fn the_model_comes_from_the_transcript_tail() {
+        assert_eq!(model_in_tail(TAIL).as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(
+            model_in_tail("{\"type\":\"user\"}\nnot json \"model\""),
+            None
+        );
+        // a long file: only its end is read, the cut first line skipped
+        let dir = std::env::temp_dir().join(format!("th-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.jsonl");
+        let filler = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(1000)
+        );
+        let old = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5\"}}\n";
+        std::fs::write(&f, format!("{old}{}{TAIL}", filler.repeat(600))).unwrap();
+        assert_eq!(last_model(&f).as_deref(), Some("claude-opus-5-5"));
+        // the only assistant entry is beyond the tail: none
+        std::fs::write(&f, format!("{old}{}", filler.repeat(600))).unwrap();
+        assert_eq!(last_model(&f), None);
+        std::fs::write(&f, old).unwrap();
+        assert_eq!(last_model(&f).as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(last_model(&dir.join("missing")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// SessionStart records its `model`; a Stop gets the transcript's
+    /// (`enrich`); a subagent's never touches it; SessionEnd clears it.
+    #[test]
+    fn the_model_is_recorded() {
+        let m = run(&[], "", "SessionStart", &fixture!("session_start"));
+        assert_eq!(get(&m, Key::Model), Some("claude-example-model"));
+        let dir = std::env::temp_dir().join(format!("th-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = dir.join("t.jsonl");
+        std::fs::write(&t, TAIL).unwrap();
+        let mut stop = fixture!("stop");
+        stop["transcript_path"] = json!(t.to_str().unwrap());
+        Claude.enrich("Stop", &mut stop);
+        let m = run(&[(Key::Model, "claude-sonnet-5-5")], "", "Stop", &stop);
+        assert_eq!(get(&m, Key::Model), Some("claude-opus-5-5"));
+        // no transcript: the model recorded stays
+        let mut bare = fixture!("stop");
+        Claude.enrich("Stop", &mut bare);
+        let m = run(&[(Key::Model, "claude-sonnet-5-5")], "", "Stop", &bare);
+        assert_eq!(get(&m, Key::Model), Some("claude-sonnet-5-5"));
+        // other events are not enriched
+        let mut prompt = fixture!("user_prompt_submit");
+        prompt["transcript_path"] = json!(t.to_str().unwrap());
+        Claude.enrich("UserPromptSubmit", &mut prompt);
+        assert!(prompt.get("model").is_none());
+        let mut sub = stop.clone();
+        sub.as_object_mut().unwrap().remove("model");
+        sub["agent_id"] = json!("a1");
+        Claude.enrich("Stop", &mut sub);
+        assert!(sub.get("model").is_none());
+        let m = run(
+            &[(Key::Model, "x")],
+            "",
+            "SessionEnd",
+            &fixture!("session_end"),
+        );
+        assert_eq!(get(&m, Key::Model), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn session_events_record_the_resume_keys() {

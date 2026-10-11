@@ -64,6 +64,11 @@ pub trait AgentAdapter: Sync {
     /// The changes `event` (with its stdin `payload`) makes to a pane in
     /// state `prior`; `now` is Unix seconds. Unknown events: no changes.
     fn on_hook(&self, event: &str, payload: &Value, prior: &Prior, now: u64) -> Vec<Change>;
+
+    /// Fills in what the payload of `event` lacks from the agent's own
+    /// files, before `on_hook` sees it (Claude: a Stop's model, from the
+    /// tail of its transcript). Bounded, and a no-op by default.
+    fn enrich(&self, _event: &str, _payload: &mut Value) {}
 }
 
 pub const ADAPTERS: &[&dyn AgentAdapter] = &[&super::claude::Claude];

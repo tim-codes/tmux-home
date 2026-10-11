@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod app;
+pub mod banner;
 pub mod filter;
 pub mod fresh;
 pub mod git;
@@ -16,7 +17,7 @@ use crate::{
     store::Store,
     tmux::snapshot::{Snapshot, read_snapshot},
 };
-use app::{Action, App, Item, Mode, PaneRow, Row};
+use app::{Action, App, Item, Mode, Row};
 use fresh::{Guard, Stamp};
 use preview::Shot;
 use ratatui::{
@@ -25,7 +26,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Paragraph},
 };
 use std::{
     path::PathBuf,
@@ -456,13 +457,10 @@ fn event_loop(
 /// only after ^o.
 const PREVIEW_MIN_HEIGHT: u16 = 30;
 
-/// Blank rows the auto split leaves under the list's last line.
-const LIST_PAD: u16 = 2;
-
 /// The preview's rows out of `avail` (the list and preview area). `pct`:
 /// the size set with M-j/M-k (`@home-preview-pct`), a share of `avail`.
-/// None (auto): the list gets its `content` lines plus `LIST_PAD` and the
-/// preview the rest, unless that leaves it under a third of `avail` (or
+/// None (auto): the list gets its `content` lines and the preview the
+/// rest (its frame's top edge right under the list's last line), unless that leaves it under a third of `avail` (or
 /// `PREVIEW_MIN_ROWS`): then half. Either way the list and the preview
 /// keep `PREVIEW_MIN_ROWS` each when there is room for both.
 fn preview_height(avail: u16, pct: Option<u16>, content: usize) -> u16 {
@@ -471,9 +469,7 @@ fn preview_height(avail: u16, pct: Option<u16>, content: usize) -> u16 {
         Some(p) => app::pct_rows(avail, p),
         None => {
             let floor = (avail.div_ceil(3)).max(app::PREVIEW_MIN_ROWS);
-            let list = u16::try_from(content)
-                .unwrap_or(u16::MAX)
-                .saturating_add(LIST_PAD);
+            let list = u16::try_from(content).unwrap_or(u16::MAX);
             match avail.saturating_sub(list) {
                 fit if fit >= floor => fit,
                 _ => avail / 2,
@@ -822,7 +818,7 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, shot: &Shot, now: u64) {
     f.render_widget(Paragraph::new(Line::from(head).style(dim)), v[2]);
     draw_list(f, app, list, &t, now);
     if let Some(p) = prev {
-        draw_preview(f, app, p, shot);
+        draw_preview(f, app, p, shot, now);
     }
 
     f.render_widget(Paragraph::new(Span::styled(app.footer(), dim)), v[4]);
@@ -984,6 +980,9 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, t: &Table, now: u64) {
         ];
         spans.extend(table_spans(t, cells));
         if selected {
+            // the highlight runs to the list's right edge
+            let pad = width.saturating_sub(spans_width(&spans));
+            spans.push(Span::raw(" ".repeat(pad)));
             for s in spans.iter_mut().skip(1) {
                 s.style = s.style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
             }
@@ -997,68 +996,54 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, t: &Table, now: u64) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// The widest a branch name gets in a pane's meta band.
-const BAND_BRANCH: usize = 20;
-
-/// A pane's meta band, most important first: `.N cmd`, the agent's state
-/// (icon and word), the git badge (its branch cut to `BAND_BRANCH`). The
-/// caller clips it to the pane's width.
-fn band_text(p: &PaneRow) -> String {
-    let mut parts = vec![format!(".{} {}", p.index, p.cmd)];
-    if let Some(a) = &p.agent {
-        let s = a.state.status;
-        let ended = if a.stale { " (ended?)" } else { "" };
-        parts.push(format!("{} {}{ended}", s.icon(), s.word()));
-    }
-    if let Some((_, g)) = &p.git {
-        let badge: Vec<String> = g
-            .badge()
-            .into_iter()
-            .map(|(t, part)| match part {
-                crate::git::badge::Part::Branch => agents::clip(&t, BAND_BRANCH),
-                _ => t,
-            })
-            .collect();
-        parts.push(badge.join(" "));
-    }
-    parts.join("  ")
-}
-
 /// The preview: the window's pane layout, each pane's capture in its
-/// scaled rectangle under a one-line meta band (`band_text`). Nothing in
-/// it depends on which line of the window is selected but the outline:
-/// on a pane row that pane is outlined in magenta (its band drawn
-/// brighter) and scrolls.
-fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot) {
+/// scaled rectangle under its banner (`banner`), every banner of the
+/// layout the same height. Nothing in it depends on which line of the
+/// window is selected but the outline: on a pane row that pane is
+/// outlined in magenta (its banner drawn brighter) and scrolls. `now`:
+/// Unix seconds (run times).
+fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot, now: u64) {
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let block = Block::default().borders(Borders::TOP).border_style(dim);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
     let (Some(r), pane) = (app.selected().cloned(), app.selected_pane().cloned()) else {
         return;
     };
     let geo: Vec<_> = r.panes.iter().map(|p| p.rect).collect();
-    let rects = preview::place(&geo, inner);
+    let rects = preview::place(&geo, area);
     let hl = pane
         .as_ref()
         .and_then(|p| r.panes.iter().position(|x| x.id == p.id));
+    let shortest = rects
+        .iter()
+        .filter(|r| r.width > 0)
+        .map(|r| r.height)
+        .filter(|&h| h > 0)
+        .min()
+        .unwrap_or(0);
+    let bh = banner::height(shortest);
     for (i, (p, rect)) in r.panes.iter().zip(&rects).enumerate() {
         if rect.width == 0 || rect.height == 0 {
             continue;
         }
         let lines = shot.panes.get(&p.id).map(Vec::as_slice).unwrap_or(&[]);
         let selected = Some(i) == hl;
-        let band = clip_w(&band_text(p), rect.width as usize);
+        let bh = bh.min(rect.height);
         f.render_widget(
-            Paragraph::new(Span::styled(
-                band,
-                if selected { Style::default() } else { dim },
+            Paragraph::new(banner::lines(
+                p,
+                &app.home,
+                now,
+                rect.width as usize,
+                bh,
+                selected,
             )),
-            Rect { height: 1, ..*rect },
+            Rect {
+                height: bh,
+                ..*rect
+            },
         );
         let rect = &Rect {
-            y: rect.y + 1,
-            height: rect.height - 1,
+            y: rect.y + bh,
+            height: rect.height - bh,
             ..*rect
         };
         if rect.height == 0 {
@@ -1091,7 +1076,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect, shot: &Shot) {
         }
     }
     let buf = f.buffer_mut();
-    for (x, y, c, outline) in preview::borders(inner, &rects, hl) {
+    for (x, y, c, outline) in preview::borders(area, &rects, hl) {
         let style = if outline {
             Style::default().fg(Color::Magenta)
         } else {
@@ -1410,17 +1395,25 @@ mod tests {
         assert!(line(&s, "~/d/old").contains("legacy ~"), "{s}");
         // window rows carry no path or badge
         assert!(!line(&s, " shell").contains("main"), "{s}");
-        // the preview: each pane's band carries its badge, no card
-        let band = line(&s, "│.0 fish");
-        assert!(band.contains("main +!? ⇕⇡2⇣1 $1 ⚠2 ↻"), "{s}");
+        // the preview: each pane's banner spells the status out, no card
+        let git = line(&s, "│main → ");
+        assert!(
+            git.contains("│main → origin/main ⇕⇡2⇣1  +1 !3 ?1  $1  ↻ rebase"),
+            "{s}"
+        );
+        assert!(
+            line(&s, "│~/dev/app/src").contains("1 worktree  ⚠2 stray"),
+            "{s}"
+        );
         assert!(!s.contains("changes    "), "{s}");
         a.select_wid("@0");
         let s = screen(&mut a, 200, 50);
-        assert!(line(&s, "│.0 claude").contains("fix/x (wt) !"), "{s}");
-        // a stale repo's badge ends in ~ in the band too
+        assert!(line(&s, "│fix/x").contains("!"), "{s}");
+        assert!(line(&s, "(wt) ←").contains("~/d/app"), "{s}");
+        // a stale repo says so in the banner too
         a.select_key("@2/%2");
         let s = screen(&mut a, 200, 50);
-        assert!(line(&s, "│.0 fish").contains("legacy ~"), "{s}");
+        assert!(line(&s, "│legacy").contains("~ stale"), "{s}");
         // filtering matches the branch
         let mut a = app_of(&git_snap());
         for c in "legacy".chars() {
@@ -1666,22 +1659,22 @@ mod tests {
         assert!(t.lines().next().unwrap().contains("dev"), "{t}");
     }
 
-    /// The preview shows an agent's state in its pane's band, never a
+    /// The preview shows an agent's state in its pane's banner, never a
     /// card: no prompt, reply or details.
     #[test]
-    fn agent_state_in_the_band() {
+    fn agent_state_in_the_banner() {
         let mut a = agent_app();
         a.select_wid("@0");
         for (w, h) in [(200, 50), (120, 40)] {
             let s = screen(&mut a, w, h);
-            let band = line(&s, "│.0 claude");
-            assert!(band.contains("◐ waiting"), "{w}x{h}: {s}");
+            let first = line(&s, "│.0 claude");
+            assert!(first.contains("◐ waiting"), "{w}x{h}: {s}");
             assert!(s.contains("line two"), "{s}");
             for gone in ["subagents", "background", "please refactor", "·  claude"] {
                 assert!(!s.contains(gone), "{w}x{h}: {gone:?} in\n{s}");
             }
         }
-        // two agents: a band each
+        // two agents: a banner each
         a.select_key("@1/%11");
         let s = screen(&mut a, 200, 50);
         assert!(line(&s, "│.0 claude").contains("● running"), "{s}");
@@ -1701,8 +1694,9 @@ mod tests {
         );
     }
 
-    /// Window `@1` of the agent fixture as an agent pane (`%1`, in a
-    /// repo) beside a plain shell (`%11`).
+    /// Window `@1` of the agent fixture as an agent pane (`%1`, running
+    /// `claude-opus-5-5` in a linked worktree of `~/dev/app`) beside a
+    /// plain shell outside any repo (`%11`, in `/tmp`).
     fn mixed_snap() -> Snapshot {
         use crate::agent::tests::pane;
         use crate::git::badge::{Phase, RepoStatus};
@@ -1712,83 +1706,163 @@ mod tests {
         shell.window_id = "@1".into();
         shell.index = 1;
         shell.active = false;
+        shell.current_path = "/tmp".into();
         s.panes[i] = shell;
         for p in s.panes.iter_mut().filter(|p| p.window_id == "@1") {
             let left = p.index == 0;
             (p.left, p.top, p.height) = (if left { 0 } else { 101 }, 0, 50);
             p.width = if left { 100 } else { 99 };
         }
+        let started = (NOW - 12 * 60).to_string();
         let agent = s.panes.iter_mut().find(|p| p.id == "%1").unwrap();
-        agent.current_path = "/home/u/dev/app".into();
-        s.git
-            .paths
-            .insert("/home/u/dev/app".into(), "/home/u/dev/app".into());
+        agent.agent_opts = [
+            ("@home_agent", "claude"),
+            ("@home_status", "running"),
+            ("@home_run_started", started.as_str()),
+            ("@home_model", "claude-opus-5-5"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let wt = "/home/u/dev/app.wt/banner";
+        agent.current_path = wt.into();
+        s.git.paths.insert(wt.into(), wt.into());
         s.git.repos.insert(
-            "/home/u/dev/app".into(),
+            wt.into(),
             RepoStatus {
-                branch: "main".into(),
+                branch: "feat/banner".into(),
+                linked: true,
+                main_root: Some("/home/u/dev/app".into()),
                 phase: Phase::Refs,
-                upstream: Some("origin/main".into()),
+                upstream: Some("origin/feat/banner".into()),
+                ahead: 2,
                 modified: 2,
+                untracked: 1,
+                stashes: 1,
+                default_branch: Some("main".into()),
                 ..RepoStatus::default()
             },
         );
         s
     }
 
-    /// The preview below its rule: the selection changes only which
-    /// pane is outlined, never a row of text or the split. Every pane
-    /// carries its one-line meta band (index, command, agent state, git),
-    /// and no agent or git card is drawn.
+    /// The (selected) preview frame's rows of a drawn screen, from its
+    /// top edge.
+    fn below(a: &mut App, w: u16, h: u16) -> (usize, Vec<String>, String) {
+        let s = screen(a, w, h);
+        let r = rule_row(&s, w);
+        (r, s.lines().skip(r).map(String::from).collect(), s)
+    }
+
+    /// The preview below the list: the selection changes only which pane
+    /// is outlined, never a row of text or the split. Every pane carries a
+    /// banner of the same height (an agent pane in a worktree, a shell
+    /// outside any repo), and no agent or git card is drawn.
     #[test]
     fn the_preview_never_shifts_with_the_selection() {
         let mut a = app_of(&mixed_snap());
-        let (w, h) = (120u16, 40u16);
-        let below = |a: &mut App| {
-            let s = screen(a, w, h);
-            let r = rule_row(&s, w);
-            (
-                r,
-                s.lines().skip(r).map(String::from).collect::<Vec<_>>(),
-                s,
-            )
+        for (w, h) in [(120u16, 40u16), (200, 60), (80, 30)] {
+            a.select_wid("@1");
+            let (r0, win, s) = below(&mut a, w, h);
+            a.select_key("@1/%1");
+            let (r1, agent, _) = below(&mut a, w, h);
+            a.select_key("@1/%11");
+            let (r2, shell, _) = below(&mut a, w, h);
+            assert_eq!((r0, r1), (r1, r2), "{w}x{h}: the split moved\n{s}");
+            assert_eq!(win, agent, "{w}x{h}: window row vs agent pane");
+            assert_eq!(agent, shell, "{w}x{h}: agent pane vs shell pane");
+            // both captures start on the same row, under 4 banner rows
+            let one = agent.iter().position(|l| l.contains("line one")).unwrap();
+            assert_eq!(one, 1 + banner::MAX as usize, "{w}x{h}:\n{s}");
+            assert_eq!(agent[one].matches("line one").count(), 2, "{s}");
+            assert_eq!(
+                agent[one - 1].matches('┄').count() as u16,
+                w - 3,
+                "the rules\n{s}"
+            );
+        }
+        let (_, rows, s) = below(&mut a, 120, 40);
+        let left = |l: &str| {
+            l.chars()
+                .skip(1)
+                .take(58)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
         };
-        a.select_wid("@1");
-        let (r0, win, s) = below(&mut a);
-        a.select_key("@1/%1");
-        let (r1, agent, _) = below(&mut a);
-        a.select_key("@1/%11");
-        let (r2, shell, _) = below(&mut a);
-        assert_eq!((r0, r1), (r1, r2), "the split moved\n{s}");
-        assert_eq!(win, agent, "window row vs agent pane");
-        assert_eq!(agent, shell, "agent pane vs shell pane");
-        // one band per pane, on the row under the frame's top edge
-        let band = &agent[2];
-        assert!(
-            band.starts_with("│.0 claude  ● running  main !"),
-            "{band:?}\n{s}"
+        let right = |l: &str| {
+            l.chars()
+                .skip(61)
+                .collect::<String>()
+                .trim_end_matches(['│', ' '])
+                .to_string()
+        };
+        assert_eq!(left(&rows[1]), ".0 claude  ● running  12m  opus 5.5", "{s}");
+        assert_eq!(
+            left(&rows[2]),
+            "feat/banner → origin/feat/banner ⇡2  !2 ?1  $1",
+            "{s}"
         );
-        assert!(band.contains("│.1 fish"), "{band:?}");
-        // the captures start below the bands
-        assert!(agent[3].contains("line one"), "{:?}", &agent[..4]);
-        // no cards
-        let preview = agent.join("\n");
-        for gone in [
-            "·  claude",
-            "prompt",
-            "add the tests",
-            "changes",
-            "worktree",
-        ] {
+        assert_eq!(
+            left(&rows[3]),
+            "~/dev/app.wt/banner  (wt) ← ~/d/app  default main",
+            "{s}"
+        );
+        assert_eq!(right(&rows[1]), ".1 fish", "{s}");
+        assert_eq!(right(&rows[2]), "/tmp", "{s}");
+        assert_eq!(right(&rows[3]), "", "{s}");
+        // no cards, no prompt or reply
+        let preview = rows.join("\n");
+        for gone in ["·  claude", "prompt", "add the tests"] {
             assert!(!preview.contains(gone), "{gone:?} in\n{preview}");
         }
-        // the selected pane's band is the brighter one
+        // the selected pane's banner is the brighter one
         let shot = shot_of(&a, "line one\nline two");
-        let buf = render(&mut a, w, h, &shot);
-        let y = (r2 + 2) as u16;
-        let x = |pat: &str| col(band, pat) as u16;
-        assert!(buf[(x(".0"), y)].modifier.contains(Modifier::DIM));
-        assert!(!buf[(x(".1"), y)].modifier.contains(Modifier::DIM));
+        let buf = render(&mut a, 120, 40, &shot);
+        let top = rule_row(&text_of(&buf), 120) as u16;
+        for y in top + 1..top + 1 + banner::MAX {
+            assert!(buf[(4, y)].modifier.contains(Modifier::DIM), "y={y}");
+        }
+        assert!(!buf[(64, top + 1)].modifier.contains(Modifier::DIM));
+        assert!(!buf[(61, top + 2)].modifier.contains(Modifier::DIM));
+    }
+
+    /// Narrow panes drop whole pieces, least important first; short ones
+    /// shrink every banner of the layout alike before the capture goes.
+    #[test]
+    fn banners_fit_narrow_and_short_panes() {
+        let mut a = app_of(&mixed_snap());
+        a.select_key("@1/%1");
+        let (_, rows, s) = below(&mut a, 64, 40);
+        let left = |l: &str| {
+            let l: String = l.chars().skip(1).collect();
+            l.split('│').next().unwrap().trim_end().to_string()
+        };
+        assert_eq!(left(&rows[1]), ".0 claude  ● running  12m", "{s}");
+        assert_eq!(left(&rows[2]), "feat/banner ⇡2  !2 ?1  $1", "{s}");
+        assert_eq!(left(&rows[3]), "~/d/a/banner  (wt) ← ~/d/app", "{s}");
+        // short: under 7 rows a pane's banner sheds the rule, then lines,
+        // in both panes alike; the capture keeps 3 rows while it can
+        let mut seen = std::collections::BTreeSet::new();
+        for pct in 1..=40 {
+            a.preview_pct = Some(pct);
+            let s = screen(&mut a, 120, 40);
+            let top = rule_row(&s, 120);
+            let lines: Vec<&str> = s.lines().collect();
+            let bottom = lines.iter().rposition(|l| l.starts_with('└')).unwrap();
+            let rows = (bottom - top - 1) as u16;
+            let bh = banner::height(rows) as usize;
+            seen.insert(bh);
+            assert_eq!(lines[top + 1].matches(".0 claude").count(), 1, "{s}");
+            assert_eq!(lines[top + 1].matches(".1 fish").count(), 1, "{s}");
+            if rows > bh as u16 {
+                let body = lines[top + 1 + bh..bottom].join("\n");
+                assert_eq!(body.matches("line two").count(), 2, "rows={rows}:\n{s}");
+                assert!(rows - bh as u16 >= 3.min(rows - 1), "rows={rows}");
+            }
+            assert_eq!(s.contains('┄'), bh == 4, "rows={rows}:\n{s}");
+        }
+        assert!(seen.len() >= 3, "{seen:?}");
     }
 
     /// ^r (or ^x's confirm) from a pinned copy marks that copy's window
@@ -1842,12 +1916,12 @@ mod tests {
 
     #[test]
     fn auto_split_fits_the_list() {
-        // a short list: its lines plus 2, the preview the rest
-        assert_eq!(preview_height(45, None, 6), 37);
+        // a short list: its lines, the preview the rest
+        assert_eq!(preview_height(45, None, 6), 39);
         // the floor: a third of the area (15 of 45) ...
-        assert_eq!(preview_height(45, None, 28), 15);
+        assert_eq!(preview_height(45, None, 30), 15);
         // ... below it, half
-        assert_eq!(preview_height(45, None, 29), 22);
+        assert_eq!(preview_height(45, None, 31), 22);
         assert_eq!(preview_height(45, None, 500), 22);
         // and at least PREVIEW_MIN_ROWS: 12 rows, a third is 4; the list
         // keeps 5 too
@@ -1873,27 +1947,65 @@ mod tests {
         assert_eq!(preview_height(45, Some(1), 6), 5);
     }
 
-    /// The preview's top rule row on a drawn screen.
+    /// The preview frame's top row on a drawn screen: it spans the whole
+    /// width, corner to corner.
     fn rule_row(s: &str, w: u16) -> usize {
         s.lines()
-            .position(|l| l.chars().count() == w as usize && l.chars().all(|c| c == '─'))
-            .unwrap_or_else(|| panic!("no rule\n{s}"))
+            .position(|l| l.chars().count() == w as usize && l.starts_with('┌') && l.ends_with('┐'))
+            .unwrap_or_else(|| panic!("no frame\n{s}"))
     }
 
-    /// Auto: the preview starts 2 rows below the page's last line, and
+    /// The preview's frame is flush with the popup's edges and sits right
+    /// under the list: no rule, no blank row between them; the selected
+    /// row's highlight spans the list's width.
+    #[test]
+    fn the_frame_is_flush_under_the_list() {
+        let mut a = agent_app();
+        let (w, h) = (120u16, 40u16);
+        let shot = shot_of(&a, "line one\nline two");
+        let buf = render(&mut a, w, h, &shot);
+        let s = text_of(&buf);
+        let top = rule_row(&s, w);
+        let lines: Vec<&str> = s.lines().collect();
+        assert!(!lines[top - 1].trim().is_empty(), "a blank row above:\n{s}");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.chars().count() == w as usize && l.chars().all(|c| c == '─')),
+            "a divider rule:\n{s}"
+        );
+        let bottom = lines.iter().rposition(|l| l.starts_with('└')).unwrap();
+        for l in &lines[top + 1..bottom] {
+            assert!(l.starts_with('│'), "left edge at x=0: {l:?}");
+            assert_eq!(
+                l.chars().count(),
+                w as usize,
+                "right edge at x={}: {l:?}",
+                w - 1
+            );
+        }
+        assert!(lines[bottom].ends_with('┘'), "{s}");
+        // the selected row: highlighted to the right edge
+        let y = (0..h).find(|&y| buf[(0, y)].symbol() == "▌").unwrap();
+        for x in 1..w {
+            assert_eq!(buf[(x, y)].bg, Color::DarkGray, "x={x}");
+        }
+    }
+
+    /// Auto: the preview starts right below the page's last line, and
     /// grows when the filter shortens the list; M-j/M-k start from the
     /// split shown and set it; M-= goes back to auto.
     #[test]
     fn the_split_follows_the_list_until_set() {
-        let mut a = app();
+        let mut a = agent_app();
         let s = screen(&mut a, 200, 50);
         let lines = list_lines(&a).len();
-        // tab strip, prompt, column header, the list, 2 blank rows (the
-        // list keeps 5 rows)
-        assert_eq!(rule_row(&s, 200), 3 + (lines + 2).max(5), "{s}");
+        // tab strip, prompt, column header, the list (it keeps 5 rows),
+        // then the frame
+        assert_eq!(rule_row(&s, 200), 3 + lines.max(5), "{s}");
         assert_eq!(a.preview_pct, None);
         // a filter matching less: the preview grows
-        for c in "longer".chars() {
+        for c in "shell".chars() {
             a.key(plain(KeyCode::Char(c)));
         }
         let s2 = screen(&mut a, 200, 50);
@@ -1921,7 +2033,7 @@ mod tests {
         assert!(rule_row(&s, 200) < auto, "larger:\n{s}");
         // a set size no longer follows the list
         let set = rule_row(&s, 200);
-        for c in "longer".chars() {
+        for c in "shell".chars() {
             a.key(plain(KeyCode::Char(c)));
         }
         assert_eq!(rule_row(&screen(&mut a, 200, 50), 200), set);
@@ -1997,12 +2109,8 @@ mod tests {
         for (w, h) in [(200, 50), (120, 40), (300, 30)] {
             let s = screen(&mut app(), w, h);
             let lines: Vec<&str> = s.lines().collect();
-            let rule = lines
-                .iter()
-                .position(|l| l.chars().count() == w as usize && l.chars().all(|c| c == '─'))
-                .unwrap_or_else(|| panic!("{w}x{h}: no rule\n{s}"));
+            let rule = rule_row(&s, w);
             assert!(rule > 3 && rule < h as usize - 3, "{s}");
-            assert!(lines[rule + 1].starts_with('┌'), "the frame: {s}");
             let one = lines.iter().position(|l| l.contains("line one")).unwrap();
             assert!(one > rule, "{s}");
             assert!(lines[..rule].iter().all(|l| !l.contains("line")), "{s}");

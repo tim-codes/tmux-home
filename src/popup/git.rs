@@ -1,5 +1,5 @@
 //! How git looks in the popup: the compact badge in a pane row's `GT`
-//! cell, the preview's pane bands and the sidebar's lines. Symbols and
+//! cell, the preview's pane banners and the sidebar's lines. Symbols and
 //! their meaning: `crate::git::badge`. A stale status
 //! (its last check timed out or failed) is drawn dimmed, ending in `~`.
 
@@ -13,7 +13,7 @@ fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
 
-fn part_style(p: Part) -> Style {
+pub fn part_style(p: Part) -> Style {
     let s = Style::default();
     match p {
         Part::Branch => s.fg(Color::Magenta),

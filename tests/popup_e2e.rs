@@ -11,12 +11,15 @@ use std::{
 };
 use tmux_home::paths::Paths;
 
-/// A full-width rule with the layout's frame right under it: the
-/// preview, below the list.
+/// The layout's frame, edge to edge, right under the list (no divider
+/// rule above it): the preview, below the list.
 fn bottom_preview(screen: &str, cols: usize) -> bool {
     let lines: Vec<&str> = screen.lines().collect();
     lines.windows(2).any(|w| {
-        w[0].chars().count() == cols && w[0].chars().all(|c| c == '─') && w[1].starts_with('┌')
+        !(w[0].starts_with('─') && w[0].chars().all(|c| c == '─'))
+            && w[1].chars().count() == cols
+            && w[1].starts_with('┌')
+            && w[1].ends_with('┐')
     })
 }
 
@@ -399,7 +402,7 @@ fn waiting_agent_is_pinned_and_ctrl_g_jumps_to_it() {
         "another page's: {}",
         o.screen()
     );
-    // ^g pages to beta, onto the pinned copy; the preview's pane band
+    // ^g pages to beta, onto the pinned copy; the preview's pane banner
     // shows the agent's state
     o.wait_cursor_on("editor");
     o.keys(&["C-g"]);

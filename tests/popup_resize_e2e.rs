@@ -5,16 +5,16 @@
 mod common;
 use common::*;
 
-/// The screen row of the preview's top rule inside the popup.
+/// The screen row of the preview frame's top edge inside the popup.
 fn rule_row(o: &Outer) -> Option<usize> {
-    let rule = regex::Regex::new(r"─{60,}").unwrap();
-    // the popup's own border is the first such line
+    let rule = regex::Regex::new(r"┌─{60,}").unwrap();
+    // the last such line: a popup border, if any, comes first
     o.screen()
         .lines()
         .enumerate()
         .filter(|(_, l)| rule.is_match(l))
         .map(|(i, _)| i)
-        .nth(1)
+        .last()
 }
 
 fn wait_rule(o: &Outer, what: &str, f: impl Fn(usize) -> bool) -> usize {
@@ -45,6 +45,10 @@ fn alt_j_k_resize_the_preview_despite_root_bindings() {
     // two panes, so a root binding firing would show in their heights
     s.tmux(&["split-window", "-d", "-v", "-t", "alpha:editor"]);
     let heights = pane_heights(&s);
+    // a list longer than the 5 rows it keeps, so the divider can go up
+    for _ in 0..3 {
+        s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    }
 
     o.open_popup();
     o.wait_cursor_on("editor");
