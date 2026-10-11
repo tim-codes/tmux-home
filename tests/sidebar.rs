@@ -519,11 +519,16 @@ fn the_sidebar_renders_live_agent_and_badge_changes() {
     install_binding(&s);
     toggle(&s, &["--window", "alpha:0"]);
     let side = sidebars(&s, "alpha:0")[0].clone();
-    wait_screen(&s, &side, r"^▌  0 home");
-    // the badge, then a change to it
-    wait_screen(&s, &side, r"^   1 app +main \|$");
+    wait_screen(&s, &side, r"^▌  0 home *$");
+    // the badge in the tags column, one past the longest name ("home"),
+    // then a change to it
+    wait_screen(&s, &side, r"^   1 app  main \|$");
     write(&repo, "README", "edited\n");
-    wait_screen(&s, &side, r"^   1 app +main ! \|$");
+    wait_screen(&s, &side, r"^   1 app  main ! \|$");
+    // a longer name widens the name column for every row
+    s.tmux(&["rename-window", "-t", "alpha:0", "homestead"]);
+    wait_screen(&s, &side, r"^   1 app       main ! \|$");
+    wait_screen(&s, &side, r"^▌  0 homestead *$");
     // an agent elsewhere on the server starts waiting: NEEDS YOU
     for (k, v) in [
         ("@pane_agent", "claude"),
