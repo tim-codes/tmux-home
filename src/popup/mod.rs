@@ -275,6 +275,17 @@ impl Runtime {
                     app.select_wid(&k);
                 }
             }
+            Action::PreviewPct(pct) => {
+                // server-global, so the next popup opens at this size
+                let n = pct.map(|p| p.to_string());
+                let args: Vec<&str> = match &n {
+                    Some(n) => vec!["set-option", "-g", PREVIEW_PCT_OPTION, n],
+                    None => vec!["set-option", "-gu", PREVIEW_PCT_OPTION],
+                };
+                if let Err(e) = self.tx.run(&args) {
+                    app.notice = Some(format!(" can't save the preview size: {e}"));
+                }
+            }
             Action::Reopen => match self.tx.reopen(&self.store) {
                 Ok(Some(wid)) => {
                     app.notice = None;
@@ -313,6 +324,10 @@ impl Runtime {
     }
 }
 
+/// The tmux server option that keeps the preview size set with M-j/M-k
+/// (a percentage; unset: automatic).
+pub const PREVIEW_PCT_OPTION: &str = "@home-preview-pct";
+
 pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     let socket = client::current_socket(socket)
         .ok_or_else(|| anyhow::anyhow!("not inside tmux and no --socket"))?;
@@ -345,6 +360,11 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
         .map(|h| h.trim().to_string())
         .unwrap_or_default();
     app.chord = app::Chord::from_env();
+    app.preview_pct = rt
+        .tx
+        .run(&["show-options", "-gqv", PREVIEW_PCT_OPTION])
+        .ok()
+        .and_then(|v| app::parse_preview_pct(&v));
     // first picture: read tmux directly, so the cursor lands on the window
     // the client shows now; no floor, since nothing was written (the feed's
     // first snapshot is a fresh read too)
@@ -432,21 +452,61 @@ fn event_loop(
     }
 }
 
-/// The preview takes the bottom half of the list area when the popup is
-/// at least this tall; below that only after ^o.
+/// The preview shows when the popup is at least this tall; below that
+/// only after ^o.
 const PREVIEW_MIN_HEIGHT: u16 = 30;
 
+/// Blank rows the auto split leaves under the list's last line.
+const LIST_PAD: u16 = 2;
+
+/// The preview's rows out of `avail` (the list and preview area). `pct`:
+/// the size set with M-j/M-k (`@home-preview-pct`), a share of `avail`.
+/// None (auto): the list gets its `content` lines plus `LIST_PAD` and the
+/// preview the rest, unless that leaves it under a third of `avail` (or
+/// `PREVIEW_MIN_ROWS`): then half. Either way the list and the preview
+/// keep `PREVIEW_MIN_ROWS` each when there is room for both.
+fn preview_height(avail: u16, pct: Option<u16>, content: usize) -> u16 {
+    let min = app::PREVIEW_MIN_ROWS.min(avail / 2);
+    let rows = match pct {
+        Some(p) => app::pct_rows(avail, p),
+        None => {
+            let floor = (avail.div_ceil(3)).max(app::PREVIEW_MIN_ROWS);
+            let list = u16::try_from(content)
+                .unwrap_or(u16::MAX)
+                .saturating_add(LIST_PAD);
+            match avail.saturating_sub(list) {
+                fit if fit >= floor => fit,
+                _ => avail / 2,
+            }
+        }
+    };
+    rows.clamp(min, avail - min)
+}
+
 /// The list and the preview below it. `height` is the popup's; `flip`
-/// (^o) shows a hidden preview or hides a shown one.
-fn preview_rect(area: Rect, height: u16, flip: bool) -> (Rect, Option<Rect>) {
+/// (^o) shows a hidden preview or hides a shown one; `pct` and `content`
+/// size it (see `preview_height`).
+fn preview_rect(
+    area: Rect,
+    height: u16,
+    flip: bool,
+    pct: Option<u16>,
+    content: usize,
+) -> (Rect, Option<Rect>) {
     if (height >= PREVIEW_MIN_HEIGHT) == flip {
         return (area, None);
     }
-    let parts = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    (parts[0], Some(parts[1]))
+    let prev = preview_height(area.height, pct, content);
+    let list = Rect {
+        height: area.height - prev,
+        ..area
+    };
+    let preview = Rect {
+        y: area.y + list.height,
+        height: prev,
+        ..area
+    };
+    (list, Some(preview))
 }
 
 /// The table's columns, in order (see `app::COLUMNS`).
@@ -795,7 +855,16 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, shot: &Shot, now: u64) {
     f.set_cursor_position((v[1].x + cx as u16, v[1].y));
 
     // column header, list, preview
-    let (list, prev) = preview_rect(v[3], area.height, app.preview_flip);
+    let content = list_lines(app).len().max(1);
+    let (list, prev) = preview_rect(
+        v[3],
+        area.height,
+        app.preview_flip,
+        app.preview_pct,
+        content,
+    );
+    app.split_area = v[3].height;
+    app.split_prev = prev.map(|p| p.height);
     let t = table(app, list.width as usize, now);
     let mut head = vec![Span::raw(" ".repeat(GUTTER))];
     head.extend(table_spans(&t, COLS.map(|c| vec![Span::raw(c.label())])));
@@ -877,17 +946,16 @@ fn draw_tabs(f: &mut Frame, app: &App, live: bool, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_list(f: &mut Frame, app: &mut App, area: Rect, t: &Table, now: u64) {
-    let h = area.height as usize;
-    app.page = h.saturating_sub(1).max(1);
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let width = area.width as usize;
-    // The list as lines: a NEEDS YOU group (when a window of the page
-    // needs you) gets a header, and so do the session's windows below it.
-    enum ListLine {
-        Header(String),
-        Row(usize),
-    }
+/// A line of the list.
+enum ListLine {
+    Header(String),
+    /// A position in `App::visible`.
+    Row(usize),
+}
+
+/// The page as list lines: a NEEDS YOU group (when a window of the page
+/// needs you) gets a header, and so do the session's windows below it.
+fn list_lines(app: &App) -> Vec<ListLine> {
     let mut items = Vec::new();
     let mut in_pinned = false;
     for (pos, it) in app.visible.iter().enumerate() {
@@ -900,6 +968,15 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, t: &Table, now: u64) {
         in_pinned = r.pinned;
         items.push(ListLine::Row(pos));
     }
+    items
+}
+
+fn draw_list(f: &mut Frame, app: &mut App, area: Rect, t: &Table, now: u64) {
+    let h = area.height as usize;
+    app.page = h.saturating_sub(1).max(1);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let width = area.width as usize;
+    let items = list_lines(app);
     let sel_line = items
         .iter()
         .position(|it| matches!(it, ListLine::Row(p) if *p == app.sel))
@@ -1095,6 +1172,9 @@ mod tests {
     }
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
     }
     fn shift(c: KeyCode) -> KeyEvent {
         KeyEvent::new(c, KeyModifiers::SHIFT)
@@ -1708,7 +1788,8 @@ mod tests {
     #[test]
     fn preview_layout_by_size() {
         let at = |w, h, flip| {
-            let (l, p) = preview_rect(Rect::new(0, 4, w, h - 5), h, flip);
+            // a list too long for the auto split: half
+            let (l, p) = preview_rect(Rect::new(0, 4, w, h - 5), h, flip, None, 1000);
             (l.height, p.map(|r| (r.y, r.width, r.height)))
         };
         // >= 30 rows: the bottom half, whatever the width
@@ -1719,6 +1800,156 @@ mod tests {
         assert_eq!(at(120, 20, true).1.unwrap().1, 120);
         // ^o hides a shown preview
         assert_eq!(at(200, 50, true).1, None);
+    }
+
+    #[test]
+    fn auto_split_fits_the_list() {
+        // a short list: its lines plus 2, the preview the rest
+        assert_eq!(preview_height(45, None, 6), 37);
+        // the floor: a third of the area (15 of 45) ...
+        assert_eq!(preview_height(45, None, 28), 15);
+        // ... below it, half
+        assert_eq!(preview_height(45, None, 29), 22);
+        assert_eq!(preview_height(45, None, 500), 22);
+        // and at least PREVIEW_MIN_ROWS: 12 rows, a third is 4; the list
+        // keeps 5 too
+        assert_eq!(preview_height(12, None, 1), 7);
+        assert_eq!(preview_height(12, None, 6), 6);
+        // the list keeps PREVIEW_MIN_ROWS even with nothing in it
+        assert_eq!(preview_height(45, None, 0), 40);
+        // tiny areas never panic
+        for a in 0..12 {
+            for c in [0, 1, 5, 100] {
+                assert!(preview_height(a, None, c) <= a);
+                assert!(preview_height(a, Some(99), c) <= a);
+            }
+        }
+    }
+
+    #[test]
+    fn a_set_size_overrides_auto() {
+        assert_eq!(preview_height(45, Some(30), 6), 13);
+        assert_eq!(preview_height(45, Some(50), 6), 22);
+        // clamped: both keep 5 rows
+        assert_eq!(preview_height(45, Some(99), 6), 40);
+        assert_eq!(preview_height(45, Some(1), 6), 5);
+    }
+
+    /// The preview's top rule row on a drawn screen.
+    fn rule_row(s: &str, w: u16) -> usize {
+        s.lines()
+            .position(|l| l.chars().count() == w as usize && l.chars().all(|c| c == '─'))
+            .unwrap_or_else(|| panic!("no rule\n{s}"))
+    }
+
+    /// Auto: the preview starts 2 rows below the page's last line, and
+    /// grows when the filter shortens the list; M-j/M-k start from the
+    /// split shown and set it; M-= goes back to auto.
+    #[test]
+    fn the_split_follows_the_list_until_set() {
+        let mut a = app();
+        let s = screen(&mut a, 200, 50);
+        let lines = list_lines(&a).len();
+        // tab strip, prompt, column header, the list, 2 blank rows (the
+        // list keeps 5 rows)
+        assert_eq!(rule_row(&s, 200), 3 + (lines + 2).max(5), "{s}");
+        assert_eq!(a.preview_pct, None);
+        // a filter matching less: the preview grows
+        for c in "longer".chars() {
+            a.key(plain(KeyCode::Char(c)));
+        }
+        let s2 = screen(&mut a, 200, 50);
+        assert!(list_lines(&a).len() < lines);
+        assert_eq!(rule_row(&s2, 200), 3 + 5, "{s2}");
+        assert!(rule_row(&s2, 200) < rule_row(&s, 200), "{s2}");
+        a.key(plain(KeyCode::Esc));
+        let s = screen(&mut a, 200, 50);
+        let auto = rule_row(&s, 200);
+
+        // M-j: from the auto split (its percentage) 5 points smaller
+        let prev = a.split_prev.unwrap();
+        let area = a.split_area as u32;
+        let pct = (prev as u32 * 100 + area / 2) / area;
+        assert_eq!(a.key(alt('j')), Action::PreviewPct(Some(pct as u16 - 5)));
+        let s = screen(&mut a, 200, 50);
+        assert!(rule_row(&s, 200) > auto, "smaller:\n{s}");
+        assert!(a.split_prev.unwrap() < prev);
+        // M-k twice: larger than before
+        a.key(alt('k'));
+        // (up to where the list keeps 5 rows)
+        let pct = pct as u16;
+        assert!(matches!(a.key(alt('k')), Action::PreviewPct(Some(p)) if p > pct && p <= pct + 5));
+        let s = screen(&mut a, 200, 50);
+        assert!(rule_row(&s, 200) < auto, "larger:\n{s}");
+        // a set size no longer follows the list
+        let set = rule_row(&s, 200);
+        for c in "longer".chars() {
+            a.key(plain(KeyCode::Char(c)));
+        }
+        assert_eq!(rule_row(&screen(&mut a, 200, 50), 200), set);
+        a.key(plain(KeyCode::Esc));
+        // M-=: auto again
+        assert_eq!(a.key(alt('=')), Action::PreviewPct(None));
+        assert_eq!(a.preview_pct, None);
+        assert_eq!(rule_row(&screen(&mut a, 200, 50), 200), auto);
+    }
+
+    /// The divider stops where the list or the preview would get under
+    /// PREVIEW_MIN_ROWS; pressing on does nothing.
+    #[test]
+    fn the_divider_stops_at_five_rows() {
+        let mut a = app();
+        screen(&mut a, 200, 50);
+        let area = a.split_area;
+        for _ in 0..30 {
+            a.key(alt('k'));
+            screen(&mut a, 200, 50);
+        }
+        assert_eq!(a.split_prev, Some(area - 5));
+        assert_eq!(a.key(alt('k')), Action::None);
+        for _ in 0..30 {
+            a.key(alt('j'));
+            screen(&mut a, 200, 50);
+        }
+        assert_eq!(a.split_prev, Some(5));
+        assert_eq!(a.key(alt('j')), Action::None);
+        // M-j at the minimum keeps the preview
+        assert!(screen(&mut a, 200, 50).contains('┌'));
+    }
+
+    /// A hidden preview (small popup): M-k shows it, M-j does nothing.
+    #[test]
+    fn alt_k_shows_a_hidden_preview() {
+        let mut a = app();
+        screen(&mut a, 120, 20);
+        assert_eq!(a.split_prev, None);
+        assert_eq!(a.key(alt('j')), Action::None);
+        screen(&mut a, 120, 20);
+        assert_eq!(a.split_prev, None);
+        a.key(alt('k'));
+        screen(&mut a, 120, 20);
+        assert!(a.split_prev.is_some());
+        assert_eq!(a.preview_pct, None, "showing it sets no size");
+        // then it resizes as usual
+        assert!(matches!(a.key(alt('k')), Action::PreviewPct(Some(_))));
+    }
+
+    /// The editors don't take M-j/M-k/M-= as text, and don't resize.
+    #[test]
+    fn resize_keys_leave_the_editors_alone() {
+        let mut a = app();
+        screen(&mut a, 200, 50);
+        a.key(ctrl('r'));
+        for c in ['j', 'k', '='] {
+            a.key(alt(c));
+        }
+        assert!(matches!(&a.mode, Mode::Rename { edit, .. } if edit.as_string() == "editor"));
+        assert_eq!(a.preview_pct, None);
+        a.key(plain(KeyCode::Esc));
+        for c in ['j', 'k', '='] {
+            a.key(alt(c));
+        }
+        assert!(a.filter.is_empty());
     }
 
     /// The preview is always below the list, never beside it, and shows
@@ -2013,7 +2244,6 @@ mod tests {
 
     #[test]
     fn tiny_terminals_do_not_panic() {
-        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
         for (w, h) in [
             (20, 3),
             (10, 1),
@@ -2027,6 +2257,8 @@ mod tests {
                 vec![],
                 vec![ctrl('r')],
                 vec![alt('n')],
+                vec![alt('k'), alt('k')],
+                vec![alt('j'), alt('=')],
                 vec![ctrl('o')],
                 vec![plain(KeyCode::Down), ctrl('o')],
                 vec![plain(KeyCode::F(1))],
