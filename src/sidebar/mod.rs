@@ -3,7 +3,9 @@
 //! daemon's snapshots (a direct read every second without one). Focused,
 //! it takes the popup's movement keys: `↑`/`↓` (`^p`/`^n`, `k`/`j`) move a
 //! selection, `⏎` switches to the selected window, `Esc` hands the focus
-//! back. `tmux-home sidebar-toggle` adds and removes these panes.
+//! back. `tmux-home sidebar-toggle` adds and removes these panes, in one
+//! window or, pinning a session, in all of its (the daemon keeps a pinned
+//! session's windows supplied; `daemon::sidebars`).
 //!
 //! A sidebar pane is marked `@home_role=sidebar`: by whoever creates it
 //! (the toggle, the daemon's auto-create) and by the sidebar process itself
