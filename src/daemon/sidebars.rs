@@ -604,8 +604,9 @@ fn execute(t: &Tmux, plan: Plan) {
         && let Ok(s) = state()
     {
         for name in s.pins() {
-            // `=`: that session exactly; none by that name is no error
-            let _ = t.run(&["set-option", "-t", &format!("={name}"), PIN_OPTION, "1"]);
+            // `=name:`, that session exactly (as a pane target, which
+            // set-option takes); none by that name is no error
+            let _ = t.run(&["set-option", "-t", &format!("={name}:"), PIN_OPTION, "1"]);
         }
     }
     let mut adds = if plan.new_windows.is_empty() {
