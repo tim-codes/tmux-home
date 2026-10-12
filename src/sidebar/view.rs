@@ -235,15 +235,13 @@ pub fn body(m: &Model, width: usize, sel: Option<&Sel>) -> (Vec<Line<'static>>, 
         }
     }
     let mut here = None;
+    // No session header: tmux's own window status chips already name it.
+    // A blank line keeps the windows apart from NEEDS YOU above them.
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
     match &m.session {
-        Some(s) => {
-            lines.push(rule(
-                s,
-                width,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        Some(_) => {
             let index = index_width(&m.windows);
             for e in &m.windows {
                 if e.here {
@@ -257,6 +255,7 @@ pub fn body(m: &Model, width: usize, sel: Option<&Sel>) -> (Vec<Line<'static>>, 
                 lines.extend(l);
             }
         }
+        // Not meaningless: this is the only "no session yet" signal.
         None => lines.push(Line::styled(" …", dim())),
     }
     (lines, picked.or(here))
@@ -349,7 +348,8 @@ mod tests {
             assert_eq!(lines[2], "   permission", "{w}:\n{s}");
             assert_eq!(lines[3], " ✕ ops:0 logs", "{w}:\n{s}");
             assert_eq!(lines[4], "   error: rate limited", "{w}:\n{s}");
-            assert!(lines[5].starts_with("─ main ─"), "{w}:\n{s}");
+            assert_eq!(lines[5], "", "{w}:\n{s}");
+            assert!(lines[6].starts_with(" ◐ 1 api"), "{w}:\n{s}");
             assert_eq!(
                 lines[15],
                 clip(" 2s 4w · 1 error · 1 waiting · 1 running", w as usize)

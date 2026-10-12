@@ -106,7 +106,6 @@ fn toggle_adds_and_removes_a_sidebar_in_the_window() {
     );
     assert_eq!(fmt(&s, "alpha:0", "#{pane_id}"), main, "focus stays put");
     assert!(sidebars(&s, "alpha:1").is_empty(), "only that window");
-    wait_screen(&s, &side[0], r"^─ alpha ─");
     wait_screen(&s, &side[0], r"^▌  0 ");
     toggle(&s, &["--window", "alpha:0"]);
     assert!(sidebars(&s, "alpha:0").is_empty());
@@ -413,7 +412,7 @@ fn a_restored_sidebar_runs_in_a_shell_and_q_closes_its_pane() {
     wait_until("self-marked", || {
         fmt(&s, &pane, "#{@home_role}") == "sidebar"
     });
-    wait_screen(&s, &pane, r"^─ alpha ─");
+    wait_screen(&s, &pane, r"^\S?\s+\d+ \S");
     s.tmux(&["send-keys", "-t", &pane, "x", "Enter", "j"]);
     std::thread::sleep(Duration::from_millis(300));
     assert!(
@@ -436,7 +435,14 @@ fn the_popup_and_close_rules_ignore_sidebar_panes() {
     toggle(&s, &["--window", &wid]);
     let side = sidebars(&s, &wid)[0].clone();
     wait_until("self-marked and running", || {
-        capture(&s, &side).contains("─ alpha ─")
+        capture(&s, &side).lines().any(|l| {
+            // a window row: marker, then its index
+            l.chars()
+                .skip(1)
+                .collect::<String>()
+                .trim_start()
+                .starts_with("0 ")
+        })
     });
     s.tmux(&["select-pane", "-t", &side]); // even when focused
     let tx = Tx::new(s.socket.clone());
@@ -570,7 +576,7 @@ fn a_sidebar_run_by_hand_is_not_managed() {
     let s = TestServer::start();
     let pane = panes(&s, "alpha:0")[0].clone();
     s.tmux(&["send-keys", "-t", &pane, &format!("{BIN} sidebar"), "Enter"]);
-    wait_screen(&s, &pane, r"^─ alpha ─");
+    wait_screen(&s, &pane, r"^\S?\s+\d+ \S");
     assert_eq!(fmt(&s, &pane, "#{@home_role}"), "");
     s.tmux(&["send-keys", "-t", &pane, "q"]);
     s.tmux(&["send-keys", "-t", &pane, "echo STILL-HERE", "Enter"]);
@@ -724,7 +730,7 @@ fn a_cold_start_restore_with_sidebars_comes_back_as_saved() {
     toggle(&a, &["--session", "--window", "main:0"]);
     for w in ["main:0", "main:1", "main:2"] {
         let side = sidebars(&a, w)[0].clone();
-        wait_screen(&a, &side, r"^─ main ─");
+        wait_screen(&a, &side, r"^\S?\s+\d+ \S");
     }
     resurrect_opts(&a);
     let saved = layout(&a);
