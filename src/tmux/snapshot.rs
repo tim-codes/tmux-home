@@ -61,6 +61,10 @@ pub struct Session {
     pub id: String,
     pub name: String,
     pub attached: u32,
+    /// Its sidebar is pinned (`@home_sidebar_pin` set, `sidebar-toggle
+    /// --pin`): every window of it gets a sidebar.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
@@ -71,6 +75,10 @@ pub struct Window {
     pub name: String,
     pub automatic_rename: bool,
     pub active: bool,
+    /// Its sidebar was closed on purpose (`@home_sidebar_off` set): a pinned
+    /// session doesn't give it one again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sidebar_off: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash, Default)]
@@ -137,10 +145,10 @@ const REC_END: &str = "\x1e\n";
 // The agent options sit between the fixed fields and the names; a prompt is
 // stored with newlines and `|` replaced, but a literal \x1f in one would
 // shift the fields after it (the record is then misread, not lost).
-const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{?#{@home_role},#{@home_role},#{@pane_role}}\x1f#{pane_tty}\x1f#{@home_role}\x1f#{pane_left}\x1f#{pane_top}\x1f#{pane_width}\x1f#{pane_height}\x1f#{window_width}\x1f#{window_height}\x1f";
+const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{?#{@home_role},#{@home_role},#{@pane_role}}\x1f#{pane_tty}\x1f#{@home_role}\x1f#{pane_left}\x1f#{pane_top}\x1f#{pane_width}\x1f#{pane_height}\x1f#{window_width}\x1f#{window_height}\x1f#{@home_sidebar_pin}\x1f#{@home_sidebar_off}\x1f";
 const PANE_TAIL: &str = "#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
 /// Fields before the agent options.
-const HEAD_FIELDS: usize = 19;
+const HEAD_FIELDS: usize = 21;
 /// Fields in a `list-panes` record.
 fn pane_fields() -> usize {
     HEAD_FIELDS + crate::agent::OPTIONS.len() + 3
@@ -243,6 +251,13 @@ fn pane_record(rec: &str) -> Option<PaneRec<'_>> {
     })
 }
 
+/// A user-option flag: set to anything but empty or `0`. (A pane record
+/// sees its session's and window's options through tmux's option
+/// inheritance; a linked window's panes are listed once per session.)
+fn flag(s: &str) -> bool {
+    !s.is_empty() && s != "0"
+}
+
 /// A geometry field; 0 if tmux left it empty.
 fn num(s: &str) -> u32 {
     s.parse().unwrap_or(0)
@@ -271,6 +286,7 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
                 id: sid.clone(),
                 name: sname.to_string(),
                 attached: 0,
+                pinned: flag(f[19]),
             });
         }
         if !s.windows.iter().any(|w| w.id == wid && w.session_id == sid) {
@@ -281,6 +297,7 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
                 active: f[3] == "1",
                 automatic_rename: f[4] == "1",
                 name: wname.to_string(),
+                sidebar_off: flag(f[20]),
             });
         }
         s.panes.push(Pane {

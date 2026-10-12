@@ -425,6 +425,36 @@ version and its 143-check test suite, which is the parity checklist.
   an absolute path: tmux-continuum skips its auto-restore if it sees another
   process starting with `tmux` at server start.
 
+**Amendment (pins and width, as built).**
+- `prefix e` → `sidebar-toggle --pin` (`--session` kept as an alias) pins
+  the session: a sidebar in every window lacking one, and from then on the
+  daemon gives every new window of it one as soon as a snapshot shows it —
+  not behind the auto-create gate, only never while a restore may be
+  running. `prefix E` → `sidebar-toggle` is the window toggle. Unpinning
+  removes the session's tmux-home sidebars, except in windows linked into
+  another pinned session (a window is pinned if any of its sessions is).
+- A pinned window whose sidebar goes (window toggle, `q`, any kill) is
+  marked `@home_sidebar_off` (window option; the toggle and `q` set it
+  themselves before the kill, the daemon too when it sees one go) and is
+  left without one; pinning again clears the marks.
+- Pins are kept by name: session option `@home_sidebar_pin` (in the
+  snapshot as `Session.pinned`; the mark as `Window.sidebar_off`) and
+  `<state dir>/pins`. When auto-create becomes allowed (after a restore)
+  the daemon pins the sessions the file names; it writes pinned sessions'
+  renames to the file and drops one killed while other sessions live.
+- Width: the daemon follows each tmux-home sidebar's width. A change with
+  the window's width and panes unchanged and no resize of ours pending is
+  by hand; held for 700 ms (`TMUX_HOME_SIDEBAR_SETTLE_MS`) and more than a
+  column off the last settled width, it becomes the width of every sidebar
+  as a whole percentage of the window, stored in `<state dir>/sidebar-width`
+  (over `@home-sidebar-width`), and every other sidebar is resized to it.
+  A window resize, or a pane coming or going in the sidebar's window, sets
+  its sidebar back to the width; a sidebar filling its window (zoomed) is
+  ignored, and a width is learned only while the sidebar keeps a sidebar's
+  shape (full height, at an edge, at most half the window), so a
+  `select-layout` over it isn't taken for a resize by hand. The daemon computes columns itself (`round(pct × window)`), and
+  so does the toggle when it splits, so the two agree.
+
 ## 9. Persistence
 
 `${XDG_STATE_HOME:-~/.local/state}/tmux-home/` (dir per `sha1(socket_path)`

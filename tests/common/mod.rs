@@ -69,6 +69,24 @@ impl TestServer {
     /// so for its panes and run-shell jobs), e.g. an isolated `HOME`.
     pub fn start_with(env: &[(&str, &std::ffi::OsStr)]) -> TestServer {
         let name = format!("th-test-{}-{}", std::process::id(), rand_suffix());
+        TestServer::start_named(&name, env)
+    }
+
+    /// A server on the socket of `old`, once it has gone: tmux-home keys
+    /// its state dir by socket path, so this is the same server restarted.
+    pub fn restart(old: TestServer) -> TestServer {
+        TestServer::restart_with(old, &[])
+    }
+
+    /// `restart`, with `start_with`'s environment.
+    pub fn restart_with(old: TestServer, env: &[(&str, &std::ffi::OsStr)]) -> TestServer {
+        let name = old.name.clone();
+        drop(old);
+        TestServer::start_named(&name, env)
+    }
+
+    fn start_named(name: &str, env: &[(&str, &std::ffi::OsStr)]) -> TestServer {
+        let name = name.to_string();
         let out = Command::new("tmux")
             .envs(env.iter().map(|(k, v)| (*k, *v)))
             .args([

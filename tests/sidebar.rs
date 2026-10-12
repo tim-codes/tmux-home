@@ -106,7 +106,6 @@ fn toggle_adds_and_removes_a_sidebar_in_the_window() {
     );
     assert_eq!(fmt(&s, "alpha:0", "#{pane_id}"), main, "focus stays put");
     assert!(sidebars(&s, "alpha:1").is_empty(), "only that window");
-    wait_screen(&s, &side[0], r"^─ alpha ─");
     wait_screen(&s, &side[0], r"^▌  0 ");
     toggle(&s, &["--window", "alpha:0"]);
     assert!(sidebars(&s, "alpha:0").is_empty());
@@ -186,29 +185,130 @@ fn width_and_side_come_from_options() {
     );
 }
 
+/// A file in the server's state dir (the test's temp dir).
+fn state_file(s: &TestServer, name: &str) -> std::path::PathBuf {
+    tmux_home::paths::Paths::for_socket(&s.socket)
+        .unwrap()
+        .state_dir
+        .join(name)
+}
+
+fn read_state(s: &TestServer, name: &str) -> String {
+    std::fs::read_to_string(state_file(s, name)).unwrap_or_default()
+}
+
 #[test]
-fn session_toggle_turns_on_where_lacking_then_off_and_leaves_other_sessions() {
+fn pin_turns_on_everywhere_new_windows_follow_and_unpin_turns_off() {
     let _env = TestEnv::new();
     let s = TestServer::start();
     s.tmux(&["new-window", "-d", "-t", "alpha:"]);
     s.tmux(&["new-window", "-d", "-t", "alpha:"]);
     s.tmux(&["new-session", "-d", "-s", "beta", "-x", "200", "-y", "50"]);
     s.tmux(&["new-window", "-d", "-t", "beta:"]);
+    install_binding(&s); // the daemon: no start-up gate for pins
     toggle(&s, &["--window", "beta:0"]); // beta:0 has one of its own
     toggle(&s, &["--window", "alpha:1"]);
     let before = sidebars(&s, "alpha:1");
-    toggle(&s, &["--session", "--window", "alpha:0"]);
+    toggle(&s, &["--pin", "--window", "alpha:0"]);
     for w in ["alpha:0", "alpha:1", "alpha:2"] {
         assert_eq!(sidebars(&s, w).len(), 1, "{w}: on");
     }
     assert_eq!(sidebars(&s, "alpha:1"), before, "an existing one is kept");
+    assert_eq!(fmt(&s, "alpha:", "#{@home_sidebar_pin}"), "1");
+    assert_eq!(read_state(&s, "pins"), "alpha\n");
+    // a new window of the pinned session gets one at once
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    wait_until("a sidebar in alpha:3", || {
+        sidebars(&s, "alpha:3").len() == 1
+    });
+    // closed by hand (the window toggle, q): stays closed
+    toggle(&s, &["--window", "alpha:3"]);
+    let side = sidebars(&s, "alpha:2")[0].clone();
+    wait_screen(&s, &side, r"^\S?\s+\d+ \S");
+    s.tmux(&["send-keys", "-t", &side, "q"]);
+    wait_until("q closed it", || sidebars(&s, "alpha:2").is_empty());
+    std::thread::sleep(Duration::from_millis(1500)); // three polls
+    assert!(
+        sidebars(&s, "alpha:3").is_empty(),
+        "the window toggle sticks"
+    );
+    assert!(sidebars(&s, "alpha:2").is_empty(), "q sticks");
+    assert_eq!(fmt(&s, "alpha:2", "#{@home_sidebar_off}"), "1");
+    // other sessions untouched
     assert_eq!(sidebars(&s, "beta:0").len(), 1, "beta untouched");
     assert!(sidebars(&s, "beta:1").is_empty(), "beta untouched");
-    toggle(&s, &["--session", "--window", "alpha:2"]);
-    for w in ["alpha:0", "alpha:1", "alpha:2"] {
+    s.tmux(&["new-window", "-d", "-t", "beta:"]);
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(sidebars(&s, "beta:2").is_empty(), "beta isn't pinned");
+    // unpin: all off, and new windows get none
+    toggle(&s, &["--pin", "--window", "alpha:2"]);
+    for w in ["alpha:0", "alpha:1", "alpha:2", "alpha:3"] {
         assert!(sidebars(&s, w).is_empty(), "{w}: off");
     }
+    assert_eq!(fmt(&s, "alpha:", "#{@home_sidebar_pin}"), "");
+    assert_eq!(read_state(&s, "pins"), "");
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(sidebars(&s, "alpha:4").is_empty(), "unpinned");
     assert_eq!(sidebars(&s, "beta:0").len(), 1, "beta's still there");
+    // pinned again: every window, the ones closed by hand too
+    toggle(&s, &["--pin", "--window", "alpha:0"]);
+    for w in ["alpha:0", "alpha:1", "alpha:2", "alpha:3", "alpha:4"] {
+        assert_eq!(sidebars(&s, w).len(), 1, "{w}: on again");
+    }
+}
+
+/// A window linked into two sessions keeps its sidebar while either is
+/// pinned.
+#[test]
+fn a_linked_window_keeps_its_sidebar_while_another_pinned_session_holds_it() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "shared"]);
+    s.tmux(&["new-session", "-d", "-s", "beta", "-x", "200", "-y", "50"]);
+    s.tmux(&["link-window", "-d", "-s", "alpha:shared", "-t", "beta:5"]);
+    toggle(&s, &["--pin", "--window", "alpha:0"]);
+    toggle(&s, &["--pin", "--window", "beta:0"]);
+    assert_eq!(sidebars(&s, "alpha:shared").len(), 1);
+    assert_eq!(sidebars(&s, "beta:0").len(), 1);
+    toggle(&s, &["--pin", "--window", "alpha:0"]);
+    assert!(sidebars(&s, "alpha:0").is_empty(), "alpha's own: off");
+    assert_eq!(sidebars(&s, "alpha:shared").len(), 1, "beta still pins it");
+    toggle(&s, &["--pin", "--window", "beta:0"]);
+    assert!(sidebars(&s, "alpha:shared").is_empty(), "nobody pins it");
+    assert!(sidebars(&s, "beta:0").is_empty());
+}
+
+/// Pins are kept by session name in the state dir: after a restart (here:
+/// the server killed and started again on its socket, sessions made anew,
+/// as a restore would), the daemon pins the same names again once it may,
+/// and their windows get sidebars.
+#[test]
+fn pins_survive_a_restart_through_the_state_file() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    s.tmux(&["new-session", "-d", "-s", "beta", "-x", "200", "-y", "50"]);
+    toggle(&s, &["--pin", "--window", "alpha:0"]);
+    assert_eq!(read_state(&s, "pins"), "alpha\n");
+    let s = TestServer::restart(s);
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    s.tmux(&["new-session", "-d", "-s", "beta", "-x", "200", "-y", "50"]);
+    assert!(sidebars(&s, "alpha:0").is_empty(), "nothing carried over");
+    quick_gate(&s);
+    install_binding(&s);
+    wait_until("alpha pinned again", || {
+        fmt(&s, "alpha:", "#{@home_sidebar_pin}") == "1"
+    });
+    wait_until("sidebars in alpha's windows", || {
+        sidebars(&s, "alpha:0").len() == 1 && sidebars(&s, "alpha:1").len() == 1
+    });
+    assert!(sidebars(&s, "beta:0").is_empty(), "beta wasn't pinned");
+    assert_eq!(fmt(&s, "beta:", "#{@home_sidebar_pin}"), "");
+    // a pinned session renamed: the file follows
+    s.tmux(&["rename-session", "-t", "alpha", "home"]);
+    wait_until("the pins file renamed", || {
+        read_state(&s, "pins") == "home\n"
+    });
 }
 
 /// Auto-create's start-up gate, shortened: no minimum age, windows and
@@ -413,7 +513,7 @@ fn a_restored_sidebar_runs_in_a_shell_and_q_closes_its_pane() {
     wait_until("self-marked", || {
         fmt(&s, &pane, "#{@home_role}") == "sidebar"
     });
-    wait_screen(&s, &pane, r"^─ alpha ─");
+    wait_screen(&s, &pane, r"^\S?\s+\d+ \S");
     s.tmux(&["send-keys", "-t", &pane, "x", "Enter", "j"]);
     std::thread::sleep(Duration::from_millis(300));
     assert!(
@@ -436,7 +536,14 @@ fn the_popup_and_close_rules_ignore_sidebar_panes() {
     toggle(&s, &["--window", &wid]);
     let side = sidebars(&s, &wid)[0].clone();
     wait_until("self-marked and running", || {
-        capture(&s, &side).contains("─ alpha ─")
+        capture(&s, &side).lines().any(|l| {
+            // a window row: marker, then its index
+            l.chars()
+                .skip(1)
+                .collect::<String>()
+                .trim_start()
+                .starts_with("0 ")
+        })
     });
     s.tmux(&["select-pane", "-t", &side]); // even when focused
     let tx = Tx::new(s.socket.clone());
@@ -465,24 +572,27 @@ fn the_popup_and_close_rules_ignore_sidebar_panes() {
 }
 
 #[test]
-fn prefix_e_and_shift_e_toggle_through_the_binding() {
+fn prefix_e_pins_and_shift_e_toggles_the_window_through_the_binding() {
     let _env = TestEnv::new();
     let s = TestServer::start();
     s.tmux(&["new-window", "-d", "-t", "alpha:"]);
     s.tmux(&["new-session", "-d", "-s", "beta"]);
     install_binding(&s);
     let o = Outer::attach(&s, "alpha:0", 120, 30);
-    o.keys(&["C-b", "e"]);
+    o.keys(&["C-b", "E"]);
     wait_until("a sidebar in alpha:0", || {
         sidebars(&s, "alpha:0").len() == 1
     });
-    assert!(sidebars(&s, "alpha:1").is_empty());
+    assert!(sidebars(&s, "alpha:1").is_empty(), "the window only");
     o.keys(&["C-b", "E"]);
-    wait_until("one in alpha:1", || sidebars(&s, "alpha:1").len() == 1);
-    assert_eq!(sidebars(&s, "alpha:0").len(), 1);
+    wait_until("off again", || sidebars(&s, "alpha:0").is_empty());
+    o.keys(&["C-b", "e"]);
+    wait_until("pinned: one in every window", || {
+        sidebars(&s, "alpha:0").len() == 1 && sidebars(&s, "alpha:1").len() == 1
+    });
     assert!(sidebars(&s, "beta:0").is_empty(), "the session only");
-    o.keys(&["C-b", "E"]);
-    wait_until("all off", || {
+    o.keys(&["C-b", "e"]);
+    wait_until("unpinned: all off", || {
         sidebars(&s, "alpha:0").is_empty() && sidebars(&s, "alpha:1").is_empty()
     });
 }
@@ -570,7 +680,7 @@ fn a_sidebar_run_by_hand_is_not_managed() {
     let s = TestServer::start();
     let pane = panes(&s, "alpha:0")[0].clone();
     s.tmux(&["send-keys", "-t", &pane, &format!("{BIN} sidebar"), "Enter"]);
-    wait_screen(&s, &pane, r"^─ alpha ─");
+    wait_screen(&s, &pane, r"^\S?\s+\d+ \S");
     assert_eq!(fmt(&s, &pane, "#{@home_role}"), "");
     s.tmux(&["send-keys", "-t", &pane, "q"]);
     s.tmux(&["send-keys", "-t", &pane, "echo STILL-HERE", "Enter"]);
@@ -673,9 +783,10 @@ fn layout(s: &TestServer) -> Vec<(String, usize, usize, bool, Vec<String>)> {
 }
 
 /// A cold start that restores a resurrect save with sidebars in it, the
-/// daemon up from the first second and auto-create on: every window comes
-/// back as saved (no orphan or extra panes), one sidebar each at the left
-/// at its width, none focused; only windows made afterwards get a new one.
+/// daemon up from the first second, auto-create on and the session pinned:
+/// every window comes back as saved (no orphan or extra panes), one
+/// sidebar each at the left at its width, none focused, the pin back; only
+/// windows made afterwards get a new one.
 /// HOME, the resurrect dir and tmux-home's dirs are all temporary.
 #[test]
 fn a_cold_start_restore_with_sidebars_comes_back_as_saved() {
@@ -721,10 +832,10 @@ fn a_cold_start_restore_with_sidebars_comes_back_as_saved() {
         "-y",
         "50",
     ]);
-    toggle(&a, &["--session", "--window", "main:0"]);
+    toggle(&a, &["--pin", "--window", "main:0"]);
     for w in ["main:0", "main:1", "main:2"] {
         let side = sidebars(&a, w)[0].clone();
-        wait_screen(&a, &side, r"^─ main ─");
+        wait_screen(&a, &side, r"^\S?\s+\d+ \S");
     }
     resurrect_opts(&a);
     let saved = layout(&a);
@@ -741,10 +852,11 @@ fn a_cold_start_restore_with_sidebars_comes_back_as_saved() {
         3,
         "{last}"
     );
-    drop(a);
 
-    // server B: a cold start, the daemon at once, auto-create on, restore
-    let b = TestServer::start_with(&envs);
+    // server B: the same server (socket) started cold, the daemon at once,
+    // auto-create on, restore; main was pinned, and is pinned again after
+    // the restore without gaining a sidebar
+    let b = TestServer::restart_with(a, &envs);
     b.tmux(&["rename-session", "-t", "alpha", "0"]);
     resurrect_opts(&b);
     b.tmux(&["set-option", "-g", "@home-sidebar-auto", "on"]);
@@ -780,8 +892,57 @@ fn a_cold_start_restore_with_sidebars_comes_back_as_saved() {
             assert_eq!(geo, &["0x32".to_string()], "{w}");
         }
     }
+    assert_eq!(
+        fmt(&b, "main:", "#{@home_sidebar_pin}"),
+        "1",
+        "pinned again"
+    );
+    assert_eq!(fmt(&b, "scratch:", "#{@home_sidebar_pin}"), "");
     // from now on new windows get one
     b.tmux(&["new-window", "-d", "-t", "main:"]);
     wait_until("a sidebar in main:3", || sidebars(&b, "main:3").len() == 1);
     drop(o);
+}
+
+/// A sidebar resized by hand sets the width for all of them, as a
+/// percentage of the window: every other sidebar follows, new ones are
+/// made at it (over `@home-sidebar-width`), it is stored, and a window
+/// that resizes gets its sidebar set back to it.
+#[test]
+fn a_width_set_by_hand_spreads_as_a_percentage() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    s.tmux(&["set-option", "-g", "@home-sidebar-width", "40"]);
+    s.tmux(&[
+        "set-environment",
+        "-g",
+        "TMUX_HOME_SIDEBAR_SETTLE_MS",
+        "300",
+    ]);
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    s.tmux(&["new-session", "-d", "-s", "beta", "-x", "100", "-y", "50"]);
+    install_binding(&s);
+    for w in ["alpha:0", "alpha:1", "beta:0"] {
+        toggle(&s, &["--window", w]);
+    }
+    let side = |w: &str| sidebars(&s, w)[0].clone();
+    let width = |w: &str| fmt(&s, &side(w), "#{pane_width}");
+    assert_eq!(width("alpha:1"), "40");
+    std::thread::sleep(Duration::from_millis(1200)); // the daemon has seen them
+    // by hand: 50 of 200
+    s.tmux(&["resize-pane", "-t", &side("alpha:0"), "-x", "50"]);
+    wait_until("alpha:1's sidebar at 25%", || width("alpha:1") == "50");
+    wait_until("beta's at 25% of 100", || width("beta:0") == "25");
+    assert_eq!(width("alpha:0"), "50", "the one resized stays put");
+    assert_eq!(read_state(&s, "sidebar-width"), "25%\n");
+    // a new one: at the stored width, not the option's
+    toggle(&s, &["--window", "alpha:2"]);
+    assert_eq!(width("alpha:2"), "50");
+    // beta's window resized: its sidebar back to 25%
+    s.tmux(&["resize-window", "-t", "beta:0", "-x", "160"]);
+    wait_until("beta's at 25% of 160", || width("beta:0") == "40");
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(read_state(&s, "sidebar-width"), "25%\n", "nothing learned");
+    assert_eq!(width("alpha:1"), "50", "nor spread");
 }

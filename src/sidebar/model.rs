@@ -180,6 +180,7 @@ pub(crate) mod tests {
 
     fn win(id: &str, sid: &str, index: u32, name: &str) -> Window {
         Window {
+            sidebar_off: false,
             id: id.into(),
             session_id: sid.into(),
             index,
@@ -204,11 +205,13 @@ pub(crate) mod tests {
         let mut s = Snapshot {
             sessions: vec![
                 Session {
+                    pinned: false,
                     id: "$1".into(),
                     name: "main".into(),
                     attached: 1,
                 },
                 Session {
+                    pinned: false,
                     id: "$2".into(),
                     name: "ops".into(),
                     attached: 0,

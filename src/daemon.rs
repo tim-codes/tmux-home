@@ -453,6 +453,7 @@ mod tests {
         let mut a = Snapshot::default();
         assert_eq!(a.sections(), Snapshot::default().sections());
         a.sessions.push(Session {
+            pinned: false,
             id: "$0".into(),
             name: "x".into(),
             attached: 0,

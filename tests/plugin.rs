@@ -279,12 +279,14 @@ fn sidebar_keys_default_to_e_and_shift_e() {
     let _env = TestEnv::new();
     let s = TestServer::start();
     run_plugin(&s, BIN);
+    // e pins the session, E toggles the window
     let e = binding(&s, "e").expect("prefix e bound");
     assert!(e.contains(&format!("{BIN} sidebar-toggle")), "{e}");
     assert!(e.contains("--window #{q:session_id}:#{q:window_id}"), "{e}");
-    assert!(!e.contains("--session"), "{e}");
+    assert!(e.contains("--pin"), "{e}");
     let big = binding(&s, "E").expect("prefix E bound");
-    assert!(big.contains("--session"), "{big}");
+    assert!(big.contains(&format!("{BIN} sidebar-toggle")), "{big}");
+    assert!(!big.contains("--pin"), "{big}");
 }
 
 #[test]
@@ -295,7 +297,14 @@ fn sidebar_keys_are_configurable() {
     run_plugin(&s, BIN);
     assert_eq!(binding(&s, "e"), None);
     assert_eq!(binding(&s, "E"), None);
-    assert!(binding(&s, "S").expect("prefix S").contains("--session"));
+    let window = binding(&s, "S").expect("prefix S");
+    assert!(
+        !window.contains("--pin"),
+        "the second key: the window toggle"
+    );
+    s.tmux(&["set-option", "-g", "@home-sidebar-keys", "P"]);
+    run_plugin(&s, BIN);
+    assert!(binding(&s, "P").expect("prefix P").contains("--pin"));
 }
 
 /// The daemon starts TMUX_HOME_DAEMON_DELAY seconds after the plugin
