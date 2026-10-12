@@ -30,7 +30,9 @@
 //!   width or panes changing, and not by a resize of ours, is being resized
 //!   by hand: once that width has held for `settle`, and if it is more than
 //!   a column off the last settled one, it becomes the sidebar width, as a
-//!   percentage of its window, stored, and applied to every other sidebar.
+//!   percentage of its window, stored, and applied to every other sidebar
+//!   (unless it has lost a sidebar's shape — not full height, off the edge,
+//!   over half the window — as `select-layout` would leave it).
 //!   A window resized, or whose panes came or went (a pane killed beside
 //!   the sidebar hands it its space), gets its sidebar set back to the
 //!   width.
@@ -500,7 +502,11 @@ impl Planner {
             && now.duration_since(since) >= self.settle
         {
             t.moved = None;
-            if ww > 0 && w.abs_diff(t.settled) > TOLERANCE {
+            // still a sidebar's shape (full height, at an edge, at most
+            // half the window): not a layout applied over it
+            let shaped =
+                p.height >= p.window_height && (p.left == 0 || p.left + w >= ww) && w * 2 <= ww;
+            if ww > 0 && shaped && w.abs_diff(t.settled) > TOLERANCE {
                 *by_hand = Some((p.id.clone(), pct(w, ww)));
             }
             t.settled = w;
@@ -1235,6 +1241,27 @@ mod tests {
                 .save_width,
             Some(33),
             "the drag over"
+        );
+        // a layout applied over it (even-horizontal): half the window or
+        // more, or no longer full height, is not a width to learn
+        let mut p = Planner::new(STABLE).settle(SETTLE);
+        p.observe(&two(32, 32), t0, Startup::Past);
+        p.observe(&two(100, 32), at(t0, 100), Startup::Past);
+        assert_eq!(
+            p.observe(&two(101, 32), at(t0, 200), Startup::Past),
+            Plan::default()
+        );
+        assert_eq!(
+            p.observe(&two(101, 32), at(t0, 2000), Startup::Past),
+            Plan::default()
+        );
+        let mut short = two(60, 32);
+        short.panes[1].height = 20;
+        short.panes[1].window_height = 50;
+        p.observe(&short, at(t0, 2100), Startup::Past);
+        assert_eq!(
+            p.observe(&short, at(t0, 4000), Startup::Past),
+            Plan::default()
         );
         // one column off what settled: tmux's rounding, nothing to learn
         let mut p = Planner::new(STABLE).settle(SETTLE);

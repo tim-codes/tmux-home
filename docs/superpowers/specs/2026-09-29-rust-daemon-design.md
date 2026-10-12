@@ -450,7 +450,9 @@ version and its 143-check test suite, which is the parity checklist.
   (over `@home-sidebar-width`), and every other sidebar is resized to it.
   A window resize, or a pane coming or going in the sidebar's window, sets
   its sidebar back to the width; a sidebar filling its window (zoomed) is
-  ignored. The daemon computes columns itself (`round(pct × window)`), and
+  ignored, and a width is learned only while the sidebar keeps a sidebar's
+  shape (full height, at an edge, at most half the window), so a
+  `select-layout` over it isn't taken for a resize by hand. The daemon computes columns itself (`round(pct × window)`), and
   so does the toggle when it splits, so the two agree.
 
 ## 9. Persistence

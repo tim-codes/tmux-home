@@ -591,7 +591,9 @@ percentage is stored in the state dir's `sidebar-width` (`25%`) and wins
 over `@home-sidebar-width` from then on; delete the file to go back to the
 option. A change of one column, a resize of the whole window, and the space
 a closing pane hands the sidebar don't count as resizing it by hand (the
-last two set it back to the width):
+last two set it back to the width), nor does a layout applied over it
+(`select-layout`: no longer full height at the edge, or over half the
+window):
 
 ```
 ─ NEEDS YOU ───────────────────
