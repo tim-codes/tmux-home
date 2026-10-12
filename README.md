@@ -22,8 +22,9 @@ where to go.
   and operations in progress for each window's repo, computed read-only in
   the background.
 - **Sidebar** (`prefix e` / `prefix E`): a narrow, always-on view of the
-  same state for one window or a whole session; focus it to move through
-  its windows and switch.
+  same state, pinned to a whole session (new windows included, kept across
+  restarts) or toggled in one window; focus it to move through its windows
+  and switch.
 - **tmux-resurrect integration**: sidebars come back after a restore, and
   (opt-in) Claude Code sessions are resumed in the panes they ran in.
 
@@ -82,7 +83,8 @@ Without TPM: clone the repo, run `cargo build --release` in it, and add
 1. Install as above and wait for the build (a minute or so).
 2. `prefix .` opens the popup. Type to filter, `↑`/`↓` to move, `⏎` to
    switch, `F1` for help, `Esc` (or `prefix .` again) to close.
-3. `prefix e` toggles the sidebar in the current window.
+3. `prefix e` pins a sidebar to every window of the current session;
+   `prefix E` toggles one in the current window.
 4. For agent status, add the [Claude Code hooks](#claude-code-hooks).
 
 ## Configuration
@@ -94,8 +96,8 @@ feature runs. Shown with their defaults:
 set -g @home-keys '.'               # prefix keys for the popup; '' binds nothing
 set -g @home-preview-history 2000   # scrollback lines the preview captures (0: screen only)
 set -g @home-preview-pct ''         # preview size, % of list+preview; unset: auto (M-j/M-k/M-= set it)
-set -g @home-sidebar-keys 'e E'     # sidebar: this window, whole session ('' = none, '-' skips one)
-set -g @home-sidebar-width 32       # columns, or a percentage (20%)
+set -g @home-sidebar-keys 'e E'     # sidebar: pin the session, toggle this window ('' = none, '-' skips one)
+set -g @home-sidebar-width 32       # columns, or a percentage (20%); until you resize one by hand
 set -g @home-sidebar-side left      # or right
 set -g @home-sidebar-auto off       # on: a sidebar in every new window
 set -g @home-sidebar-exclude ''     # sessions auto-create skips (space-separated)
@@ -103,9 +105,11 @@ set -g @home-restore-agents off     # on: resume Claude Code sessions after a re
 set -g @home-restore-agents-delay 2 # seconds between resumed sessions
 ```
 
-State (the closed-window stack, logs) lives in
+State (the closed-window stack, the pinned sessions, the sidebar width set
+by hand, logs) lives in
 `${XDG_STATE_HOME:-~/.local/state}/tmux-home/<server key>/`, one directory
-per tmux server; `TMUX_HOME_STATE_DIR` overrides the root.
+per tmux server (the key is its socket path, so a restarted server finds
+it again); `TMUX_HOME_STATE_DIR` overrides the root.
 
 ## How it runs
 
@@ -553,14 +557,41 @@ is gone. The popup stays open with the cursor on it. The stack lives in
 
 ## Sidebar
 
-`prefix e` toggles a sidebar in the current window; `prefix E` toggles one
-in every window of the current session (on in every window lacking one if
-any does, else off everywhere; other sessions are never touched). From a
-shell or your own binding: `tmux-home sidebar-toggle [--session] [--window
-<target>]`.
+`prefix e` pins the current session's sidebars: every window of it gets
+one, and so does every window made in it from then on (at once, as the
+daemon sees it). `prefix e` again unpins it and removes all its sidebars.
+`prefix E` toggles the sidebar in the current window only. Other sessions
+are never touched. From a shell or your own binding: `tmux-home
+sidebar-toggle [--pin] [--window <target>]` (`--session` is the old name of
+`--pin`).
 
-The sidebar is a narrow pane (`@home-sidebar-width`, default 32 columns,
-at the `@home-sidebar-side` edge, full height):
+In a pinned session, a sidebar closed by hand (`prefix E`, `q`, or killed
+any other way) stays closed in that window — it is marked
+`@home_sidebar_off` — until the session is pinned again, which gives every
+window one. A window linked into several sessions has a sidebar while any
+of them is pinned: unpinning one session leaves the sidebar of a window
+another pinned session holds.
+
+Pins are kept by session name, in the session option `@home_sidebar_pin`
+and in the state dir's `pins` file (one name per line). After a restart,
+once the restore is done (the same point auto-create waits for, below), the
+daemon pins the sessions named there again, and gives their windows that
+lack one a sidebar (none is added while a restore may be running). A pinned
+session's rename is written to the file; one killed while the server lives
+on is dropped from it. (The per-window "closed by hand" marks don't survive
+a server restart: tmux-resurrect doesn't save window options.)
+
+The sidebar is a narrow pane, full height at the `@home-sidebar-side` edge,
+32 columns wide or as `@home-sidebar-width` says — until you resize one by
+hand (mouse drag, `resize-pane`). Once its width has held for a moment
+(0.7 s, so a drag isn't fought), it becomes the width of every sidebar, as a
+percentage of the window: the others are resized to it, new ones are made
+at it, and a window that changes size gets its sidebar set back to it. The
+percentage is stored in the state dir's `sidebar-width` (`25%`) and wins
+over `@home-sidebar-width` from then on; delete the file to go back to the
+option. A change of one column, a resize of the whole window, and the space
+a closing pane hands the sidebar don't count as resizing it by hand (the
+last two set it back to the width):
 
 ```
 ─ NEEDS YOU ───────────────────
@@ -607,14 +638,16 @@ tmux-agent-sidebar's `@pane_role` panes).
 With `@home-sidebar-auto on`, the daemon adds a sidebar to each window
 created from then on, except in sessions named in `@home-sidebar-exclude`
 (e.g. `scratch`). Each window is decided once, when the daemon first sees
-it, so closing one with `prefix e` sticks. Auto-create starts only once the
+it, so closing one with `prefix E` sticks. Auto-create starts only once the
 server is past its start-up: at least 30 seconds old, its windows and panes
 unchanged for 5 seconds, and, with `@continuum-restore on`, the restore done
 (see below; at most 60 seconds' wait). Windows that exist at that moment
 never get one. (A restore creates windows and later selects panes and types
 commands into them by index; a sidebar added in between would shift them.)
+Pinned sessions don't wait for any of this (only for a restore to finish),
+and `@home-sidebar-exclude` doesn't apply to them: pinning is explicit.
 A sidebar first seen by the daemon (a restored one keeps its saved width) is
-set to `@home-sidebar-width`. When a window's last other pane exits, the
+set to the sidebar width. When a window's last other pane exits, the
 daemon closes its sidebar, so no window is left holding only a sidebar; a
 window with two tmux-home sidebars keeps the older one.
 
@@ -640,7 +673,9 @@ default `ps` strategy saves the command lines of a pane process's children,
 so it saves `<path>/tmux-home sidebar --managed`, which `~tmux-home sidebar`
 (a substring match) restores by typing it into the restored shell. The
 sidebar then marks its own pane, so nothing else is needed; `q` on a
-restored one closes the whole pane.
+restored one closes the whole pane. Pinned sessions are pinned again after
+the restore (see [Sidebar](#sidebar)); their restored sidebars count, so a
+window gets a new one only if it came back without.
 
 #### Resuming Claude Code sessions
 
@@ -693,8 +728,15 @@ Its keys and hooks override tmux-home's: remove its `@plugin` line, any
 `bind E …` of your own that runs its toggle (e.g. a session-scoped
 `tmux-sidebar-session` script), and any `after-new-window` /
 `after-new-session` hooks that run `toggle --create-only`; those bound after
-TPM win over the `e`/`E` tmux-home binds. Then set `@home-sidebar-auto on`
-and `@home-sidebar-exclude` instead.
+TPM win over the `e`/`E` tmux-home binds. Then pin the sessions you want
+sidebars in with `prefix e`, or set `@home-sidebar-auto on` and
+`@home-sidebar-exclude` for every new window.
+
+Coming from an earlier tmux-home: `prefix e` and `prefix E` swapped roles.
+`e` (the first of `@home-sidebar-keys`) used to toggle the window and now
+pins the session; `E` (the second) used to toggle every window of the
+session once and now toggles the window. A custom `@home-sidebar-keys`
+keeps its keys with the new meanings, so swap them to keep the old feel.
 
 ## Tests
 

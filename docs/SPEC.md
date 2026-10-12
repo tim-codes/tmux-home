@@ -337,6 +337,10 @@ Only what the primary user needs; more when someone asks.
 | `@home-keys` | `w f` (space-separated prefix keys; empty = bind nothing) |
 | `@home-preview` | `auto` (`right`, `bottom`, `off`) |
 | `@home-preview-pct` | unset = auto size (§5); 1–99 = the preview's % of the list+preview area, written by `M-j`/`M-k`, unset by `M-=` |
+| `@home-sidebar-keys` | `e E` (pin/unpin the session's sidebars; toggle the window's, §12) |
+| `@home-sidebar-width` | `32` (columns or `N%`; a width set by hand, stored as `N%`, wins over it) |
+| `@home-sidebar-side` | `left` (`right`) |
+| `@home-sidebar-auto` / `-exclude` | `off` / empty (a sidebar in new windows, except these sessions) |
 | `@home-restore-agents` | `off` (`on`: resume Claude Code sessions after a resurrect restore, §12) |
 | `@home-restore-agents-delay` | `2` (seconds between resumed launches) |
 
@@ -398,6 +402,18 @@ this section, and §7, §8, §10 and §13 where they conflict.
 - Sidebar panes (`@pane_role=sidebar`) are never the row's pane, never
   previewed, never close-checked and never part of a reopen shape. A job
   stopped with `^z` makes its pane busy.
+- Sidebar (`tmux-home sidebar`, design §8): `prefix e` pins the session
+  (`sidebar-toggle --pin`): a sidebar in every window of it, new windows
+  included, at once (never mid-restore); a window whose sidebar is closed by
+  hand is marked `@home_sidebar_off` and keeps none until the session is
+  pinned again; unpinning removes the session's sidebars, except in a window
+  linked into another pinned session. Pins are the session option
+  `@home_sidebar_pin` plus `<state root>/<server key>/pins` (names), which
+  the daemon re-applies once a restore is done. `prefix E` toggles the
+  window's sidebar. A sidebar resized by hand (its width changed, its
+  window's width and panes not, not by the daemon, held 700 ms, more than a
+  column) sets every sidebar's width as a percentage of its window, stored
+  in `sidebar-width` beside `pins`; window resizes re-apply it.
 - Git badges (pass 5b) come from the daemon's git task (`src/daemon/git.rs`)
   over a vendored copy of stray's git layer (`src/git/`), published as the
   snapshot's `git` section: repo root → status, pane cwd → root. Git runs
