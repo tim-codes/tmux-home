@@ -81,7 +81,7 @@ fn newline_in_pane_path_round_trips() {
 fn unparseable_record_is_skipped() {
     let opts = "\x1f".repeat(tmux_home::agent::OPTIONS.len());
     let good = format!(
-        "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1f\x1f/dev/ttys9\x1f\x1f0\x1f0\x1f80\x1f24\x1f80\x1f24\x1f{opts}alpha\x1ft\x1fw\x1e\n"
+        "$0\x1f@0\x1f0\x1f1\x1f0\x1f%0\x1f0\x1f1\x1fsh\x1f/\x1f\x1f/dev/ttys9\x1f\x1f0\x1f0\x1f80\x1f24\x1f80\x1f24\x1f1\x1f\x1f{opts}alpha\x1ft\x1fw\x1e\n"
     );
     let panes = format!("garbage\x1e\n{good}");
     let snap = tmux_home::tmux::snapshot::parse(&panes, "also garbage\x1e\n");
@@ -89,7 +89,34 @@ fn unparseable_record_is_skipped() {
     assert_eq!(snap.panes[0].tty, "/dev/ttys9");
     assert_eq!((snap.panes[0].width, snap.panes[0].height), (80, 24));
     assert_eq!(snap.windows[0].name, "w");
+    assert!(snap.sessions[0].pinned, "@home_sidebar_pin");
+    assert!(!snap.windows[0].sidebar_off, "@home_sidebar_off");
     assert!(snap.clients.is_empty());
+}
+
+/// A session's pin is its own (a linked window's panes, listed once per
+/// session, see each session's); a window's off mark is the window's.
+#[test]
+fn sidebar_pin_and_off_marks_are_read() {
+    let _env = common::TestEnv::new();
+    let s = common::TestServer::start();
+    s.tmux(&["new-session", "-d", "-s", "beta", "-x", "200", "-y", "50"]);
+    s.tmux(&["link-window", "-d", "-s", "alpha:0", "-t", "beta:5"]);
+    s.tmux(&["set-option", "-t", "alpha", "@home_sidebar_pin", "1"]);
+    s.tmux(&["set-option", "-w", "-t", "beta:0", "@home_sidebar_off", "1"]);
+    let snap = read_snapshot(&Tmux::new(s.socket.clone())).unwrap();
+    let pinned: Vec<(&str, bool)> = snap
+        .sessions
+        .iter()
+        .map(|x| (x.name.as_str(), x.pinned))
+        .collect();
+    assert_eq!(pinned, [("alpha", true), ("beta", false)]);
+    let off: Vec<(u32, bool)> = snap
+        .windows
+        .iter()
+        .map(|w| (w.index, w.sidebar_off))
+        .collect();
+    assert_eq!(off, [(0, false), (0, true), (5, false)]);
 }
 
 #[test]
