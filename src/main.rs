@@ -40,11 +40,14 @@ enum Cmd {
         #[arg(long)]
         managed: bool,
     },
-    /// Add or remove a sidebar in a window (default: $TMUX_PANE's).
+    /// Add or remove a sidebar in a window (default: $TMUX_PANE's), or
+    /// with --pin pin or unpin its session's sidebars.
     SidebarToggle {
-        /// Every window of the window's session: on if any lacks one, else off.
-        #[arg(long)]
-        session: bool,
+        /// Pin the window's session (a sidebar in every window of it, new
+        /// ones included, kept across restarts), or unpin it (its sidebars
+        /// go). `--session` is the old name.
+        #[arg(long, alias = "session")]
+        pin: bool,
         /// The window (any tmux target, e.g. `$1:@3`).
         #[arg(long)]
         window: Option<String>,
@@ -110,10 +113,10 @@ fn main() -> anyhow::Result<()> {
             return tmux_home::sidebar::run(socket, managed);
         }
         Cmd::SidebarToggle {
-            session,
+            pin,
             window,
             socket,
-        } => return tmux_home::sidebar::toggle(socket, session, window),
+        } => return tmux_home::sidebar::toggle(socket, pin, window),
         Cmd::Query { socket, json: _ } => return tmux_home::client::query(socket),
         Cmd::AgentsSnapshot { socket } => return tmux_home::restore::snapshot_cli(socket),
         Cmd::RestoreAgents { socket, worker } => {

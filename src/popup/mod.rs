@@ -1133,6 +1133,7 @@ mod tests {
     fn snap() -> Snapshot {
         let mut s = Snapshot::default();
         s.sessions.push(Session {
+            pinned: false,
             id: "$0".into(),
             name: "alpha".into(),
             attached: 1,
@@ -1142,6 +1143,7 @@ mod tests {
             .enumerate()
         {
             s.windows.push(Window {
+                sidebar_off: false,
                 id: format!("@{i}"),
                 session_id: "$0".into(),
                 index: i as u32,
@@ -1246,6 +1248,7 @@ mod tests {
         use crate::agent::tests::pane;
         let mut s = Snapshot::default();
         s.sessions.push(Session {
+            pinned: false,
             id: "$0".into(),
             name: "dev".into(),
             attached: 1,
@@ -1284,6 +1287,7 @@ mod tests {
         ];
         for (i, name) in ["fix", "api", "old", "shell"].into_iter().enumerate() {
             s.windows.push(Window {
+                sidebar_off: false,
                 id: format!("@{i}"),
                 session_id: "$0".into(),
                 index: i as u32,
@@ -1620,11 +1624,13 @@ mod tests {
         let mut s = agent_snap();
         for (sid, name) in [("$1", "beta"), ("$2", "zeta")] {
             s.sessions.push(Session {
+                pinned: false,
                 id: sid.into(),
                 name: name.into(),
                 attached: 0,
             });
             s.windows.push(Window {
+                sidebar_off: false,
                 id: format!("@{sid}"),
                 session_id: sid.into(),
                 index: 0,

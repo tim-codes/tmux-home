@@ -1375,6 +1375,7 @@ mod tests {
         let mut s = Snapshot::default();
         for (sid, name) in [("$0", "alpha"), ("$1", "beta")] {
             s.sessions.push(Session {
+                pinned: false,
                 id: sid.into(),
                 name: name.into(),
                 attached: 0,
@@ -1390,6 +1391,7 @@ mod tests {
         .enumerate()
         {
             s.windows.push(Window {
+                sidebar_off: false,
                 id: wid.into(),
                 session_id: sid.into(),
                 index: idx,
@@ -1858,6 +1860,7 @@ mod tests {
     fn with_made() -> Snapshot {
         let mut made = snap();
         made.windows.push(Window {
+            sidebar_off: false,
             id: "@7".into(),
             session_id: "$0".into(),
             index: 2,
@@ -1927,6 +1930,7 @@ mod tests {
         assert_eq!(under, "@1");
         // a window appears above it: the selection follows its row
         s.windows.push(Window {
+            sidebar_off: false,
             id: "@8".into(),
             session_id: "$0".into(),
             index: 0,

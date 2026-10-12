@@ -704,6 +704,7 @@ mod tests {
 
     fn win(id: &str, active: bool) -> Window {
         Window {
+            sidebar_off: false,
             id: id.into(),
             session_id: "$0".into(),
             index: id[1..].parse().unwrap(),
