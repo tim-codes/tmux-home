@@ -946,3 +946,96 @@ fn a_width_set_by_hand_spreads_as_a_percentage() {
     assert_eq!(read_state(&s, "sidebar-width"), "25%\n", "nothing learned");
     assert_eq!(width("alpha:1"), "50", "nor spread");
 }
+
+/// The same with a pane border status line (`pane-border-status top`):
+/// tmux takes a row of the window for it, so no pane is the window's full
+/// height — a sidebar still is as tall as its window's panes go, and a
+/// width set by hand on it must still be learned and spread.
+#[test]
+fn a_width_set_by_hand_spreads_under_a_pane_border_status() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    s.tmux(&["set-option", "-g", "pane-border-status", "top"]);
+    s.tmux(&["set-option", "-g", "@home-sidebar-width", "40"]);
+    s.tmux(&[
+        "set-environment",
+        "-g",
+        "TMUX_HOME_SIDEBAR_SETTLE_MS",
+        "300",
+    ]);
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    s.tmux(&["new-session", "-d", "-s", "beta", "-x", "100", "-y", "50"]);
+    install_binding(&s);
+    for w in ["alpha:0", "alpha:1", "beta:0"] {
+        toggle(&s, &["--window", w]);
+    }
+    let side = |w: &str| sidebars(&s, w)[0].clone();
+    let width = |w: &str| fmt(&s, &side(w), "#{pane_width}");
+    assert_eq!(
+        fmt(&s, &side("alpha:0"), "#{pane_top} #{pane_height}"),
+        "1 49",
+        "the border status takes the top row"
+    );
+    std::thread::sleep(Duration::from_millis(1200)); // the daemon has seen them
+    // by hand: 50 of 200
+    s.tmux(&["resize-pane", "-t", &side("alpha:0"), "-x", "50"]);
+    wait_until("alpha:1's sidebar at 25%", || width("alpha:1") == "50");
+    wait_until("beta's at 25% of 100", || width("beta:0") == "25");
+    assert_eq!(read_state(&s, "sidebar-width"), "25%\n");
+}
+
+/// A percentage width is a share of each window, kept as the client (and
+/// so the window) resizes: the sidebar stretches with it, and every window
+/// of the session, once shown at the new size, has the same width.
+#[test]
+fn a_percentage_width_follows_the_client_size_into_every_window() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    s.tmux(&["set-option", "-g", "pane-border-status", "top"]);
+    s.tmux(&["set-option", "-g", "@home-sidebar-width", "20%"]);
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    install_binding(&s);
+    for w in ["alpha:0", "alpha:1", "alpha:2"] {
+        toggle(&s, &["--window", w]);
+    }
+    let side = |w: &str| sidebars(&s, w)[0].clone();
+    let width = |w: &str| fmt(&s, &side(w), "#{pane_width}");
+    // 20% of the window, to the nearest column
+    let share = |w: &str| {
+        let ww: u32 = fmt(&s, w, "#{window_width}").parse().unwrap();
+        ((ww * 20 + 50) / 100).to_string()
+    };
+    let o = Outer::attach(&s, "alpha:0", 150, 40);
+    wait_until("alpha:0 at the client's width", || {
+        fmt(&s, "alpha:0", "#{window_width}") == "150"
+    });
+    wait_until("alpha:0's sidebar at 20% of 150", || {
+        width("alpha:0") == "30"
+    });
+    // the client widens: the window with it, and its sidebar
+    o.tmux(&["resize-window", "-t", "outer", "-x", "220"]);
+    wait_until("alpha:0 at 220", || {
+        fmt(&s, "alpha:0", "#{window_width}") == "220"
+    });
+    wait_until("alpha:0's sidebar at 20% of 220", || {
+        width("alpha:0") == "44"
+    });
+    // hopping to the other windows: each sized to the client, and its
+    // sidebar to the same width
+    for w in ["alpha:1", "alpha:2", "alpha:0"] {
+        s.tmux(&["select-window", "-t", w]);
+        wait_until(&format!("{w} at 220"), || {
+            fmt(&s, w, "#{window_width}") == "220"
+        });
+        wait_until(&format!("{w}'s sidebar at 20% of 220"), || {
+            width(w) == share(w) && width(w) == "44"
+        });
+    }
+    // and narrower again
+    o.tmux(&["resize-window", "-t", "outer", "-x", "120"]);
+    wait_until("alpha:0's sidebar at 20% of 120", || {
+        width("alpha:0") == "24"
+    });
+    drop(o);
+}
