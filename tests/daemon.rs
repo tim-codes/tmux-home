@@ -225,19 +225,25 @@ async fn stale_socket_file_is_replaced() {
     d.abort();
 }
 
+/// A request as raw JSON (fields a typed `Request` doesn't spell, such
+/// as `current`), and the daemon's first reply.
+async fn ask_raw(p: &Paths, json: &str) -> Option<Reply> {
+    use tokio::io::AsyncWriteExt;
+    let s = connect(p).await;
+    let (r, mut w) = s.into_split();
+    w.write_all(format!("{json}\n").as_bytes()).await.unwrap();
+    read_msg(&mut BufReader::new(r)).await.unwrap()
+}
+
+/// A client of another build whose own binary is still the one on disk
+/// (`current`: a newer build, or a development build) replaces the daemon.
 #[tokio::test]
 async fn version_mismatch_restarts() {
     let _env = common::TestEnv::new();
     let s = common::TestServer::start();
     let p = Paths::for_socket(&s.socket).unwrap();
     let d = tokio::spawn(tmux_home::daemon::run(s.socket.clone(), SourceKind::Poll));
-    let reply = ask(
-        &p,
-        Request::Query {
-            v: "0.0.0-old".into(),
-        },
-    )
-    .await;
+    let reply = ask_raw(&p, r#"{"op":"query","v":"0.0.0-new","current":true}"#).await;
     assert!(matches!(reply, Some(Reply::Restart)));
     tokio::time::timeout(Duration::from_secs(2), d)
         .await
@@ -245,6 +251,45 @@ async fn version_mismatch_restarts() {
         .unwrap()
         .unwrap();
     assert!(!p.sock.exists());
+}
+
+/// The rebuild loop: a long-running client (a sidebar) still runs the
+/// build that was on disk when it started, and its binary has since been
+/// rebuilt. The daemon, started from the new binary, must not exit for it
+/// (its replacement would be the same new build, which the old client
+/// would turn away again, and so on, for good); it tells the client it is
+/// stale and goes on serving. A client from before `current` existed
+/// counts as stale too: it can only be older.
+#[tokio::test]
+async fn a_stale_client_does_not_restart_the_daemon() {
+    let _env = common::TestEnv::new();
+    let s = common::TestServer::start();
+    let p = Paths::for_socket(&s.socket).unwrap();
+    let d = tokio::spawn(tmux_home::daemon::run(s.socket.clone(), SourceKind::Poll));
+    let epoch = |r: Option<Reply>| match r {
+        Some(Reply::Snapshot { epoch, .. }) => epoch,
+        other => panic!("expected a snapshot, got {other:?}"),
+    };
+    let before = epoch(ask(&p, Request::Query { v: v() }).await);
+    for json in [
+        r#"{"op":"subscribe","v":"0.0.0-old","client":"sidebar","current":false}"#,
+        r#"{"op":"subscribe","v":"0.0.0-old","client":"sidebar"}"#,
+        r#"{"op":"query","v":"0.0.0-old","current":false}"#,
+    ] {
+        let reply = ask_raw(&p, json).await;
+        assert!(
+            !matches!(reply, Some(Reply::Restart)),
+            "{json}: a stale client must not restart the daemon"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!d.is_finished(), "{json}: the daemon exited");
+        assert_eq!(
+            epoch(ask(&p, Request::Query { v: v() }).await),
+            before,
+            "{json}: the same daemon goes on serving"
+        );
+    }
+    d.abort();
 }
 
 /// A server with no sessions yet (TPM runs tmux-home.tmux from tmux.conf,

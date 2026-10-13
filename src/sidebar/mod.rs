@@ -13,6 +13,11 @@
 //! sidebar` in, from `@resurrect-processes`) is a sidebar again too.
 //! Everything that walks windows (the popup's rows, `^x`'s close check,
 //! `^t`'s reopen snapshot, the git task) skips sidebar panes.
+//!
+//! A sidebar outlives rebuilds of its binary: once one replaced it on disk
+//! (`selfexe::replaced`), the sidebar execs the new binary in its own place
+//! (same arguments, same PID and pane) rather than run on as the old build,
+//! which the new build's daemon won't serve (see `run`).
 
 pub mod model;
 pub mod state;
@@ -21,14 +26,14 @@ pub mod view;
 use crate::{
     client,
     ops::Tx,
-    popup::{fresh::Stamp, spawn_feed},
+    popup::{Feed, fresh::Stamp, spawn_feed},
     tmux::Tmux,
 };
 use model::{Entry, Sel};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc::TryRecvError,
+    sync::mpsc::{self, TryRecvError},
     time::Duration,
 };
 
@@ -146,12 +151,9 @@ pub fn global_option(t: &Tmux, name: &str) -> String {
 }
 
 /// The binary a new sidebar pane runs: `TMUX_HOME_BIN` (tests), else this
-/// executable.
+/// executable's path (`client::own_bin`).
 pub fn sidebar_bin() -> PathBuf {
-    std::env::var_os("TMUX_HOME_BIN")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok())
-        .unwrap_or_else(|| PathBuf::from("tmux-home"))
+    client::own_bin().unwrap_or_else(|_| PathBuf::from("tmux-home"))
 }
 
 /// `split-window` arguments that add a sidebar to `window`: full height,
@@ -421,6 +423,9 @@ fn toggle_pin(t: &Tmux, sid: &str, name: &str) -> anyhow::Result<()> {
 /// How often the sidebar looks for input and snapshots.
 const TICK: Duration = Duration::from_millis(100);
 
+/// How often the sidebar looks whether a rebuild replaced its binary.
+const SELF_CHECK: Duration = Duration::from_secs(1);
+
 /// Seconds after the server starts before a sidebar starts a daemon
 /// (`TMUX_HOME_SIDEBAR_REVIVE_AGE`, default 15): restored sidebars start
 /// early in a restore, and the plugin starts the daemon later on purpose.
@@ -539,27 +544,73 @@ pub fn run(socket: Option<PathBuf>, managed: bool) -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.trim().parse().ok());
     let feed = spawn_feed(socket.clone(), "sidebar", start.map(|s| s + revive_age()));
+    // A rebuild replaced the binary this sidebar runs: it is the old build
+    // now, which the daemon (the new build, the one on disk) won't serve.
+    // It replaces itself with the new binary, same arguments, same PID, so
+    // the pane goes on (its screen is redrawn). If that fails it goes on
+    // as it is, without looking again.
+    let mut check_self = true;
+    loop {
+        match run_screen(&t, &socket, &me, managed, &home, &feed, check_self) {
+            Ok(Exit::Replaced) => {
+                client::note(&socket, &format!("sidebar {me}: binary replaced, re-exec"));
+                let e = crate::selfexe::reexec();
+                client::note(&socket, &format!("sidebar {me}: re-exec failed: {e}"));
+                check_self = false;
+            }
+            Ok(Exit::Done) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Why `run_screen` returned.
+enum Exit {
+    /// `q`, or the server went.
+    Done,
+    /// A rebuild replaced this process's binary.
+    Replaced,
+}
+
+/// The sidebar's screen and event loop, between `ratatui::init` and
+/// `ratatui::restore`.
+fn run_screen(
+    t: &Tmux,
+    socket: &Path,
+    me: &str,
+    managed: bool,
+    home: &str,
+    feed: &mpsc::Receiver<Feed>,
+    check_self: bool,
+) -> anyhow::Result<Exit> {
     let mut term = ratatui::init();
-    let result = (|| -> anyhow::Result<()> {
+    let mut checked = std::time::Instant::now();
+    let result = (|| -> anyhow::Result<Exit> {
         let mut m = model::Model::default();
         let mut sel: Option<Sel> = None;
         let mut live = false;
         let mut dirty = true;
         loop {
+            if check_self && checked.elapsed() >= SELF_CHECK {
+                checked = std::time::Instant::now();
+                if crate::selfexe::replaced() {
+                    return Ok(Exit::Replaced);
+                }
+            }
             let mut latest = None;
             loop {
                 match feed.try_recv() {
                     Ok(f) => latest = Some(f),
                     Err(TryRecvError::Empty) => break,
                     // the feed ends when the server has gone
-                    Err(TryRecvError::Disconnected) => return Ok(()),
+                    Err(TryRecvError::Disconnected) => return Ok(Exit::Done),
                 }
             }
             if let Some(f) = latest {
                 let now_live = matches!(f.stamp, Stamp::Live { .. });
                 dirty |= now_live != live;
                 live = now_live;
-                let next = model::Model::build(&f.snap, &me, &home);
+                let next = model::Model::build(&f.snap, me, home);
                 // focus in: start on the sidebar's own window; focus out:
                 // drop the selection (only on a change: a key may beat
                 // the snapshot that shows the focus arriving)
@@ -591,13 +642,13 @@ pub fn run(socket: Option<PathBuf>, managed: bool) -> anyhow::Result<()> {
                         Some(Key::Go) => {
                             let s = sel.take().or_else(|| m.here());
                             if let Some(e) = s.as_ref().and_then(|s| m.entry(s)) {
-                                go(&t, &socket, &me, e);
+                                go(t, socket, me, e);
                             }
                             dirty = true;
                         }
                         Some(Key::Back) => {
                             sel = None;
-                            give_back(&t, &me);
+                            give_back(t, me);
                             dirty = true;
                         }
                         Some(Key::Quit) => {
@@ -606,10 +657,10 @@ pub fn run(socket: Option<PathBuf>, managed: bool) -> anyhow::Result<()> {
                             // closed on purpose, so a pinned session
                             // leaves its window without one
                             if managed {
-                                let _ = t.run(&["set-option", "-w", "-t", &me, OFF_OPTION, "1"]);
-                                let _ = t.run(&["kill-pane", "-t", &me]);
+                                let _ = t.run(&["set-option", "-w", "-t", me, OFF_OPTION, "1"]);
+                                let _ = t.run(&["kill-pane", "-t", me]);
                             }
-                            return Ok(());
+                            return Ok(Exit::Done);
                         }
                         None => {}
                     },

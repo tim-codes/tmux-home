@@ -1,10 +1,16 @@
 //! Talking to the daemon, and what to do when it can't serve: the one
 //! spawn/degraded path, shared by `query`, `status` and the popup. All of it
 //! is synchronous (std sockets, std processes): only the daemon runs tokio.
+//!
+//! Every request says whether this process's binary is still the one on
+//! disk (`selfexe`), which decides who gives way on a build mismatch (see
+//! `ipc::Envelope`): `Restart` (the daemon was the old build and is exiting;
+//! start the new one) or `Stale` (this process is the old build; the daemon
+//! goes on, and nothing is started).
 
 use crate::{
     BUILD_ID,
-    ipc::{Reply, Request, read_msg_sync, write_msg_sync},
+    ipc::{Envelope, Reply, Request, read_msg_sync, write_msg_sync},
     paths::Paths,
     tmux::{
         Tmux,
@@ -81,12 +87,24 @@ pub enum Answer {
     },
     /// A daemon of another build answered; it is exiting.
     Restart,
+    /// A daemon of another build answered, and this process's binary has
+    /// been replaced on disk: this process is the stale build. The daemon
+    /// goes on serving; don't start another.
+    Stale,
     /// No daemon, no reply within the budget, or an error reply.
     Down,
 }
 
-/// Sends `req` and waits up to `budget` for the first reply.
+/// Sends `req` and waits up to `budget` for the first reply. The request
+/// says whether this process's binary is still the one on disk
+/// (`selfexe::replaced`): on a build mismatch, that decides which side
+/// gives way (see `ipc::Envelope`).
 pub fn ask(tmux_socket: &Path, req: &Request, budget: Duration) -> Answer {
+    ask_as(tmux_socket, req, !crate::selfexe::replaced(), budget)
+}
+
+/// `ask`, saying `current` whatever the binary on disk is.
+pub fn ask_as(tmux_socket: &Path, req: &Request, current: bool, budget: Duration) -> Answer {
     let Ok(p) = Paths::for_socket(tmux_socket) else {
         return Answer::Down;
     };
@@ -94,7 +112,7 @@ pub fn ask(tmux_socket: &Path, req: &Request, budget: Duration) -> Answer {
         let s = UnixStream::connect(&p.sock)?;
         s.set_write_timeout(Some(budget))?;
         s.set_read_timeout(Some(budget))?;
-        write_msg_sync(&mut &s, req)?;
+        write_msg_sync(&mut &s, &Envelope { req, current })?;
         let mut r = BufReader::new(s.try_clone()?);
         let reply = read_msg_sync(&mut r)?;
         // a subscription then waits for pushes indefinitely (macOS refuses
@@ -112,20 +130,40 @@ pub fn ask(tmux_socket: &Path, req: &Request, budget: Duration) -> Answer {
             },
         },
         Ok((Some(Reply::Restart), _)) => Answer::Restart,
+        Ok((Some(Reply::Stale), _)) => Answer::Stale,
         _ => Answer::Down,
     }
 }
 
-/// Spawn a detached daemon for `tmux_socket`. Uses `TMUX_HOME_BIN` if set
-/// (tests: `current_exe()` is the test binary, not `tmux-home`), else the
-/// current executable. The daemon's stderr is appended to
-/// `<state_dir>/daemon.log` (state dir created 0700) so its errors survive;
-/// if that can't be opened, stderr is discarded rather than failing the spawn.
+/// The binary to start for a daemon: `TMUX_HOME_BIN` if set (tests:
+/// `current_exe()` is the test binary, not `tmux-home`), else this
+/// process's binary path (`selfexe`: the path it started from, where a
+/// rebuild puts the new build; on Linux `current_exe()` names the deleted
+/// old file once it has been replaced).
+pub fn own_bin() -> anyhow::Result<PathBuf> {
+    if let Some(b) = std::env::var_os("TMUX_HOME_BIN") {
+        return Ok(b.into());
+    }
+    match crate::selfexe::get() {
+        Some(exe) => Ok(exe.path().to_path_buf()),
+        None => Ok(std::env::current_exe()?),
+    }
+}
+
+/// Spawn a detached daemon for `tmux_socket`, from `own_bin()`. The
+/// daemon's stderr is appended to `<state_dir>/daemon.log` (state dir
+/// created 0700) so its errors survive; if that can't be opened, stderr is
+/// discarded rather than failing the spawn.
+///
+/// The daemon is not this process's child: a `/bin/sh` starts it in the
+/// background and exits at once (waited for here), so the daemon is
+/// reparented to init. A long-running client (a sidebar) would otherwise
+/// keep every daemon it ever started as a `<defunct>` child once that one
+/// exited, since it never waits for them.
 pub fn spawn_daemon(tmux_socket: &Path) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
-    let bin = std::env::var_os("TMUX_HOME_BIN")
-        .map(PathBuf::from)
-        .map_or_else(std::env::current_exe, Ok)?;
+    let bin = own_bin()?;
+    anyhow::ensure!(bin.is_file(), "no binary at {}", bin.display());
     let stderr = match daemon_log(tmux_socket) {
         Ok(f) => Stdio::from(f),
         Err(e) => {
@@ -133,16 +171,26 @@ pub fn spawn_daemon(tmux_socket: &Path) -> anyhow::Result<()> {
             Stdio::null()
         }
     };
-    std::process::Command::new(bin)
-        .arg("daemon")
-        .arg("--socket")
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#""$0" daemon --socket "$1" &"#)
+        .arg(bin)
         .arg(tmux_socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
         .process_group(0)
-        .spawn()?;
+        .status()?;
+    anyhow::ensure!(status.success(), "daemon launcher failed: {status}");
     Ok(())
+}
+
+/// Appends `line` to `<state_dir>/daemon.log`, best effort.
+pub fn note(tmux_socket: &Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = daemon_log(tmux_socket) {
+        let _ = writeln!(f, "tmux-home: {line}");
+    }
 }
 
 /// Moves `log` to `<log>.1` (replacing an older one) once it holds `cap`
@@ -205,6 +253,8 @@ pub fn snapshot(tmux_socket: &Path, budget: Duration) -> anyhow::Result<(Snapsho
         Answer::Snapshot { data, .. } => return Ok((data, true)),
         Answer::Restart => revive(tmux_socket, true),
         Answer::Down => revive(tmux_socket, false),
+        // the daemon is up, it just isn't this build
+        Answer::Stale => {}
     }
     let snap = read_snapshot(&Tmux::new(tmux_socket.to_path_buf()))?;
     Ok((snap, false))
@@ -249,7 +299,7 @@ pub fn status(socket: Option<PathBuf>) -> anyhow::Result<()> {
             }
             false
         }
-        Answer::Down => false,
+        Answer::Down | Answer::Stale => false,
     };
     println!("{}", if up { "●" } else { "○" });
     Ok(())

@@ -100,6 +100,9 @@ enum Cmd {
 }
 
 fn main() -> anyhow::Result<()> {
+    // before anything else: which binary this is, so a later rebuild of it
+    // can be noticed (see `selfexe`)
+    tmux_home::selfexe::init();
     // The hook bypasses clap: it must exit 0 whatever its arguments are.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("hook") {

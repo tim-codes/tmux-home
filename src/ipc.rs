@@ -2,8 +2,8 @@ use crate::tmux::snapshot::Snapshot;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-/// `v` is the client's build ID (`crate::BUILD_ID`); a daemon of another
-/// build replies `Restart` and exits.
+/// `v` is the client's build ID (`crate::BUILD_ID`). What a daemon of
+/// another build does depends on which of the two is stale (`Envelope`).
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -17,6 +17,25 @@ pub enum Request {
     Refresh { v: String },
 }
 
+/// A request on the wire: the request, plus whether the client's binary
+/// is still the one on disk (`crate::selfexe`).
+///
+/// On a build mismatch the daemon exits (`Restart`) only when it is the
+/// stale one: its own binary was replaced on disk, or the client is
+/// `current` (a newer build, or a development build run on purpose). A
+/// client that isn't (`current: false`: a long-running client whose
+/// binary a rebuild replaced, or one from before this field, which can
+/// only be older) gets `Stale` and the daemon goes on serving: restarting
+/// it would start the on-disk build again, which the stale client would
+/// turn away again, for good. (`R`: a client sends a `&Request`.)
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Envelope<R = Request> {
+    #[serde(flatten)]
+    pub req: R,
+    #[serde(default)]
+    pub current: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
@@ -27,7 +46,11 @@ pub enum Reply {
         seq: u64,
         data: Snapshot,
     },
+    /// The daemon is of another build and is exiting: start the new one.
     Restart,
+    /// The client is of another build than the daemon and its binary has
+    /// been replaced on disk: it is the stale one. The daemon goes on.
+    Stale,
     Error {
         msg: String,
     },
@@ -124,5 +147,33 @@ mod tests {
             serde_json::to_string(&Reply::Restart).unwrap(),
             r#"{"type":"restart"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&Reply::Stale).unwrap(),
+            r#"{"type":"stale"}"#
+        );
+    }
+
+    /// The envelope adds `current` next to the request's own fields; a
+    /// request without it (an older client) reads as not current.
+    #[test]
+    fn envelope_wire_shape() {
+        let e = Envelope {
+            req: Request::Subscribe {
+                v: "1".into(),
+                client: "sidebar".into(),
+            },
+            current: true,
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            s,
+            r#"{"op":"subscribe","v":"1","client":"sidebar","current":true}"#
+        );
+        let back: Envelope = serde_json::from_str(&s).unwrap();
+        assert!(back.current);
+        assert!(matches!(back.req, Request::Subscribe { ref client, .. } if client == "sidebar"));
+        let old: Envelope = serde_json::from_str(r#"{"op":"query","v":"0.1.0"}"#).unwrap();
+        assert!(!old.current);
+        assert!(matches!(old.req, Request::Query { ref v } if v == "0.1.0"));
     }
 }
