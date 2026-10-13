@@ -1,8 +1,9 @@
 //! Drawing the sidebar: a narrow column (24–40 cells) in the popup's
 //! compact look. Each window of the session is a stacked row: line 1 is
 //! the marker, status icon (never colour alone), index and the name on
-//! the full remaining width; the tags (the agent's state word, the git
-//! badge's pieces) follow on lines indented to the name, wrapped by whole
+//! the full remaining width, then the agent's state word at the end of
+//! the line (the name is clipped first to keep it visible); the git
+//! badge's pieces follow on lines indented to the name, wrapped by whole
 //! pieces. The same at every width.
 
 use super::model::{Entry, Model, Sel};
@@ -72,13 +73,20 @@ fn name_at(index: usize) -> usize {
     index + 4
 }
 
-/// A row's tags, the second column's pieces: the agent's state word, then
-/// the git badge's pieces. Missing ones are simply absent.
-fn tags(e: &Entry) -> Vec<Span<'static>> {
+/// The agent's state word with its style, if the row has an agent.
+fn status_word(e: &Entry) -> Option<Span<'static>> {
+    let st = e.status?;
+    let style = if e.stale { dim() } else { status_style(st) };
+    Some(Span::styled(st.word(), style))
+}
+
+/// A row's tags, the second line's pieces: the git badge's pieces, led by
+/// the state word only when `with_status` (the line-1 word couldn't fit).
+/// Missing ones are simply absent.
+fn tags(e: &Entry, with_status: bool) -> Vec<Span<'static>> {
     let mut out = Vec::new();
-    if let Some(st) = e.status {
-        let style = if e.stale { dim() } else { status_style(st) };
-        out.push(Span::styled(st.word(), style));
+    if with_status {
+        out.extend(status_word(e));
     }
     for sp in e.git.as_ref().map(git::badge_spans).unwrap_or_default() {
         out.push(Span::styled(sp.content.trim_start().to_string(), sp.style));
@@ -115,30 +123,40 @@ fn wrap(pieces: Vec<Span<'static>>, room: usize) -> Vec<Vec<Span<'static>>> {
     lines
 }
 
-/// A window of the sidebar's session: `▌● 2 name` with the name on the
-/// full remaining width (clipped with `…` only if it still doesn't fit),
-/// then its tags on further lines indented to the name's first column,
-/// wrapped by whole pieces. A row without tags is one line. The here row
-/// is highlighted to the edge on every line.
+/// A window of the sidebar's session: `▌● 2 name status` with the agent's
+/// state word at the end of line 1 and the name on the rest of the width.
+/// The name is clipped with `…` first to keep the word visible; only when
+/// even a one-cell name (`…`) can't sit beside it does the word fall back
+/// to leading the tags below (name then on the full width, as for a row
+/// without an agent). The git tags follow on further lines indented to the
+/// name's first column, wrapped by whole pieces. A row without tags is one
+/// line. The here row is highlighted to the edge on every line.
 fn window_lines(e: &Entry, index: usize, width: usize) -> Vec<Line<'static>> {
     let at = name_at(index);
     let room = width.saturating_sub(at);
-    let name = if room == 0 {
+    let word = status_word(e).filter(|w| room >= w.width() + 2);
+    let name_room = word.as_ref().map_or(room, |w| room - w.width() - 1);
+    let name = if name_room == 0 {
         String::new()
     } else {
-        clip(&e.name, room)
+        clip(&e.name, name_room)
     };
     let name_style = if e.stale { dim() } else { Style::default() };
-    let mut lines = vec![Line::from(vec![
+    let mut first = vec![
         Span::styled(
             if e.here { "▌" } else { " " },
             Style::default().fg(Color::Magenta),
         ),
         icon(e),
         Span::raw(format!(" {:>w$} ", e.index, w = index)),
-        Span::styled(name, name_style),
-    ])];
-    for t in wrap(tags(e), room) {
+        Span::styled(name.clone(), name_style),
+    ];
+    if let Some(w) = word.clone() {
+        first.push(Span::raw(" "));
+        first.push(w);
+    }
+    let mut lines = vec![Line::from(first)];
+    for t in wrap(tags(e, word.is_none()), room) {
         let mut l = vec![Span::raw(" ".repeat(at))];
         l.extend(t);
         lines.push(Line::from(l));
@@ -365,26 +383,66 @@ mod tests {
         assert_eq!(
             rows(&m, 24, 6, 6),
             [
-                " ◐ 1 api",
-                "     waiting",
+                " ◐ 1 api waiting",
                 "▌  2 a-rather-long-wind…",
                 "     main ! ⇡1",
-                " ● 3 ed",
-                "     running",
+                " ● 3 ed running",
+                "",
+                "",
             ]
         );
         assert_eq!(
             rows(&m, 32, 6, 6),
             [
-                " ◐ 1 api",
-                "     waiting",
+                " ◐ 1 api waiting",
                 "▌  2 a-rather-long-window-name",
                 "     main ! ⇡1",
-                " ● 3 ed",
-                "     running",
+                " ● 3 ed running",
+                "",
+                "",
             ]
         );
         assert_eq!(rows(&m, 40, 6, 6), rows(&m, 32, 6, 6));
+    }
+
+    #[test]
+    fn the_status_word_ends_line_one_and_the_name_is_clipped_to_keep_it() {
+        let mut s = snap();
+        s.windows[0].name = "a-rather-long-window-name".into();
+        let m = Model::build(&s, "%9", "/home");
+        // 24 columns: 19 after the index; `waiting` (7) + a space leave 11
+        let r = rows(&m, 24, 6, 1);
+        assert_eq!(r[0], " ◐ 1 a-rather-l… waiting");
+        assert_eq!(r[0].chars().count(), 24);
+        // wide enough: the name whole, the word right after it
+        assert_eq!(
+            rows(&m, 40, 6, 1)[0],
+            " ◐ 1 a-rather-long-window-name waiting"
+        );
+        // the word is the last thing on line 1 and keeps its colour
+        let mut t = Terminal::new(TestBackend::new(24, 16)).unwrap();
+        t.draw(|f| draw(f, &m, true, None)).unwrap();
+        let buf = t.backend().buffer().clone();
+        assert_eq!(buf[(23, 6)].symbol(), "g");
+        assert_eq!(
+            buf[(23, 6)].fg,
+            status_style(Status::Waiting).fg.unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn when_not_even_a_one_cell_name_fits_the_word_falls_back_below() {
+        let m = model();
+        // 10 columns: 5 after the index; `running` (7) + `…` can't share
+        // line 1, so the word leads the tags below as it used to
+        let r = rows(&m, 10, 0, 16);
+        let i = r.iter().position(|l| l.starts_with(" ● 3")).unwrap();
+        assert_eq!(r[i], " ● 3 ed");
+        assert_eq!(r[i + 1], "     runn…");
+        // exactly enough for `…` + space + word (9 after the index, 14 columns)
+        let r = rows(&m, 14, 0, 16);
+        let i = r.iter().position(|l| l.starts_with(" ● 3")).unwrap();
+        assert_eq!(r[i], " ● 3 … running");
     }
 
     #[test]
@@ -401,8 +459,8 @@ mod tests {
                 "▌   2 web",
                 "      main ! ⇡1",
                 "    3 edit",
-                " ◐ 10 api",
-                "      waiting",
+                " ◐ 10 api waiting",
+                "",
             ]
         );
     }
@@ -453,9 +511,9 @@ mod tests {
         let m = Model::build(&s, "%9", "/home");
         let r = rows(&m, 24, 6, 6);
         // line 1: marker, icon, index, then the name to column 24 exactly
-        assert_eq!(r[2], format!("▌  2 {}…", "x".repeat(18)));
-        assert_eq!(r[2].chars().count(), 24);
-        assert_eq!(r[3], "     main ! ⇡1", "tags still render below");
+        assert_eq!(r[1], format!("▌  2 {}…", "x".repeat(18)));
+        assert_eq!(r[1].chars().count(), 24);
+        assert_eq!(r[2], "     main ! ⇡1", "tags still render below");
         // NEEDS YOU: the head `session:index name` clips the same way
         let mut s = snap();
         s.windows[3].name = "y".repeat(60);
@@ -500,11 +558,11 @@ mod tests {
             let mut t = Terminal::new(TestBackend::new(w, 16)).unwrap();
             t.draw(|f| draw(f, &model(), true, None)).unwrap();
             let buf = t.backend().buffer().clone();
-            // the here row is lines 8 and 9 (name, tags)
-            assert_eq!(uniform_bg(&buf, w, 8, 10), Color::DarkGray, "{w}");
-            assert_ne!(buf[(0, 10)].bg, Color::DarkGray, "the next row is not");
-            assert_ne!(buf[(0, 7)].bg, Color::DarkGray);
-            for y in 8..10 {
+            // the here row is lines 7 and 8 (name, tags)
+            assert_eq!(uniform_bg(&buf, w, 7, 9), Color::DarkGray, "{w}");
+            assert_ne!(buf[(0, 9)].bg, Color::DarkGray, "the next row is not");
+            assert_ne!(buf[(0, 6)].bg, Color::DarkGray);
+            for y in 7..9 {
                 for x in 0..w {
                     assert!(!buf[(x, y)].modifier.contains(Modifier::REVERSED));
                 }
@@ -576,10 +634,8 @@ mod tests {
         t.draw(|f| draw(f, &m, true, Some(&sel))).unwrap();
         let buf = t.backend().buffer().clone();
         let rev = |x, y| buf[(x, y)].modifier.contains(Modifier::REVERSED);
-        for y in [10, 11] {
-            assert!(rev(0, y) && rev(31, y), "both lines of ed, to the edge");
-        }
-        assert!(!rev(0, 9) && !rev(0, 12));
+        assert!(rev(0, 9) && rev(31, 9), "ed's line, to the edge");
+        assert!(!rev(0, 8) && !rev(0, 10));
         let needs = Sel {
             needs: true,
             wid: "@4".into(),

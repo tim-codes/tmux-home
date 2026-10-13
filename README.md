@@ -600,23 +600,23 @@ window):
  ◐ main:1 api
    permission
 ─ main ────────────────────────
- ◐ 1 api
-     waiting
+ ◐ 1 api waiting
 ▌  2 web
      main ! ⇡1
- ● 3 editor
-     running feat/x +? ⇣2
-     $1
+ ● 3 editor running
+     feat/x +? ⇣2 $1
  2s 7w · 1 waiting · 1 running
 ```
 
 Windows that need you, server-wide, with the reason; then the windows of
 its own session, the window it lives in highlighted as one band. Each window
 is stacked, at every width: the first line is the agent status icon, the
-index (a fixed-width field, so names line up) and the name on the full
-remaining width, clipped with `…` only if it still doesn't fit; the tags
-(the agent's state word and the git badge's pieces) follow below, indented to
-the name. What doesn't fit on a line wraps, whole pieces at a time, onto
+index (a fixed-width field, so names line up), the name, and the agent's
+state word (`running`, `waiting`, ...) at the end; when the line is too
+narrow the name is clipped with `…` first and the word stays visible (only
+if not even a one-cell name fits beside it does the word drop to the second
+line, ahead of the git pieces). The git badge's pieces follow below,
+indented to the name. What doesn't fit on a line wraps, whole pieces at a time, onto
 further lines with the same indent (a single piece wider than the line is
 clipped), and a window with no agent and no repo is one line. A tally sits at the bottom (sessions, windows,
 live agents by status; `○` while it reads tmux directly, without the
