@@ -4,7 +4,7 @@ pub mod sidebars;
 use crate::{
     BUILD_ID,
     git::badge::GitSection,
-    ipc::{Reply, Request, read_msg, write_msg},
+    ipc::{Envelope, Reply, Request, read_msg, write_msg},
     paths::Paths,
     tmux::{
         Tmux,
@@ -180,6 +180,13 @@ pub async fn run(tmux_socket: PathBuf, kind: SourceKind) -> anyhow::Result<()> {
 
 /// `run`, answering as build `version` (tests: a daemon of a different
 /// build than its clients, to exercise the `Restart` handshake).
+///
+/// The handshake on a build mismatch (`serve`): the daemon exits with a
+/// `Restart` reply only when it is the stale side, that is its own binary
+/// was replaced on disk (`selfexe::replaced`) or the client says it is
+/// current. A stale client (a sidebar still running the build its binary
+/// was before a rebuild) gets `Stale` and the daemon goes on: the binary
+/// on disk is the source of truth, and the client replaces itself.
 pub async fn run_with_version(
     tmux_socket: PathBuf,
     kind: SourceKind,
@@ -281,14 +288,21 @@ pub async fn run_with(
 async fn serve(stream: UnixStream, shared: Arc<Shared>) {
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
-    let Ok(Ok(Some(req))) =
-        tokio::time::timeout(INITIAL_REQUEST_TIMEOUT, read_msg::<_, Request>(&mut r)).await
+    let Ok(Ok(Some(Envelope { req, current }))) =
+        tokio::time::timeout(INITIAL_REQUEST_TIMEOUT, read_msg::<_, Envelope>(&mut r)).await
     else {
         return;
     };
     if req.version() != shared.version {
-        let _ = write_msg(&mut w, &Reply::Restart).await;
-        shared.restart.notify_one();
+        match on_mismatch(crate::selfexe::replaced(), current) {
+            Mismatch::Restart => {
+                let _ = write_msg(&mut w, &Reply::Restart).await;
+                shared.restart.notify_one();
+            }
+            Mismatch::Stale => {
+                let _ = write_msg(&mut w, &Reply::Stale).await;
+            }
+        }
         return;
     }
     let mut latest = shared.latest.subscribe();
@@ -317,6 +331,29 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>) {
                 return;
             }
         }
+    }
+}
+
+/// Which side of a build mismatch gives way.
+#[derive(Debug, PartialEq, Eq)]
+enum Mismatch {
+    /// The daemon: it replies `Restart` and exits, and the client starts
+    /// its own build.
+    Restart,
+    /// The client: it is told `Stale`, and the daemon goes on.
+    Stale,
+}
+
+/// The daemon gives way if its own binary was replaced on disk (it is the
+/// older build) or the client's binary is still the one on disk (a newer
+/// build, or a development build run on purpose). Otherwise the client is
+/// the stale one: restarting would start the on-disk build again, the one
+/// the stale client turns away, and so on forever.
+fn on_mismatch(daemon_replaced: bool, client_current: bool) -> Mismatch {
+    if daemon_replaced || client_current {
+        Mismatch::Restart
+    } else {
+        Mismatch::Stale
     }
 }
 
@@ -365,6 +402,18 @@ mod tests {
 
     fn sections(tmux: u64) -> Sections {
         Sections { tmux, git: 0 }
+    }
+
+    #[test]
+    fn only_the_stale_side_of_a_mismatch_gives_way() {
+        // a new build's client meets the old build's daemon
+        assert_eq!(on_mismatch(true, true), Mismatch::Restart);
+        // a development build's client, the daemon current
+        assert_eq!(on_mismatch(false, true), Mismatch::Restart);
+        // the old build's client (a sidebar) meets the new build's daemon
+        assert_eq!(on_mismatch(false, false), Mismatch::Stale);
+        // both replaced: the daemon is not the on-disk build either
+        assert_eq!(on_mismatch(true, false), Mismatch::Restart);
     }
 
     #[test]

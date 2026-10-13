@@ -257,3 +257,45 @@ fn query_cli_on_server_without_sessions() {
     assert_eq!(v["sessions"], serde_json::json!([]));
     s.tmux(&["kill-server"]);
 }
+
+/// `(pid, ppid, stat)` of each process whose command line contains `pat`.
+fn procs(pat: &str) -> Vec<(u32, u32, String)> {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,stat=,command="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains(pat))
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            Some((
+                f.next()?.parse().ok()?,
+                f.next()?.parse().ok()?,
+                f.next()?.into(),
+            ))
+        })
+        .collect()
+}
+
+/// A daemon a client starts is not that client's child: a long-running
+/// client (a sidebar) never waits for it, so once it exited (a rebuild
+/// replaced it) it would sit `<defunct>` under the client for good.
+#[test]
+fn a_spawned_daemon_is_not_the_clients_child() {
+    // SAFETY: see degraded_then_daemon above.
+    unsafe {
+        std::env::set_var("TMUX_HOME_BIN", env!("CARGO_BIN_EXE_tmux-home"));
+    }
+    let _env = common::TestEnv::new();
+    let s = common::TestServer::start();
+    tmux_home::client::spawn_daemon(&s.socket).unwrap();
+    assert!(wait_daemon_serving(&s), "the daemon never came up");
+    let pat = format!("daemon --socket {}", s.socket.display());
+    let mine: Vec<_> = procs(&pat)
+        .into_iter()
+        .filter(|(_, ppid, _)| *ppid == std::process::id())
+        .collect();
+    assert!(mine.is_empty(), "daemon is our child: {mine:?}");
+    s.tmux(&["kill-server"]);
+}

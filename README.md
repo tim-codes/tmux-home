@@ -138,6 +138,28 @@ a hash of the sources when the tree is dirty or there is no git), so after a
 rebuild — even at the same version — the old daemon exits on the first
 request and the client starts the new one.
 
+The binary on disk decides which build runs. Each process remembers the file
+it started from, and a long-running one (a sidebar, the daemon) can tell when
+a rebuild has put a new file there. That makes it the stale side, so on a
+build mismatch only the stale side gives way:
+
+- The daemon exits for a client of another build only when its own binary
+  was replaced, or the client's binary is still the one on disk (a newer
+  build, or a development build).
+- A client whose binary was replaced (a sidebar that was already running at
+  the rebuild) gets a `stale` reply instead. The daemon keeps running.
+- A running sidebar looks at its binary every second. Once a rebuild has
+  replaced it, the sidebar execs the new binary with the same arguments, in
+  the same process and pane (its screen is redrawn), and notes it in
+  `daemon.log`.
+- A popup that is open during a rebuild reads tmux directly (`(direct)`)
+  until it closes.
+
+So an in-place rebuild replaces the daemon once (on the first request from a
+new-build client, such as the status line), and the sidebars then switch to
+the new build. A daemon a client starts is never that client's child
+process, so a long-running client doesn't keep the exited ones as zombies.
+
 `tmux-home status` prints `●` when the daemon answers and `○` when it
 doesn't, for a status line. It never starts a daemon that is simply down,
 so after the server's daemon dies the chip shows `○` until something (the

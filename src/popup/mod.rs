@@ -83,30 +83,36 @@ fn feed_loop(
     loop {
         // live: subscribe until the daemon goes away
         let since = Instant::now();
-        let restart = match client::ask(&socket, &client::subscribe_req(client), SUBSCRIBE_BUDGET) {
-            Answer::Snapshot {
-                epoch,
-                seq,
-                data,
-                mut conn,
-            } => {
-                let mut next = Some((seq, data));
-                while let Some((seq, snap)) = next.take() {
-                    let stamp = Stamp::Live { epoch, seq, since };
-                    if tx.send(Feed { snap, stamp }).is_err() {
-                        return;
+        let (restart, stale) =
+            match client::ask(&socket, &client::subscribe_req(client), SUBSCRIBE_BUDGET) {
+                Answer::Snapshot {
+                    epoch,
+                    seq,
+                    data,
+                    mut conn,
+                } => {
+                    let mut next = Some((seq, data));
+                    while let Some((seq, snap)) = next.take() {
+                        let stamp = Stamp::Live { epoch, seq, since };
+                        if tx.send(Feed { snap, stamp }).is_err() {
+                            return;
+                        }
+                        if let Ok(Some(Reply::Snapshot { seq, data, .. })) = conn.recv() {
+                            next = Some((seq, data));
+                        }
                     }
-                    if let Ok(Some(Reply::Snapshot { seq, data, .. })) = conn.recv() {
-                        next = Some((seq, data));
-                    }
+                    (false, false)
                 }
-                false
-            }
-            Answer::Restart => true,
-            Answer::Down => false,
-        };
+                Answer::Restart => (true, false),
+                Answer::Down => (false, false),
+                // this process is the old build (a rebuild replaced its
+                // binary) and the daemon the new one: it serves the others, so
+                // start none; the sidebar replaces itself (`sidebar::run`), a
+                // popup reads tmux directly until it closes
+                Answer::Stale => (false, true),
+            };
         // degraded: (re)start a daemon now and then, read directly meanwhile
-        let may = revive_from.is_none_or(|t| crate::agent::now() >= t);
+        let may = !stale && revive_from.is_none_or(|t| crate::agent::now() >= t);
         if may && (restart || last_spawn.is_none_or(|t| t.elapsed() > RESPAWN_EVERY)) {
             last_spawn = Some(Instant::now());
             client::revive(&socket, restart);
