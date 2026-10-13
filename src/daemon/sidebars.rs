@@ -32,7 +32,9 @@
 //!   a column off the last settled one, it becomes the sidebar width, as a
 //!   percentage of its window, stored, and applied to every other sidebar
 //!   (unless it has lost a sidebar's shape — not full height, off the edge,
-//!   over half the window — as `select-layout` would leave it).
+//!   over half the window — as `select-layout` would leave it). Full
+//!   height is every row its window's panes cover: a pane border status
+//!   line (`pane-border-status`) takes a row no pane has.
 //!   A window resized, or whose panes came or went (a pane killed beside
 //!   the sidebar hands it its space), gets its sidebar set back to the
 //!   width.
@@ -377,8 +379,9 @@ impl Planner {
                 self.track.remove(&ours[0].id);
             }
             let lay = layout(&win.panes);
+            let span = rows(&win.panes);
             for p in ours {
-                self.follow(p, lay, now, &mut plan, &mut by_hand);
+                self.follow(p, lay, span, now, &mut plan, &mut by_hand);
             }
             if real {
                 self.pin(wid, win, now, startup, &mut plan);
@@ -441,11 +444,13 @@ impl Planner {
         }
     }
 
-    /// Follows tmux-home sidebar `p`'s width (`lay`: its window's panes).
+    /// Follows tmux-home sidebar `p`'s width (`lay`: its window's panes;
+    /// `span`: the rows they cover, `rows`).
     fn follow(
         &mut self,
         p: &Pane,
         lay: u64,
+        span: (u32, u32),
         now: Instant,
         plan: &mut Plan,
         by_hand: &mut Option<(String, u32)>,
@@ -503,9 +508,11 @@ impl Planner {
         {
             t.moved = None;
             // still a sidebar's shape (full height, at an edge, at most
-            // half the window): not a layout applied over it
-            let shaped =
-                p.height >= p.window_height && (p.left == 0 || p.left + w >= ww) && w * 2 <= ww;
+            // half the window): not a layout applied over it. Full height
+            // is every row the window's panes cover, not the window's
+            // height: a pane border status line takes a row of that.
+            let full = p.top <= span.0 && p.top + p.height >= span.1;
+            let shaped = full && (p.left == 0 || p.left + w >= ww) && w * 2 <= ww;
             if ww > 0 && shaped && w.abs_diff(t.settled) > TOLERANCE {
                 *by_hand = Some((p.id.clone(), pct(w, ww)));
             }
@@ -554,6 +561,14 @@ fn layout(panes: &[&Pane]) -> u64 {
     let mut h = DefaultHasher::new();
     ids.hash(&mut h);
     h.finish()
+}
+
+/// The rows `panes` cover, `(top, bottom)` (bottom exclusive): the
+/// window's height less any pane border status line.
+fn rows(panes: &[&Pane]) -> (u32, u32) {
+    let top = panes.iter().map(|p| p.top).min().unwrap_or(0);
+    let bottom = panes.iter().map(|p| p.top + p.height).max().unwrap_or(0);
+    (top, bottom)
 }
 
 /// The server's start time (`#{start_time}`, Unix seconds).
@@ -1256,8 +1271,11 @@ mod tests {
             Plan::default()
         );
         let mut short = two(60, 32);
+        short.panes[0].height = 50;
         short.panes[1].height = 20;
-        short.panes[1].window_height = 50;
+        for p in &mut short.panes[..2] {
+            p.window_height = 50;
+        }
         p.observe(&short, at(t0, 2100), Startup::Past);
         assert_eq!(
             p.observe(&short, at(t0, 4000), Startup::Past),
@@ -1271,6 +1289,31 @@ mod tests {
             p.observe(&two(33, 32), at(t0, 2000), Startup::Past),
             Plan::default()
         );
+    }
+
+    /// `pane-border-status top` (or `bottom`) takes a row of the window:
+    /// a sidebar is then one row short of the window's height, but still
+    /// every row its panes cover, so a width set by hand counts.
+    #[test]
+    fn a_pane_border_status_row_does_not_stop_a_width_set_by_hand() {
+        for top in [1, 0] {
+            let bordered = |a: u32| {
+                let mut s = two(a, 32);
+                for p in &mut s.panes {
+                    p.top = top;
+                    p.height = 49;
+                    p.window_height = 50;
+                }
+                s
+            };
+            let t0 = Instant::now();
+            let mut p = Planner::new(STABLE).settle(SETTLE);
+            p.observe(&bordered(32), t0, Startup::Past);
+            p.observe(&bordered(50), at(t0, 100), Startup::Past);
+            let plan = p.observe(&bordered(50), at(t0, 900), Startup::Past);
+            assert_eq!(plan.save_width, Some(25), "top {top}");
+            assert_eq!(plan.resize, [r("%4", 25)], "top {top}");
+        }
     }
 
     #[test]

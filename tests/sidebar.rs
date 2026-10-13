@@ -946,3 +946,40 @@ fn a_width_set_by_hand_spreads_as_a_percentage() {
     assert_eq!(read_state(&s, "sidebar-width"), "25%\n", "nothing learned");
     assert_eq!(width("alpha:1"), "50", "nor spread");
 }
+
+/// The same with a pane border status line (`pane-border-status top`):
+/// tmux takes a row of the window for it, so no pane is the window's full
+/// height — a sidebar still is as tall as its window's panes go, and a
+/// width set by hand on it must still be learned and spread.
+#[test]
+fn a_width_set_by_hand_spreads_under_a_pane_border_status() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    s.tmux(&["set-option", "-g", "pane-border-status", "top"]);
+    s.tmux(&["set-option", "-g", "@home-sidebar-width", "40"]);
+    s.tmux(&[
+        "set-environment",
+        "-g",
+        "TMUX_HOME_SIDEBAR_SETTLE_MS",
+        "300",
+    ]);
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    s.tmux(&["new-session", "-d", "-s", "beta", "-x", "100", "-y", "50"]);
+    install_binding(&s);
+    for w in ["alpha:0", "alpha:1", "beta:0"] {
+        toggle(&s, &["--window", w]);
+    }
+    let side = |w: &str| sidebars(&s, w)[0].clone();
+    let width = |w: &str| fmt(&s, &side(w), "#{pane_width}");
+    assert_eq!(
+        fmt(&s, &side("alpha:0"), "#{pane_top} #{pane_height}"),
+        "1 49",
+        "the border status takes the top row"
+    );
+    std::thread::sleep(Duration::from_millis(1200)); // the daemon has seen them
+    // by hand: 50 of 200
+    s.tmux(&["resize-pane", "-t", &side("alpha:0"), "-x", "50"]);
+    wait_until("alpha:1's sidebar at 25%", || width("alpha:1") == "50");
+    wait_until("beta's at 25% of 100", || width("beta:0") == "25");
+    assert_eq!(read_state(&s, "sidebar-width"), "25%\n");
+}
