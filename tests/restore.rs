@@ -189,6 +189,7 @@ fn sessions_are_resumed_in_their_directory_and_account() {
     assert_eq!(opt(&s, &a, "@home_config_dir"), acct.to_str().unwrap());
     assert_eq!(opt(&s, &b, "@home_config_dir"), "");
 
+    s.tmux(&["set", "-g", "@home_restore_done", "1"]);
     run(&s, "agents-snapshot");
     let snap: tmux_home::restore::Snapshot = serde_json::from_slice(
         &std::fs::read(
@@ -279,6 +280,157 @@ fn sessions_are_resumed_in_their_directory_and_account() {
     drop(dirs);
 }
 
+fn snapshot_file(s: &TestServer) -> PathBuf {
+    tmux_home::paths::Paths::for_socket(&s.socket)
+        .unwrap()
+        .state_dir
+        .join("agents.json")
+}
+
+fn restore_log(s: &TestServer) -> String {
+    std::fs::read_to_string(
+        tmux_home::paths::Paths::for_socket(&s.socket)
+            .unwrap()
+            .state_dir
+            .join("restore.log"),
+    )
+    .unwrap_or_default()
+}
+
+/// A snapshot whose one entry resumes `id` at `alpha:1.0`, in `proj`.
+fn write_snapshot(s: &TestServer, id: &str, proj: &Path, transcript: &Path) {
+    let snap = tmux_home::restore::Snapshot {
+        saved: 1,
+        entries: vec![tmux_home::restore::Entry {
+            session: "alpha".into(),
+            window: 1,
+            pane: 0,
+            path: proj.to_str().unwrap().into(),
+            session_id: id.into(),
+            transcript: transcript.to_str().unwrap().into(),
+            cwd: proj.to_str().unwrap().into(),
+            config_dir: None,
+        }],
+    };
+    let file = snapshot_file(s);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, serde_json::to_vec(&snap).unwrap()).unwrap();
+}
+
+/// Until the server is done restoring (`@home_restore_done`), its panes
+/// aren't the user's sessions: a save then (an autosave on a server whose
+/// restore never ran) leaves the snapshot the restore needs as it was.
+#[test]
+fn a_server_not_restored_yet_saves_nothing() {
+    let _env = TestEnv::new();
+    let dirs = temp_base("gate");
+    let base = dirs.base.clone();
+    let proj = base.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let transcript = base.join("t.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let s = TestServer::start();
+    let old = "00000000-0000-4000-8000-0000000000f0";
+    let id = "00000000-0000-4000-8000-0000000000f1";
+    write_snapshot(&s, old, &proj, &transcript);
+    let before = std::fs::read(snapshot_file(&s)).unwrap();
+    let p = window(&s, 2, &proj, "/usr/bin:/bin", Some(&fake_claude()));
+    wait_until("fake claude running", || {
+        opt(&s, &p, "pane_current_command") == "2.1.283"
+    });
+    hook(
+        &s,
+        &p,
+        "SessionStart",
+        &payload(id, &transcript, &proj),
+        None,
+    );
+
+    run(&s, "agents-snapshot");
+    assert_eq!(
+        std::fs::read(snapshot_file(&s)).unwrap(),
+        before,
+        "untouched"
+    );
+    let log = restore_log(&s);
+    assert!(log.contains("skip save: server not restored yet"), "{log}");
+
+    s.tmux(&["set", "-g", "@home_restore_done", "1"]);
+    run(&s, "agents-snapshot");
+    let snap: tmux_home::restore::Snapshot =
+        serde_json::from_slice(&std::fs::read(snapshot_file(&s)).unwrap()).unwrap();
+    let got: Vec<(String, &str)> = snap
+        .entries
+        .iter()
+        .map(|e| (e.location(), e.session_id.as_str()))
+        .collect();
+    assert_eq!(got, [("alpha:2.0".to_string(), id)]);
+    drop(dirs);
+}
+
+/// A restore that finds nothing to claim doesn't use up the server's one
+/// restore: the next one (here, once the pane is back) resumes. Two
+/// restores at once then type the command once.
+#[test]
+fn a_restore_that_claims_nothing_leaves_the_next_free() {
+    let _env = TestEnv::new();
+    let dirs = temp_base("unclaimed");
+    let base = dirs.base.clone();
+    let proj = base.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let (bin, log) = fake_claude_cli(&base);
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let transcript = base.join("t.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let s = TestServer::start();
+    s.tmux(&["set", "-g", "@home-restore-agents", "on"]);
+    s.tmux(&["set", "-g", "@home-restore-agents-delay", "0.2"]);
+    let id = "00000000-0000-4000-8000-0000000000d1";
+    write_snapshot(&s, id, &proj, &transcript);
+    let guard = || {
+        s.tmux(&["show-options", "-gqv", "@home_agents_restored"])
+            .trim()
+            .to_string()
+    };
+
+    // alpha:1 isn't there
+    run(&s, "restore-agents");
+    let rlog = restore_log(&s);
+    assert!(rlog.contains("restore: 0 of 1 saved agents"), "{rlog}");
+    assert_eq!(guard(), "", "not used up");
+
+    let p = window(&s, 1, &proj, &path, None);
+    let both: Vec<_> = (0..2)
+        .map(|_| {
+            Command::new(BIN)
+                .args(["restore-agents", "--socket"])
+                .arg(&s.socket)
+                .env_remove("TMUX")
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut c in both {
+        assert!(c.wait().unwrap().success());
+    }
+    assert_eq!(opt(&s, &p, "@home_restore"), id, "claimed");
+    wait_until("resumed", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| !l.is_empty())
+    });
+    assert_ne!(guard(), "");
+    // a further restore claims nothing new, and nothing is typed twice
+    run(&s, "restore-agents");
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().lines().count(),
+        1,
+        "{}",
+        restore_log(&s)
+    );
+    drop(dirs);
+}
+
 /// Through tmux-resurrect itself (skipped when it isn't installed): its
 /// save runs `agents-snapshot` from the post-save hook, the server goes
 /// away, a new one on the same socket restores, and the post-restore hook
@@ -333,6 +485,8 @@ fn through_resurrect_save_and_restore() {
 
     let a = TestServer::start_with(&envs);
     setup(&a);
+    // a server with nothing to restore: the config marks it done
+    a.tmux(&["set", "-g", "@home_restore_done", "1"]);
     let pane = window(&a, 1, &proj, &path, Some(&fake_claude()));
     wait_until("fake claude running", || {
         opt(&a, &pane, "pane_current_command") == "2.1.283"
