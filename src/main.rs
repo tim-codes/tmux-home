@@ -76,14 +76,16 @@ enum Cmd {
         event: String,
     },
     /// Save the panes running Claude Code under their `session:window.pane`
-    /// (for `@resurrect-hook-post-save-all`). Always exits 0.
+    /// (for `@resurrect-hook-post-save-all`), once the server is done
+    /// restoring (`@home_restore_done`). Always exits 0.
     AgentsSnapshot {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
     },
     /// Resume the saved Claude Code sessions in the panes resurrect
     /// restored (for `@resurrect-hook-post-restore-all`; needs
-    /// `@home-restore-agents on`). Once per server; returns at once, the
+    /// `@home-restore-agents on`). Once per server (a run that claims
+    /// nothing doesn't count); returns at once, the
     /// launches are staggered in the background. Always exits 0.
     RestoreAgents {
         #[arg(long)]

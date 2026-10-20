@@ -424,8 +424,13 @@ this section, and §7, §8, §10 and §13 where they conflict.
   `@home_transcript`, `@home_cwd`, `@home_config_dir`). `tmux-home
   agents-snapshot`, run by resurrect after each save, writes the panes
   running Claude at that moment to `<state dir>/agents.json` by
-  `session:window.pane`. `tmux-home restore-agents`, run by resurrect after
-  a restore, once per server, types `cd <cwd> && env [-u]
+  `session:window.pane`, but only once the server option
+  `@home_restore_done` is set (post-restore hook, or the config on a
+  server with nothing to restore); before that it logs and leaves the
+  file as it was, so a server whose restore never ran can't overwrite the
+  snapshot. `tmux-home restore-agents`, run by resurrect after a restore,
+  once per server (`@home_agents_restored`, set only once it claims a
+  pane), types `cd <cwd> && env [-u]
   CLAUDE_CONFIG_DIR[=<dir>] claude --resume <id>` into each restored pane
   that is at a shell prompt in the saved directory and whose transcript
   still exists, one every `@home-restore-agents-delay` seconds from a

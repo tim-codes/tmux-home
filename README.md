@@ -724,7 +724,13 @@ and Stop record the session's id, transcript, directory and account
 - **Save.** After each resurrect save, `agents-snapshot` writes the panes
   running Claude at that moment, by `session:window.pane`, to
   `<state root>/<server key>/agents.json`. A session you exited (or that
-  crashed) has left its pane by then, so it isn't saved.
+  crashed) has left its pane by then, so it isn't saved. It saves only on
+  a server that is done restoring, `@home_restore_done` set (by the
+  post-restore hook above): until then the server's panes aren't your
+  sessions yet, and a save would overwrite the snapshot the restore needs
+  (it logs `skip save: server not restored yet` instead). A server that
+  starts with nothing to restore must set it too, e.g. in tmux.conf when
+  resurrect has no `last` snapshot.
 - **Restore.** After a restore, once per tmux server, `restore-agents`
   takes each saved pane that is back at a shell prompt (fish, bash, zsh,
   sh, …) in the saved directory, and whose transcript still exists
@@ -740,7 +746,8 @@ and Stop record the session's id, transcript, directory and account
   `env` runs the `claude` on `PATH`, not a shell function of that name.
   Exiting claude leaves you at the shell. Every skip, and every resume, is
   logged to `restore.log` beside `agents.json`; a second restore on the
-  same server (`prefix C-r`) types nothing.
+  same server (`prefix C-r`) types nothing, unless the first resumed
+  nothing (then it tries again).
 
 Don't add claude to `@resurrect-processes` as well. A long idle session
 may open at Claude Code's "resume from summary?" question instead of its
