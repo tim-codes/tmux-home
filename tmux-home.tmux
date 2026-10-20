@@ -135,9 +135,11 @@ if [[ -x $RUST_BIN ]]; then
 	# The daemon: one per server; a second start is a no-op (lock), and it
 	# exits with the server.
 	# Started TMUX_HOME_DAEMON_DELAY seconds (default 10) after the config
-	# loads: tmux-continuum skips its auto-restore if, as the server starts,
-	# it sees another process whose command line starts with `tmux`. A popup
-	# opened sooner starts the daemon itself.
+	# loads: a tmux-continuum still installed skips its auto-restore if, as
+	# the server starts, it sees another process whose command line starts
+	# with `tmux`. Kept for that migration; it costs nothing otherwise (the
+	# daemon's first autosave is an interval away). A popup opened sooner
+	# starts the daemon itself.
 	delay=${TMUX_HOME_DAEMON_DELAY:-10}
 	[[ $delay =~ ^[0-9]+$ ]] || delay=10
 	if ((delay > 0)); then
