@@ -343,6 +343,8 @@ Only what the primary user needs; more when someone asks.
 | `@home-sidebar-auto` / `-exclude` | `off` / empty (a sidebar in new windows, except these sessions) |
 | `@home-restore-agents` | `off` (`on`: resume Claude Code sessions after a resurrect restore, §12) |
 | `@home-restore-agents-delay` | `2` (seconds between resumed launches) |
+| `@home-save-interval` | `5` (minutes between the daemon's resurrect autosaves; `0` = off) |
+| `@home_restore_done` | set by the user's config after a restore, or when there is nothing to restore: gates autosave, `agents-snapshot` and sidebar creation |
 
 Colours: terminal's default foreground/background plus the 16 ANSI colours,
 so it follows whatever theme the terminal has.
@@ -352,8 +354,9 @@ so it follows whatever theme the terminal has.
 - Sending prompts or keystrokes to agents; approving permissions.
 - Launching agents (claude-hatch `prefix y`). Resuming one after a reboot
   is the single exception (below); a new agent is never started.
-- Session persistence/restore (resurrect/continuum): tmux-resurrect saves
-  and restores the layout. tmux-home only cooperates with it: sidebars
+- Session persistence/restore (resurrect): tmux-resurrect saves and
+  restores the layout. tmux-home only cooperates with it — its daemon
+  runs resurrect's save on an interval (in place of tmux-continuum), and: sidebars
   restore themselves, and, as an explicit opt-in goal (pass 7,
   `@home-restore-agents on`), a pane that was running a Claude Code session
   when resurrect last saved comes back running `claude --resume <that
@@ -419,6 +422,15 @@ this section, and §7, §8, §10 and §13 where they conflict.
   snapshot's `git` section: repo root → status, pane cwd → root. Git runs
   read-only, with a timeout and at most 4 at once; nothing git-related runs
   on the tmux poll's path.
+- Autosave (`src/daemon/autosave.rs`), in place of tmux-continuum: a
+  daemon task that, every `@home-save-interval` minutes (read each tick;
+  `0` = off) and only once `@home_restore_done` is set, runs
+  `$(@resurrect-save-script-path) quiet` (fallback: the TPM install's
+  `save.sh`) with `$TMUX` naming the server. The last save's time is the
+  server option `@home_save_last`, set to "now" on the daemon's first look,
+  so the first save is an interval after start. One save at a time (the
+  task awaits it; killed after 300 s); logged to `<state dir>/autosave.log`.
+  Sidebar creation waits on the same `@home_restore_done` (at most 60 s).
 - Agent restore (pass 7, `src/restore.rs`; opt-in). The Claude hook keeps
   each pane's session in its options (`@home_session_id`,
   `@home_transcript`, `@home_cwd`, `@home_config_dir`). `tmux-home
