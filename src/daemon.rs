@@ -1,3 +1,4 @@
+pub mod autosave;
 pub mod git;
 pub mod sidebars;
 
@@ -253,6 +254,8 @@ pub async fn run_with(
     let git_task = git::spawn(shared.clone(), git_cfg);
     // sidebars: auto-create, cleanup and dedupe, from the same snapshots
     let sidebar_task = sidebars::spawn(shared.clone());
+    // resurrect saves on an interval (in place of tmux-continuum's)
+    let autosave_task = autosave::spawn(shared.clone(), autosave::Config::default());
     // tmux kills `run-shell -b` jobs on kill-server: on these signals, exit
     // through the normal cleanup below (remove the socket, release the lock).
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -280,6 +283,7 @@ pub async fn run_with(
     };
     git_task.abort();
     sidebar_task.abort();
+    autosave_task.abort();
     let _ = std::fs::remove_file(&paths.sock);
     drop(lock);
     result

@@ -58,7 +58,7 @@ place.
 - **git** for the badges (developed on 2.50); optional.
 - Optional: [Claude Code](https://github.com/anthropics/claude-code) for
   agent status, and [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect)
-  / [tmux-continuum](https://github.com/tmux-plugins/tmux-continuum).
+  (tmux-home's daemon autosaves with it; tmux-continuum isn't needed).
 
 ## Install
 
@@ -103,6 +103,7 @@ set -g @home-sidebar-auto off       # on: a sidebar in every new window
 set -g @home-sidebar-exclude ''     # sessions auto-create skips (space-separated)
 set -g @home-restore-agents off     # on: resume Claude Code sessions after a restore
 set -g @home-restore-agents-delay 2 # seconds between resumed sessions
+set -g @home-save-interval 5        # minutes between resurrect autosaves (0: off)
 ```
 
 State (the closed-window stack, the pinned sessions, the sidebar width set
@@ -124,9 +125,11 @@ key's message says so.
 
 Loading the plugin also starts the daemon, one per tmux server, 10 seconds
 later (`TMUX_HOME_DAEMON_DELAY`); it exits with the server. The delay is for
-tmux-continuum, which skips its auto-restore if, as the server starts, it
-sees any process whose command line starts with `tmux`; tmux-home also runs
-tmux by its absolute path, so its commands never look like that. A popup or
+a tmux-continuum still installed, which skips its auto-restore if, as the
+server starts, it sees any process whose command line starts with `tmux`;
+tmux-home also runs tmux by its absolute path, so its commands never look
+like that. (Without continuum the delay costs nothing: the autosave's first
+save is an interval away anyway.) A popup or
 sidebar opened sooner starts the daemon itself. The popup subscribes to it for live updates. If the daemon
 is down, the popup reads tmux itself (the header shows `(direct)`) and starts
 a new daemon in the background. The daemon's errors go to
@@ -664,7 +667,7 @@ created from then on, except in sessions named in `@home-sidebar-exclude`
 (e.g. `scratch`). Each window is decided once, when the daemon first sees
 it, so closing one with `prefix E` sticks. Auto-create starts only once the
 server is past its start-up: at least 30 seconds old, its windows and panes
-unchanged for 5 seconds, and, with `@continuum-restore on`, the restore done
+unchanged for 5 seconds, and the restore done, `@home_restore_done` set
 (see below; at most 60 seconds' wait). Windows that exist at that moment
 never get one. (A restore creates windows and later selects panes and types
 commands into them by index; a sidebar added in between would shift them.)
@@ -690,6 +693,37 @@ when a restore has finished:
 set -g @resurrect-processes '"~tmux-home sidebar"'
 set -g @resurrect-hook-post-restore-all 'tmux set -g @home_restore_done 1'
 ```
+
+`@home_restore_done` is tmux-home's "this server's windows are the user's"
+signal: until it is set, nothing is autosaved, `agents-snapshot` saves
+nothing, and sidebars wait (at most 60 seconds). Your config sets it: the
+post-restore hook above after a restore, and directly on a server that has
+nothing to restore. For example, restoring from the config when the
+server starts (in place of continuum's `@continuum-restore`), once per
+server (a reload finds the flag set and does nothing):
+
+```tmux
+run-shell -b '[ -n "$(tmux show -gqv @home_restore_done)" ] || if [ -e ~/.local/share/tmux/resurrect/last ]; then ~/.tmux/plugins/tmux-resurrect/scripts/restore.sh; else tmux set -g @home_restore_done 1; fi'
+```
+
+(after TPM's `run`, with your `@resurrect-dir` if you set one; restore.sh
+runs the post-restore hook, which sets the flag). Never set it before the
+restore has run: a save then replaces the snapshot with a server that is
+still empty.
+
+**Autosave.** The daemon runs resurrect's save every `@home-save-interval`
+minutes (default 5; 0 turns it off; read each time, so a reload applies),
+once `@home_restore_done` is set, whether or not a client is attached. It
+runs `$(@resurrect-save-script-path) quiet` as continuum did, one save at a
+time; the first comes an interval after the daemon starts, and the time of
+the last is kept in `@home_save_last`, so a daemon restart keeps the
+rhythm. Saves, failures and skips go to `autosave.log` in the state dir.
+
+**Coming from tmux-continuum:** remove its `@plugin` line (and
+`@continuum-restore`, `@continuum-save-interval`), restore from the
+config as above, and set `@home-save-interval` if 5 minutes isn't right.
+Running both saves twice as often, and continuum still saves a server
+whose restore never ran.
 
 (append the first to any list you already have). The sidebar pane runs
 `/bin/sh -c '"$0" sidebar --managed; exit' <path>/tmux-home`; resurrect's
@@ -724,7 +758,13 @@ and Stop record the session's id, transcript, directory and account
 - **Save.** After each resurrect save, `agents-snapshot` writes the panes
   running Claude at that moment, by `session:window.pane`, to
   `<state root>/<server key>/agents.json`. A session you exited (or that
-  crashed) has left its pane by then, so it isn't saved.
+  crashed) has left its pane by then, so it isn't saved. It saves only on
+  a server that is done restoring, `@home_restore_done` set (by the
+  post-restore hook above): until then the server's panes aren't your
+  sessions yet, and a save would overwrite the snapshot the restore needs
+  (it logs `skip save: server not restored yet` instead). A server that
+  starts with nothing to restore must set it too, e.g. in tmux.conf when
+  resurrect has no `last` snapshot.
 - **Restore.** After a restore, once per tmux server, `restore-agents`
   takes each saved pane that is back at a shell prompt (fish, bash, zsh,
   sh, …) in the saved directory, and whose transcript still exists
@@ -740,7 +780,8 @@ and Stop record the session's id, transcript, directory and account
   `env` runs the `claude` on `PATH`, not a shell function of that name.
   Exiting claude leaves you at the shell. Every skip, and every resume, is
   logged to `restore.log` beside `agents.json`; a second restore on the
-  same server (`prefix C-r`) types nothing.
+  same server (`prefix C-r`) types nothing, unless the first resumed
+  nothing (then it tries again).
 
 Don't add claude to `@resurrect-processes` as well. A long idle session
 may open at Claude Code's "resume from summary?" question instead of its

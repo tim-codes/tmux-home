@@ -7,9 +7,10 @@
 //!   or it already has a sidebar. Each window is decided once, when first
 //!   seen, so closing its sidebar with `prefix E` sticks. Auto-create is
 //!   allowed (and stays so) once the server is past its start-up (`Gate`):
-//!   at least `min_age` old, done restoring (with `@continuum-restore on`:
-//!   until resurrect's post-restore hook sets `@home_restore_done`, at most
-//!   `restore_hold`), and its windows and panes unchanged for `stable`.
+//!   at least `min_age` old, done restoring (until `@home_restore_done` is
+//!   set — by resurrect's post-restore hook, or by the config when there is
+//!   nothing to restore — at most `restore_hold`), and its windows and
+//!   panes unchanged for `stable`.
 //!   Windows that exist at that moment are never given one: a restore
 //!   creates windows by index and later selects panes and types commands by
 //!   index, so a sidebar added mid-restore shifts every index after it.
@@ -111,12 +112,11 @@ impl Gate {
         }
     }
 
-    /// The start-up phase at server age `age`: restoring while (possibly)
-    /// still restoring — `continuum` is `@continuum-restore on`,
-    /// `restore_done` is `@home_restore_done` set — for at most
+    /// The start-up phase at server age `age`: restoring until
+    /// `restore_done` (`@home_restore_done` set), for at most
     /// `restore_hold`; then young until `min_age`.
-    pub fn startup(&self, age: Duration, continuum: bool, restore_done: bool) -> Startup {
-        if continuum && !restore_done && age < self.restore_hold {
+    pub fn startup(&self, age: Duration, restore_done: bool) -> Startup {
+        if !restore_done && age < self.restore_hold {
             Startup::Restoring
         } else if age >= self.min_age {
             Startup::Past
@@ -584,11 +584,10 @@ fn startup(t: &Tmux, gate: &Gate, start: Option<u64>) -> Startup {
         return Startup::Restoring;
     };
     let age = Duration::from_secs(crate::agent::now().saturating_sub(start));
-    let continuum = sidebar::global_option(t, "@continuum-restore").trim() == "on";
     let done = !sidebar::global_option(t, "@home_restore_done")
         .trim()
         .is_empty();
-    gate.startup(age, continuum, done)
+    gate.startup(age, done)
 }
 
 /// Carries out a plan (blocking: tmux commands, the state files). Failures
@@ -821,13 +820,11 @@ mod tests {
         use Startup::*;
         let g = Gate::default();
         let s = Duration::from_secs;
-        assert_eq!(g.startup(s(10), false, false), Young);
-        assert_eq!(g.startup(s(30), false, false), Past);
-        assert_eq!(g.startup(s(30), true, false), Restoring, "continuum");
-        assert_eq!(g.startup(s(10), true, false), Restoring, "continuum");
-        assert_eq!(g.startup(s(30), true, true), Past, "restore done");
-        assert_eq!(g.startup(s(60), true, false), Past, "held at most 60 s");
-        assert_eq!(g.startup(s(5), true, true), Young, "and never young");
+        assert_eq!(g.startup(s(10), true), Young);
+        assert_eq!(g.startup(s(30), true), Past);
+        assert_eq!(g.startup(s(30), false), Restoring, "not done");
+        assert_eq!(g.startup(s(10), false), Restoring, "not done");
+        assert_eq!(g.startup(s(60), false), Past, "held at most 60 s");
     }
 
     #[test]

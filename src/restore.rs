@@ -14,13 +14,18 @@
 //!   itself; SessionEnd's teardown wipes it.
 //! - **Snapshot** (`tmux-home agents-snapshot`, from resurrect's
 //!   `@resurrect-hook-post-save-all`). Pane IDs don't survive a restore;
-//!   resurrect restores by `session:window.pane`, so the record is saved
-//!   under that location, read from the same layout resurrect just saved,
-//!   to `<state_dir>/agents.json`. Only panes that run Claude at that
-//!   moment are saved: a session the user exited, or that crashed, is not
-//!   resumed whatever its last hook said.
+//!   resurrect restores by `session:window.pane`, so each pane running
+//!   Claude at that moment (`list-panes`) is saved under that location to
+//!   `<state_dir>/agents.json`. Only panes that run Claude are saved: a
+//!   session the user exited, or that crashed, is not resumed whatever its
+//!   last hook said. Only a server that is done restoring
+//!   (`@home_restore_done`, set by the post-restore hook, or by the config
+//!   when there was nothing to restore) is saved: until then its panes
+//!   aren't the user's sessions yet, and a save would overwrite the
+//!   snapshot the restore needs.
 //! - **Restore** (`tmux-home restore-agents`, from
-//!   `@resurrect-hook-post-restore-all`). Once per server: each saved
+//!   `@resurrect-hook-post-restore-all`). Once per server (a run that
+//!   claims nothing doesn't count, so a later restore can still try): each saved
 //!   entry whose pane is back at a shell prompt, in the saved directory,
 //!   with its transcript still on disk, is claimed (`@home_restore`), and a
 //!   detached worker types the command into each claimed pane, one every
@@ -47,8 +52,13 @@ pub const OPT_ON: &str = "@home-restore-agents";
 /// Seconds before each launch (default `DEFAULT_DELAY`).
 pub const OPT_DELAY: &str = "@home-restore-agents-delay";
 pub const DEFAULT_DELAY: f64 = 2.0;
-/// Server option: `restore-agents` has run on this server (Unix seconds).
+/// Server option: `restore-agents` has claimed panes on this server (Unix
+/// seconds).
 pub const GUARD: &str = "@home_agents_restored";
+/// Server option: the server is done restoring (or had nothing to
+/// restore), so its panes are the user's: set by the config, in
+/// resurrect's post-restore hook. `agents-snapshot` saves only then.
+pub const RESTORE_DONE: &str = "@home_restore_done";
 /// Pane option: the session id `restore-agents` claimed the pane for.
 pub const CLAIM: &str = "@home_restore";
 /// Pane option: the resume command has been typed into the pane.
@@ -372,8 +382,14 @@ pub fn snapshot_cli(socket: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn save(t: &Tmux, socket: &Path) -> anyhow::Result<usize> {
+/// Writes the snapshot; `None`, leaving the old one, when the server isn't
+/// done restoring (`RESTORE_DONE` unset).
+pub fn save(t: &Tmux, socket: &Path) -> anyhow::Result<Option<usize>> {
     use std::io::Write;
+    if global(t, RESTORE_DONE).is_empty() {
+        log(socket, "snapshot: skip save: server not restored yet");
+        return Ok(None);
+    }
     let panes = list_panes(t)?;
     let prev = load(socket).unwrap_or_default();
     let snap = Snapshot {
@@ -394,7 +410,7 @@ pub fn save(t: &Tmux, socket: &Path) -> anyhow::Result<usize> {
     f.write_all(&serde_json::to_vec_pretty(&snap)?)?;
     f.sync_all()?;
     std::fs::rename(&tmp, &path)?;
-    Ok(snap.entries.len())
+    Ok(Some(snap.entries.len()))
 }
 
 /// `tmux-home restore-agents [--worker]`. Always exits 0.
@@ -417,6 +433,9 @@ pub fn restore_cli(socket: Option<PathBuf>, worker: bool) -> anyhow::Result<()> 
 
 /// The foreground half, quick: once per server and only when enabled,
 /// claims the panes to resume and starts the worker that types into them.
+/// The server counts as done (`GUARD`) only once a pane is claimed: a run
+/// that finds nothing to resume (no snapshot, an unreadable one, every
+/// pane skipped) leaves a later restore (`prefix C-r`) free to try.
 fn claim(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
     if global(t, OPT_ON) != "on" {
         return Ok(());
@@ -425,7 +444,6 @@ fn claim(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
         log(socket, "restore: already ran on this server");
         return Ok(());
     }
-    t.run(&["set-option", "-g", GUARD, &crate::agent::now().to_string()])?;
     let snap = load(socket)?;
     let panes = list_panes(t)?;
     let mut claimed = 0;
@@ -446,6 +464,7 @@ fn claim(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
         &format!("restore: {claimed} of {} saved agents", snap.entries.len()),
     );
     if claimed > 0 {
+        t.run(&["set-option", "-g", GUARD, &crate::agent::now().to_string()])?;
         spawn_worker(socket)?;
     }
     Ok(())
@@ -468,10 +487,27 @@ fn spawn_worker(socket: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Workers take turns: an exclusive lock on `restore.lock` beside the
+/// snapshot, held until the worker is done. Two restores close together
+/// can both claim a pane (each sees it unclaimed before the other marks
+/// it); taking turns, the later worker finds it already typed into
+/// (`TYPED`, set in the same tmux command as the keys) and skips it.
+fn worker_lock(socket: &Path) -> anyhow::Result<std::fs::File> {
+    let path = snapshot_path(socket)?.with_file_name("restore.lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    f.lock()?;
+    Ok(f)
+}
+
 /// The background half: for each claimed pane, in snapshot order, waits
 /// the delay, checks the pane again (still a shell prompt where it was)
 /// and types the command; a pane that has moved on loses its claim.
 fn run_worker(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
+    let _turn = worker_lock(socket)?;
     let delay = parse_delay(&global(t, OPT_DELAY));
     let snap = load(socket)?;
     for e in &snap.entries {
