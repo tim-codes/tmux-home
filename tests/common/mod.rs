@@ -122,7 +122,17 @@ impl TestServer {
         // remove that source of flakiness outright.
         // New windows run /bin/sh, not the user's $SHELL: predictable, fast
         // to start, and no rc files.
-        for opt in [["automatic-rename", "off"], ["default-shell", "/bin/sh"]] {
+        // `@home_restore_done`: the server is done restoring (nothing to
+        // restore), as the config says on a real one; tests of the restore
+        // unset it. `@home-save-interval 0`: the daemon's autosave never
+        // runs resurrect (whose default dir is the user's own) unless a
+        // test turns it on, with a temp `@resurrect-dir`.
+        for opt in [
+            ["automatic-rename", "off"],
+            ["default-shell", "/bin/sh"],
+            ["@home_restore_done", "1"],
+            ["@home-save-interval", "0"],
+        ] {
             let out = Command::new("tmux")
                 .args(["-L", &name, "set-option", "-g", opt[0], opt[1]])
                 .env_remove("TMUX")

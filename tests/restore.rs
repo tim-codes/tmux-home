@@ -330,6 +330,7 @@ fn a_server_not_restored_yet_saves_nothing() {
     let transcript = base.join("t.jsonl");
     std::fs::write(&transcript, "{}\n").unwrap();
     let s = TestServer::start();
+    s.tmux(&["set", "-gu", "@home_restore_done"]);
     let old = "00000000-0000-4000-8000-0000000000f0";
     let id = "00000000-0000-4000-8000-0000000000f1";
     write_snapshot(&s, old, &proj, &transcript);

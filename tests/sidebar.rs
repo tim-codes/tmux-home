@@ -376,8 +376,8 @@ fn auto_create_is_off_by_default_and_decides_each_window_once() {
     assert!(sidebars(&s, "alpha:1").is_empty());
 }
 
-/// A young server gets no auto-created sidebars, and with continuum's
-/// restore on none until resurrect's post-restore hook says it's done.
+/// A young server gets no auto-created sidebars, and none until the
+/// restore is done (`@home_restore_done`).
 #[test]
 fn auto_create_waits_for_server_age_and_the_restore() {
     let _env = TestEnv::new();
@@ -394,7 +394,7 @@ fn auto_create_waits_for_server_age_and_the_restore() {
 
     let s = TestServer::start();
     s.tmux(&["set-option", "-g", "@home-sidebar-auto", "on"]);
-    s.tmux(&["set-option", "-g", "@continuum-restore", "on"]);
+    s.tmux(&["set-option", "-gu", "@home_restore_done"]);
     quick_gate(&s);
     install_binding(&s);
     std::thread::sleep(Duration::from_millis(1000));
@@ -860,7 +860,7 @@ fn a_cold_start_restore_with_sidebars_comes_back_as_saved() {
     b.tmux(&["rename-session", "-t", "alpha", "0"]);
     resurrect_opts(&b);
     b.tmux(&["set-option", "-g", "@home-sidebar-auto", "on"]);
-    b.tmux(&["set-option", "-g", "@continuum-restore", "on"]);
+    b.tmux(&["set-option", "-gu", "@home_restore_done"]);
     b.tmux(&[
         "set-option",
         "-g",
