@@ -104,7 +104,11 @@ set -g @home-sidebar-exclude ''     # sessions auto-create skips (space-separate
 set -g @home-restore-agents off     # on: resume Claude Code sessions after a restore
 set -g @home-restore-agents-delay 2 # seconds between resumed sessions
 set -g @home-save-interval 5        # minutes between resurrect autosaves (0: off)
+set -g @home-switch-keys off        # on: C-M-S-F1…F10 go to window 1…10 (see Switch keys)
 ```
+
+The plugin also sets `@home_sidebar_shown`, a format for your status line
+(see [Hiding the window list](#hiding-the-window-list)).
 
 State (the closed-window stack, the pinned sessions, the sidebar width set
 by hand, logs) lives in
@@ -244,11 +248,40 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | `^o` | toggle the preview |
 | `M-k` `M-j` | preview larger / smaller: the list/preview divider up / down 5% (the list and the preview keep 5 rows each). `M-k` shows a hidden preview; `M-j` never hides it. Remembered across opens |
 | `M-=` | preview back to its automatic size |
+| C-M-S-F1 … F10 | go to window 1 … 10 of your session and close; F12 for window 3 (see [Switch keys](#switch-keys)) |
 | `F1` `^/` | help |
 
 Window keys (`^r`, `M-r`, `^x`, `M-↑↓`, `M-n`) act on a pane row's window.
 The preview keys work in the list only; the rename and new-window editors
 ignore them.
+
+### Switch keys
+
+With `@home-switch-keys on`, C-M-S-F1 … C-M-S-F10 (Ctrl+Alt+Shift) go to
+window 1 … 10 of the current session, by index, from anywhere: a pane, a
+focused sidebar (its window gets its last pane back first, as with its own
+`⏎`) and the open popup (which then closes, as with `⏎`). Window 3 is
+C-M-S-F12, not F3. An index with no window does nothing.
+
+They are meant for a terminal to send for a chord tmux can't see itself,
+such as Cmd+Opt+1 … Cmd+Opt+0 on macOS, next to Cmd+1 … for the terminal's
+own tabs. Send xterm's modified function keys (modifier 8):
+
+| Window | Key | Bytes |
+| --- | --- | --- |
+| 1 2 4 | C-M-S-F1 F2 F4 | `\e[1;8P` `\e[1;8Q` `\e[1;8S` |
+| 3 | C-M-S-F12 | `\e[24;8~` |
+| 5 6 7 8 9 10 | C-M-S-F5 … F10 | `\e[15;8~` `\e[17;8~` `\e[18;8~` `\e[19;8~` `\e[20;8~` `\e[21;8~` |
+
+Alacritty: `{ key = "1", mods = "Command|Alt", chars = "\u001B[1;8P" }` and
+so on. Ghostty: `keybind = super+alt+digit_1=csi:1;8P`.
+
+They are function keys, not `user-keys`, because of the popup. tmux gives
+an open popup the keys before any key table, so no root binding fires
+there, and it drops User keys rather than pass them on. A function key gets
+through, and the popup acts on it itself. C-M-S-F3 doesn't work: its
+sequence, `\e[1;8R`, is also a cursor position report, and the popup's
+terminal library reads it as one.
 
 ### Preview
 
@@ -657,6 +690,28 @@ popup's movement keys:
 | `⏎` | Switch to the selected window; the sidebar's window gets its last pane back, so returning there doesn't land in the sidebar |
 | `Esc` | Hand the focus back to the window's last pane |
 | `q` | Close the sidebar |
+
+### Hiding the window list
+
+The sidebar lists the session's windows, so the status line's window list
+repeats it. `@home_sidebar_shown`, a format the plugin sets, is true
+(non-empty) when the window it is expanded for shows a sidebar: a pane
+marked `@home_role=sidebar`, in a window that isn't zoomed. It is worked out
+from the panes on every redraw, so nothing has to keep it in sync. It is
+right straight after a toggle, `q`, a pane closing, a restore, or a crash.
+In `status-format` the window is the client's current one. To use it, take
+your status line's format (`tmux show -gv 'status-format[0]'`; the window
+list is the `#{W:…}` part) and wrap the window list in it:
+
+```
+#{W:<window formats>}   →   #{?#{E:@home_sidebar_shown},,#{W:<window formats>}}
+```
+
+Then set the result back with `set -g status-format[0] "…"`. The rest of
+the line stays as it was. If the plugin isn't loaded, the option is unset
+and expands to nothing, and the list shows as before. Only the list goes:
+the status line keeps its height, so panes don't resize when you switch
+windows.
 
 Sidebar panes are marked `@home_role=sidebar` and left out of the popup's
 rows, `^x`'s close check and `^t`'s reopen snapshot (as are
