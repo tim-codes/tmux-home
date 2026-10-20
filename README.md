@@ -106,6 +106,9 @@ set -g @home-restore-agents-delay 2 # seconds between resumed sessions
 set -g @home-save-interval 5        # minutes between resurrect autosaves (0: off)
 ```
 
+The plugin also sets `@home_sidebar_shown`, a format for your status line
+(see [Hiding the window list](#hiding-the-window-list)).
+
 State (the closed-window stack, the pinned sessions, the sidebar width set
 by hand, logs) lives in
 `${XDG_STATE_HOME:-~/.local/state}/tmux-home/<server key>/`, one directory
@@ -657,6 +660,28 @@ popup's movement keys:
 | `⏎` | Switch to the selected window; the sidebar's window gets its last pane back, so returning there doesn't land in the sidebar |
 | `Esc` | Hand the focus back to the window's last pane |
 | `q` | Close the sidebar |
+
+### Hiding the window list
+
+The sidebar lists the session's windows, so the status line's window list
+repeats it. `@home_sidebar_shown`, a format the plugin sets, is true
+(non-empty) when the window it is expanded for shows a sidebar: a pane
+marked `@home_role=sidebar`, in a window that isn't zoomed. It is worked out
+from the panes on every redraw, so nothing has to keep it in sync. It is
+right straight after a toggle, `q`, a pane closing, a restore, or a crash.
+In `status-format` the window is the client's current one. To use it, take
+your status line's format (`tmux show -gv 'status-format[0]'`; the window
+list is the `#{W:…}` part) and wrap the window list in it:
+
+```
+#{W:<window formats>}   →   #{?#{E:@home_sidebar_shown},,#{W:<window formats>}}
+```
+
+Then set the result back with `set -g status-format[0] "…"`. The rest of
+the line stays as it was. If the plugin isn't loaded, the option is unset
+and expands to nothing, and the list shows as before. Only the list goes:
+the status line keeps its height, so panes don't resize when you switch
+windows.
 
 Sidebar panes are marked `@home_role=sidebar` and left out of the popup's
 rows, `^x`'s close check and `^t`'s reopen snapshot (as are

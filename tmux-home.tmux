@@ -131,6 +131,15 @@ if [[ -n ${sk[1]:-} && ${sk[1]} != - ]]; then
 	t bind-key "${sk[1]}" run-shell -b "$(sidebar_cmd '')"
 fi
 
+# A format for status lines: true (non-empty) when the window it is
+# expanded for shows a tmux-home sidebar - a pane marked @home_role=sidebar,
+# and not zoomed (a zoomed pane hides it). Derived from the panes each time
+# it is expanded, so nothing has to keep it in sync: it is right after a
+# toggle, a close, a restore or a crash alike. In status-format the window
+# is the client's current one, so `#{?#{E:@home_sidebar_shown},,#{W:...}}`
+# drops the window list while the sidebar shows them (README, Sidebar).
+t set -g @home_sidebar_shown '#{?window_zoomed_flag,,#{P:#{?#{==:#{@home_role},sidebar},1,}}}'
+
 if [[ -x $RUST_BIN ]]; then
 	# The daemon: one per server; a second start is a no-op (lock), and it
 	# exits with the server.
