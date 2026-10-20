@@ -476,6 +476,30 @@ pub enum Action {
     PreviewPct(Option<u16>),
 }
 
+/// The switch keys' modifiers: what `CSI 1;8P` (C-M-S-F1) and its kin
+/// (xterm's modifier 8) decode to.
+const SWITCH_KEY_MODS: KeyModifiers = KeyModifiers::CONTROL
+    .union(KeyModifiers::ALT)
+    .union(KeyModifiers::SHIFT);
+
+/// The switch keys' function keys, for windows 1 … 10: C-M-S-F`n` for
+/// window `n`, except window 3's C-M-S-F12. C-M-S-F3 is `CSI 1;8R`, which
+/// crossterm reads as a cursor position report, never as a key.
+pub const SWITCH_FKEYS: [u8; 10] = [1, 2, 12, 4, 5, 6, 7, 8, 9, 10];
+
+/// The window index a switch key selects (the terminal sends them for
+/// Cmd+Opt+1 … Cmd+Opt+0; `@home-switch-keys` binds the same keys
+/// outside the popup).
+pub fn switch_key(k: &KeyEvent) -> Option<u32> {
+    match k.code {
+        KeyCode::F(n) if k.modifiers == SWITCH_KEY_MODS => SWITCH_FKEYS
+            .iter()
+            .position(|&f| f == n)
+            .map(|i| i as u32 + 1),
+        _ => None,
+    }
+}
+
 pub const FOOTER_LIST: &str = " ⏎ go   ^r rename   M-r auto-name   ^x close   ^t reopen   M-↑↓ move   M-n new   ^o preview   M-j/k size   pfx ( ) session   Esc clear/close   F1 keys";
 pub const FOOTER_EDIT: &str = " ⏎ save   Esc cancel   (empty name cancels)";
 pub const FOOTER_NEW: &str = " ⏎ create   Esc cancel   (empty = automatic name)";
@@ -660,6 +684,31 @@ impl App {
     /// The page's tab position (0 when there is none).
     fn tab_pos(&self, sid: &str) -> usize {
         self.tabs.iter().position(|t| t.sid == sid).unwrap_or(0)
+    }
+
+    /// `Switch` to window `index` of the client's session (no client: the
+    /// page shown), with the window's own active pane; `None` when it has
+    /// no window at that index.
+    fn window_switch(&mut self, index: u32) -> Action {
+        let sid = match self.tabs.iter().find(|t| t.client) {
+            Some(t) => t.sid.clone(),
+            None => match &self.tab {
+                Some(s) => s.clone(),
+                None => return Action::None,
+            },
+        };
+        match self
+            .rows
+            .iter()
+            .find(|r| !r.pinned && r.sid == sid && r.index == index)
+        {
+            Some(r) => Action::Switch {
+                sid: r.sid.clone(),
+                wid: r.wid.clone(),
+                pane: None,
+            },
+            None => Action::None,
+        }
     }
 
     /// The page the popup opens on: the client's session, else the first.
@@ -1070,6 +1119,14 @@ impl App {
             }
             self.armed = c.is_prefix(&k);
         }
+        // Switch keys (C-M-S-F1 … F10, the terminal's Cmd+Opt+1 … 0; see
+        // `SWITCH_FKEYS`): go to
+        // that window of the client's session, from any mode, as the root
+        // binding does outside the popup (tmux gives the popup its keys
+        // first). An index with no window does nothing.
+        if let Some(n) = switch_key(&k) {
+            return self.window_switch(n);
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         match &mut self.mode {
@@ -1348,6 +1405,9 @@ pub const HELP: &str = "tmux-home — keys   (press any key to return)
                   preview; remembered across opens (@home-preview-pct)
   M-=             back to the automatic size: the list's lines plus 2,
                   the preview the rest (half if it would get under a third)
+  C-M-S-F1…F10    go to window 1…10 of your session and close (F12 for
+                  window 3; sent by the terminal for Cmd+Opt+1…0; nothing
+                  if there is no such window)
   F1  ^/          this help
   (window keys act on a pane row's window)";
 
@@ -1544,6 +1604,40 @@ mod tests {
         let logs = a.selected().unwrap();
         assert_eq!(logs.pane.as_deref(), Some("%2"));
         assert_eq!(logs.path, "~/d/x");
+    }
+
+    #[test]
+    fn switch_keys_go_to_a_window_of_the_clients_session_from_any_page_and_mode() {
+        let wk = |n| KeyEvent::new(KeyCode::F(n), SWITCH_KEY_MODS);
+        assert_eq!(switch_key(&wk(1)), Some(1));
+        assert_eq!(switch_key(&wk(12)), Some(3));
+        assert_eq!(switch_key(&wk(3)), None, "unreadable: F12 stands in");
+        assert_eq!(switch_key(&wk(10)), Some(10));
+        assert_eq!(switch_key(&wk(11)), None);
+        assert_eq!(switch_key(&key(KeyCode::F(1))), None, "plain F1 is help");
+        let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(switch_key(&KeyEvent::new(KeyCode::F(2), ctrl_alt)), None);
+
+        let mut a = app();
+        let to_build = Action::Switch {
+            sid: "$1".into(),
+            wid: "@3".into(),
+            pane: None,
+        };
+        // the client is on beta ($1): its window 1 is @3, from any page
+        a.page_tab(-1);
+        assert_eq!(a.tab.as_deref(), Some("$0"));
+        assert_eq!(a.key(wk(1)), to_build);
+        // a missing index does nothing
+        assert_eq!(a.key(wk(7)), Action::None);
+        // in an editor too, dropping the edit
+        a.key(ctrl('r'));
+        assert!(matches!(a.mode, Mode::Rename { .. }));
+        assert_eq!(a.key(wk(1)), to_build);
+        // with a filter that hides the window
+        let mut a = app();
+        typed(&mut a, "logs");
+        assert_eq!(a.key(wk(1)), to_build);
     }
 
     #[test]

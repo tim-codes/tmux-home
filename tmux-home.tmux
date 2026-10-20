@@ -140,6 +140,26 @@ fi
 # drops the window list while the sidebar shows them (README, Sidebar).
 t set -g @home_sidebar_shown '#{?window_zoomed_flag,,#{P:#{?#{==:#{@home_role},sidebar},1,}}}'
 
+# Switch keys (opt-in, @home-switch-keys on): C-M-S-F1 ... C-M-S-F10 select
+# window 1 ... 10 of the current session, from the root table - except that
+# window 3 is C-M-S-F12: C-M-S-F3 is CSI 1;8R, which the popup's terminal
+# library reads as a cursor position report. They are meant to be sent by
+# the terminal for a chord tmux can't see (Cmd+Opt+1 ... Cmd+Opt+0; README,
+# Switch keys): a modified function key, not a user-keys entry, because
+# tmux hands an open popup its keys before any key table and drops User
+# keys there, while it passes C-M-S-Fn on, and the popup acts on them
+# itself (app::SWITCH_FKEYS, the same table). A missing index does nothing.
+# Focus in a sidebar goes back to the window's last pane first, as the
+# sidebar's own switch does, so coming back doesn't land in the sidebar.
+if [[ $(t show-options -gqv @home-switch-keys) == on ]]; then
+	i=0
+	for f in 1 2 12 4 5 6 7 8 9 10; do
+		i=$((i + 1))
+		t bind-key -n "C-M-S-F$f" if-shell -F "#{W:#{?#{==:#{window_index},$i},1,}}" \
+			"if-shell -F '#{&&:#{==:#{@home_role},sidebar},#{P:#{?pane_last,1,}}}' last-pane ; select-window -t :$i"
+	done
+fi
+
 if [[ -x $RUST_BIN ]]; then
 	# The daemon: one per server; a second start is a no-op (lock), and it
 	# exits with the server.
