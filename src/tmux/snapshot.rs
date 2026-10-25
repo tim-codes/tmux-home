@@ -217,11 +217,13 @@ pub async fn read_snapshot_async(t: &Tmux) -> anyhow::Result<Snapshot> {
     tokio::task::spawn_blocking(move || read_snapshot(&t)).await?
 }
 
-/// The panes of one window (or any `list-panes -t` target), parsed exactly
-/// as a snapshot's are.
+/// The panes of one window (or any `list-panes -t` target), read exactly
+/// as a snapshot's are, agent processes included (`agent::procs`).
 pub fn read_panes(t: &Tmux, target: &str) -> anyhow::Result<Vec<Pane>> {
     let out = t.run(&["list-panes", "-t", target, "-F", &PANE_FMT])?;
-    Ok(parse(&out, "").panes)
+    let mut s = parse(&out, "");
+    crate::agent::procs::annotate(&mut s);
+    Ok(s.panes)
 }
 
 fn read_parsed(t: &Tmux) -> anyhow::Result<Snapshot> {

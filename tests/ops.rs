@@ -484,3 +484,49 @@ fn close_plan_warns_about_a_working_agent() {
     assert_eq!(tx.close_plan(&wid(&s, "alpha:st")).unwrap(), ClosePlan::Now);
     assert_eq!(ask("alpha:vi"), "close \"vi\"? running: sleep (y/N) ");
 }
+
+/// An agent a wrapper left under the pane's shell (`sh -c "claude …"`
+/// without job control: tmux reports the shell) is found by process, so ^x
+/// asks before closing its window, hooks or not.
+#[test]
+fn close_plan_sees_an_agent_under_the_shell() {
+    use tmux_home::ops::ClosePlan;
+    let s = TestServer::start();
+    let claude = common::fake_claude();
+    let wrapped = format!("'{claude}' & wait");
+    for n in ["hooked", "bare"] {
+        s.tmux(&[
+            "new-window",
+            "-d",
+            "-t",
+            "alpha:",
+            "-n",
+            n,
+            "sh",
+            "-c",
+            &wrapped,
+        ]);
+    }
+    s.wait_settled();
+    for n in ["hooked", "bare"] {
+        let cmd = show(&s, &format!("alpha:{n}"), "#{pane_current_command}");
+        assert!(tmux_home::ops::is_shell(&cmd), "tmux sees the shell: {cmd}");
+    }
+    for (k, v) in [
+        ("@home_agent", "claude"),
+        ("@home_status", "running"),
+        ("@home_config_dir", "/u/.claude-exxo-openrouter"),
+    ] {
+        s.tmux(&["set-option", "-p", "-t", "alpha:hooked", k, v]);
+    }
+    let tx = Tx::new(s.socket.clone());
+    let ask = |w: &str| match tx.close_plan(&wid(&s, w)).unwrap() {
+        ClosePlan::Ask(p) => p,
+        other => panic!("{w}: {other:?}"),
+    };
+    assert_eq!(
+        ask("alpha:hooked"),
+        "close \"hooked\"? agent still working — running: kimi (y/N) "
+    );
+    assert_eq!(ask("alpha:bare"), "close \"bare\"? running: claude (y/N) ");
+}

@@ -200,11 +200,20 @@ impl Tx {
             if let Some(a) = &agent {
                 busy.agent_working |= a.state.status.working();
             }
-            if !is_shell(&pane.current_command) {
-                match agent {
-                    Some(a) => add(a.state.kind.name().to_string()),
-                    None => add(pane.current_command.clone()),
-                }
+            // an agent a wrapper left under the pane's shell runs all the
+            // same (`agent::procs`); its hooks may not have said so yet
+            let found = pane
+                .proc_agent
+                .as_ref()
+                .and_then(|_| crate::agent::kind_of(pane, None));
+            if let Some(a) = &agent
+                && (!is_shell(&pane.current_command) || pane.proc_agent.is_some())
+            {
+                add(a.state.kind.name().to_string());
+            } else if let Some(k) = found {
+                add(k.name().to_string());
+            } else if !is_shell(&pane.current_command) {
+                add(pane.current_command.clone());
             } else {
                 for job in stopped_jobs(&pane.tty) {
                     add(format!("{job} (stopped)"));
