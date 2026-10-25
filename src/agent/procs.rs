@@ -149,13 +149,24 @@ static ENV_CACHE: LazyLock<Mutex<EnvCache>> = LazyLock::new(|| Mutex::new(HashMa
 /// gets its account from its environment only when the pane's options
 /// don't already say (`@agent`, `@home_config_dir`).
 pub fn annotate(s: &mut Snapshot) {
-    if !s.panes.iter().any(|p| p.pid != 0 && p.role != "sidebar") {
+    if !s.panes.iter().any(needs_walk) {
         return;
     }
     let Some(t) = ProcTable::read() else {
         return;
     };
     annotate_with(s, &t, &mut |pid| read_env(pid, CONFIG_DIR_VAR));
+}
+
+/// Whether finding `p`'s agent takes the process table: a work pane,
+/// unless its launcher marked it (`@agent`: the kind is known) and tmux
+/// already reports Claude Code as its command (so it is known to run). A
+/// marked pane whose agent a wrapper left under the shell still needs
+/// the walk, or it would look ended.
+fn needs_walk(p: &crate::tmux::snapshot::Pane) -> bool {
+    p.pid != 0
+        && p.role != "sidebar"
+        && !(super::marker(p).is_some() && super::AgentKind::Claude.looks_alive(&p.current_command))
 }
 
 /// `annotate` against table `t`, reading `CLAUDE_CONFIG_DIR` through `env`
@@ -453,6 +464,25 @@ mod tests {
             ]
         );
         assert_eq!(asked, [11], "env read only where the pane doesn't say");
+    }
+
+    /// Marked panes that tmux already shows running Claude Code (and
+    /// sidebars, and panes without a pid) don't need the process table;
+    /// a marked pane at its shell does.
+    #[test]
+    fn the_table_is_needed_only_where_the_panes_dont_say() {
+        let marked = |cmd: &str| {
+            let mut p = pane("%1", 10, &[("@agent", "kimi")]);
+            p.current_command = cmd.into();
+            p
+        };
+        assert!(!needs_walk(&marked("2.1.310")) && !needs_walk(&marked("claude")));
+        assert!(needs_walk(&marked("fish")), "a wrapper's launch");
+        assert!(needs_walk(&pane("%1", 10, &[])));
+        assert!(!needs_walk(&pane("%1", 0, &[])));
+        let mut side = pane("%1", 10, &[]);
+        side.role = "sidebar".into();
+        assert!(!needs_walk(&side));
     }
 
     #[test]
