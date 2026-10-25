@@ -20,6 +20,14 @@ use std::{
 
 /// Mouse reporting is on (a `MouseGuard` is alive).
 static MOUSE_ON: AtomicBool = AtomicBool::new(false);
+/// modifyOtherKeys mode 2 is on (an `ExtendedKeys` that asked is alive).
+static KEYS_ON: AtomicBool = AtomicBool::new(false);
+
+/// Writes the sequence that resets modifyOtherKeys.
+pub fn keys_off(out: &mut impl Write) {
+    let _ = out.write_all(b"\x1b[>4m");
+    let _ = out.flush();
+}
 
 thread_local! {
     /// Set while a `quietly` call runs on this thread.
@@ -65,14 +73,18 @@ impl Drop for MouseGuard {
 }
 
 /// The panic hook's own part: nothing for a panic inside `quietly` (it is
-/// caught, and the popup carries on); otherwise the mouse off if it is on.
-/// True when the previous hook should run.
-pub fn on_panic(quiet: bool, mouse_on: bool, out: &mut impl Write) -> bool {
+/// caught, and the popup carries on); otherwise the mouse off if it is
+/// on, and modifyOtherKeys reset if it was asked for. True when the
+/// previous hook should run.
+pub fn on_panic(quiet: bool, mouse_on: bool, keys_on: bool, out: &mut impl Write) -> bool {
     if quiet {
         return false;
     }
     if mouse_on {
         mouse_off(out);
+    }
+    if keys_on {
+        keys_off(out);
     }
     true
 }
@@ -83,8 +95,8 @@ pub fn on_panic(quiet: bool, mouse_on: bool, out: &mut impl Write) -> bool {
 /// ^r. Only asked for when tmux's `extended-keys-format` is `csi-u`
 /// (`wanted`): crossterm reads `CSI 114;6u`, but drops the xterm form
 /// (`CSI 27;6;114~`) — and in mode 2 that would be every Ctrl and Alt key.
-/// The popup's screen goes with the popup, so a panic needs no reset.
-pub struct ExtendedKeys(bool);
+/// Reset on drop, and by the panic hook (`on_panic`).
+pub struct ExtendedKeys;
 
 impl ExtendedKeys {
     /// tmux's `extended-keys` (`on`/`always`) and `extended-keys-format`
@@ -98,17 +110,16 @@ impl ExtendedKeys {
             let mut out = std::io::stdout();
             let _ = out.write_all(b"\x1b[>4;2m");
             let _ = out.flush();
+            KEYS_ON.store(true, Ordering::SeqCst);
         }
-        ExtendedKeys(want)
+        ExtendedKeys
     }
 }
 
 impl Drop for ExtendedKeys {
     fn drop(&mut self) {
-        if self.0 {
-            let mut out = std::io::stdout();
-            let _ = out.write_all(b"\x1b[>4m");
-            let _ = out.flush();
+        if KEYS_ON.swap(false, Ordering::SeqCst) {
+            keys_off(&mut std::io::stdout());
         }
     }
 }
@@ -123,7 +134,9 @@ pub fn install_panic_hook() {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let (quiet, mouse) = (QUIET.with(Cell::get), MOUSE_ON.load(Ordering::SeqCst));
-            if on_panic(quiet, mouse, &mut std::io::stdout()) {
+            // a caught (`quietly`) panic leaves the mode on
+            let keys = !quiet && KEYS_ON.swap(false, Ordering::SeqCst);
+            if on_panic(quiet, mouse, keys, &mut std::io::stdout()) {
                 prev(info);
             }
         }));
@@ -166,9 +179,9 @@ mod tests {
     #[test]
     fn the_hook_turns_the_mouse_off() {
         let mut out = Vec::new();
-        assert!(on_panic(false, false, &mut out));
+        assert!(on_panic(false, false, false, &mut out));
         assert!(out.is_empty(), "nothing when the mouse isn't on");
-        assert!(on_panic(false, true, &mut out));
+        assert!(on_panic(false, true, false, &mut out));
         let s = String::from_utf8(out).unwrap();
         for seq in ["\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l", "\x1b[?1006l"] {
             assert!(s.contains(seq), "no {seq:?} in {s:?}");
@@ -178,8 +191,15 @@ mod tests {
     #[test]
     fn a_quiet_panic_writes_nothing_and_skips_the_previous_hook() {
         let mut out = Vec::new();
-        assert!(!on_panic(true, true, &mut out));
+        assert!(!on_panic(true, true, true, &mut out));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn the_hook_resets_extended_keys() {
+        let mut out = Vec::new();
+        assert!(on_panic(false, false, true, &mut out));
+        assert_eq!(out, b"\x1b[>4m");
     }
 
     #[test]
