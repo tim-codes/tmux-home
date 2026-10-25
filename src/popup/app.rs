@@ -67,12 +67,27 @@ pub struct PaneRow {
     pub path: String,
     /// The pane title (often just the host name; see `App::host`).
     pub title: String,
+    /// The name given with ^r (`@home_pane_name`): shown instead of the
+    /// title, which agents keep rewriting.
+    pub name: String,
     pub agent: Option<PaneAgent>,
     /// Git status (root, status) of the repo the pane's cwd is in.
     pub git: Option<(String, RepoStatus)>,
     /// Geometry in its window, in cells: left, top, width, height.
     pub rect: (u32, u32, u32, u32),
     pub(crate) hay: String,
+}
+
+impl PaneRow {
+    /// What the pane is called: the name given with ^r, else its title
+    /// (which may be just the host name; see `App::host`).
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.title
+        } else {
+            &self.name
+        }
+    }
 }
 
 impl Row {
@@ -191,11 +206,13 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                     let git = git_of(&p.current_path);
                     let path = short_path(&p.current_path, home);
                     let title = p.title.replace(['\t', '\n'], " ");
+                    let name = p.name.replace(['\t', '\n'], " ");
                     let cmd = display_cmd(p);
                     let hay = format!(
-                        "{} {} {} {} {}",
+                        "{} {} {} {} {} {}",
                         cmd,
                         path,
+                        name,
                         title,
                         agent.as_ref().map(|a| a.state.kind.name()).unwrap_or(""),
                         git.as_ref().map(|(_, g)| g.branch.as_str()).unwrap_or("")
@@ -207,6 +224,7 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                         cwd: p.current_path.clone(),
                         path,
                         title,
+                        name,
                         agent,
                         git,
                         rect: (p.left, p.top, p.width, p.height),
@@ -434,8 +452,10 @@ impl Chord {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
     List,
+    /// Renaming window `wid`, or its pane `pane` (^r on a pane).
     Rename {
         wid: String,
+        pane: Option<String>,
         edit: LineEdit,
     },
     NewWindow {
@@ -463,6 +483,12 @@ pub enum Action {
     },
     Rename {
         wid: String,
+        name: String,
+    },
+    /// Name a pane (`@home_pane_name`); an empty name clears it, back to
+    /// the pane's title.
+    RenamePane {
+        pane: String,
         name: String,
     },
     ResetName(String),
@@ -511,10 +537,36 @@ pub fn switch_key(k: &KeyEvent) -> Option<u32> {
     }
 }
 
-pub const FOOTER_LIST: &str = " ⏎ go   ^r rename   M-r auto-name   ^x close   ^t reopen   M-↑↓ move   M-n new   ^o preview   M-j/k size   pfx ( ) session   Esc clear/close   F1 keys";
+pub const FOOTER_LIST: &str = " ⏎ go   ^r rename pane   ^S-r rename window   M-r auto-name   ^x close   ^t reopen   M-↑↓ move   M-n new   ^o preview   M-j/k size   pfx ( ) session   Esc clear/close   F1 keys";
 pub const FOOTER_EDIT: &str = " ⏎ save   Esc cancel   (empty name cancels)";
+pub const FOOTER_EDIT_PANE: &str = " ⏎ save   Esc cancel   (empty: back to the pane's title)";
 pub const FOOTER_NEW: &str = " ⏎ create   Esc cancel   (empty = automatic name)";
 pub const FOOTER_CLOSE: &str = " y close   any other key or Esc cancels";
+
+/// Ctrl+Shift+R, the window-rename key: with the terminal's extended keys
+/// on (tmux's `extended-keys` and `extended-keys-format csi-u`; see
+/// `popup::term::ExtendedKeys`) it arrives as `CSI 114;6u`, Ctrl+Shift
+/// and `r` (or `R`); otherwise it reads as plain ^r. M-R (Alt+Shift+R)
+/// works on every setup.
+pub fn is_rename_window_key(k: &KeyEvent) -> bool {
+    let m = k.modifiers;
+    match k.code {
+        KeyCode::Char('r') | KeyCode::Char('R')
+            if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+        {
+            true
+        }
+        // ESC R reads as Alt (+ Shift) R
+        KeyCode::Char('R') => m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+/// Whether a pane title says more than the host name tmux gives a pane.
+pub fn shows_title(title: &str, host: &str) -> bool {
+    let short = host.split('.').next().unwrap_or(host);
+    !title.trim().is_empty() && title != host && title != short
+}
 
 /// A session page, as the tab strip shows it.
 #[derive(Clone, Debug, PartialEq)]
@@ -1153,18 +1205,18 @@ impl App {
                     _ => Action::Redraw,
                 }
             }
-            Mode::Rename { wid, edit } => match k.code {
+            Mode::Rename { wid, pane, edit } => match k.code {
                 KeyCode::Esc => {
                     self.mode = Mode::List;
                     Action::Redraw
                 }
                 KeyCode::Enter => {
-                    let (wid, name) = (wid.clone(), edit.as_string());
+                    let (wid, pane, name) = (wid.clone(), pane.clone(), edit.as_string());
                     self.mode = Mode::List;
-                    if name.is_empty() {
-                        Action::Redraw
-                    } else {
-                        Action::Rename { wid, name }
+                    match pane {
+                        Some(pane) => Action::RenamePane { pane, name },
+                        None if name.is_empty() => Action::Redraw,
+                        None => Action::Rename { wid, name },
                     }
                 }
                 _ => {
@@ -1235,13 +1287,18 @@ impl App {
             }
             KeyCode::Char('c') | KeyCode::Char('q') if ctrl => return Action::Quit,
             KeyCode::Char('g') if ctrl => self.jump_attention(),
+            // ^S-r (or its fallback M-R): the window, from any line
+            _ if is_rename_window_key(&k) => {
+                if let Some(r) = sel {
+                    self.start_rename(r, None);
+                }
+            }
+            // ^r: the line's pane (a window of one pane is that pane);
+            // on a window of several, the window
             KeyCode::Char('r') if ctrl => {
                 if let Some(r) = sel {
-                    self.notice = None;
-                    self.mode = Mode::Rename {
-                        wid: r.wid,
-                        edit: LineEdit::with(&r.name),
-                    };
+                    let pane = self.rename_pane().map(|p| p.id.clone());
+                    self.start_rename(r, pane);
                 }
             }
             KeyCode::Char('r') if alt => {
@@ -1285,6 +1342,46 @@ impl App {
             }
         }
         Action::Redraw
+    }
+
+    /// The pane ^r renames: the selected pane row's, or the only pane of
+    /// the selected window row's window.
+    pub fn rename_pane(&self) -> Option<&PaneRow> {
+        let it = self.selected_item()?;
+        let r = &self.rows[it.row];
+        match it.pane {
+            Some(p) => r.panes.get(p),
+            None if r.panes.len() == 1 => r.panes.first(),
+            None => None,
+        }
+    }
+
+    /// The rename editor for window `r`, or its pane `pane`, filled with
+    /// the name shown now (a pane's title only when it says something).
+    fn start_rename(&mut self, r: Row, pane: Option<String>) {
+        self.notice = None;
+        let text = match &pane {
+            Some(id) => r
+                .panes
+                .iter()
+                .find(|p| &p.id == id)
+                .map(|p| {
+                    if !p.name.is_empty() {
+                        p.name.clone()
+                    } else if shows_title(&p.title, &self.host) {
+                        p.title.clone()
+                    } else {
+                        String::new()
+                    }
+                })
+                .unwrap_or_default(),
+            None => r.name.clone(),
+        };
+        self.mode = Mode::Rename {
+            wid: r.wid,
+            pane,
+            edit: LineEdit::with(&text),
+        };
     }
 
     /// M-k (`up`: the divider up, the preview larger) / M-j (down,
@@ -1365,6 +1462,7 @@ impl App {
                 FOOTER_LIST.replacen("   ^r rename", "   ^g needs you   ^r rename", 1)
             }
             Mode::List | Mode::Help => FOOTER_LIST.into(),
+            Mode::Rename { pane: Some(_), .. } => FOOTER_EDIT_PANE.into(),
             Mode::Rename { .. } => FOOTER_EDIT.into(),
             Mode::NewWindow { .. } => FOOTER_NEW.into(),
             Mode::Confirm { .. } => FOOTER_CLOSE.into(),
@@ -1400,7 +1498,12 @@ pub const HELP: &str = "tmux-home — keys   (press any key to return)
   ^g              jump to the next window that needs you, on any page
   Esc             clear the filter; close if it is already empty
   prefix + key    the key that opened the popup closes it, from any mode
-  ^r              rename the window inline (⏎ save, Esc/empty cancel)
+  ^r              rename the pane inline: on a pane row, or a window of
+                  one pane (⏎ save, Esc cancel; empty: back to its title);
+                  on a window of several panes, the window
+  ^S-r  M-R       rename the window inline, from any line (⏎ save,
+                  Esc/empty cancel); ^S-r needs tmux's extended-keys on
+                  and extended-keys-format csi-u, M-R always works
   M-r             reset the window to its automatic name
   ^x              close the window; asks first (y/N) if anything but a
                   shell is running in it (a job stopped with ^z counts),
@@ -1758,10 +1861,13 @@ mod tests {
     fn rename_mode() {
         let mut a = app();
         typed(&mut a, "bui");
-        a.key(key(KeyCode::Down)); // the pane row: acts on its window
-        a.key(ctrl('r'));
+        a.key(key(KeyCode::Down)); // the pane row: ^S-r acts on its window
+        a.key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert!(
-            matches!(&a.mode, Mode::Rename { wid, edit } if wid == "@3" && edit.as_string() == "build")
+            matches!(&a.mode, Mode::Rename { wid, pane: None, edit } if wid == "@3" && edit.as_string() == "build")
         );
         // list keys don't act while editing; a snapshot leaves the editor alone
         a.key(ctrl('x'));
@@ -1776,20 +1882,91 @@ mod tests {
         );
         assert_eq!(a.mode, Mode::List);
         assert_eq!(a.filter.as_string(), "bui", "filter kept");
+        // M-R (Alt+Shift+R, however the terminal reports the shift) too
+        for m in [KeyModifiers::ALT, KeyModifiers::ALT | KeyModifiers::SHIFT] {
+            a.key(KeyEvent::new(KeyCode::Char('R'), m));
+            assert!(matches!(&a.mode, Mode::Rename { pane: None, .. }), "{m:?}");
+            a.key(key(KeyCode::Esc));
+        }
         // Esc cancels; empty name cancels
-        a.key(ctrl('r'));
+        a.key(alt(KeyCode::Char('R')));
         assert_eq!(a.key(key(KeyCode::Esc)), Action::Redraw);
         assert_eq!(a.mode, Mode::List);
-        a.key(ctrl('r'));
+        a.key(alt(KeyCode::Char('R')));
         a.key(ctrl('u'));
         assert_eq!(a.key(key(KeyCode::Enter)), Action::Redraw);
         // a vanished target closes the editor with a notice
-        a.key(ctrl('r'));
+        a.key(alt(KeyCode::Char('R')));
         let mut s = snap();
         s.windows.retain(|w| w.id != "@3");
         a.set_rows(rows_of(&s));
         assert_eq!(a.mode, Mode::List);
         assert!(a.notice.is_some());
+    }
+
+    /// ^r names the line's pane: a pane row's, or a window of one pane's
+    /// only pane; on a window of several it renames the window. The
+    /// editor starts from the name given, else a title worth showing.
+    #[test]
+    fn ctrl_r_renames_the_pane() {
+        let mut s = snap();
+        let mut second = s.panes[2].clone();
+        second.id = "%7".into();
+        second.index = 1;
+        second.title = "✳ Fix the build".into();
+        s.panes.push(second);
+        s.panes[3].name = "given".into();
+        let mut a = app_of(&s);
+        a.host = "host.local".into();
+        // beta: logs (two panes, and a sidebar) and build (one)
+        assert_eq!(sel(&a), "@2");
+        a.key(ctrl('r'));
+        assert!(
+            matches!(&a.mode, Mode::Rename { wid, pane: None, edit } if wid == "@2" && edit.as_string() == "logs")
+        );
+        a.key(key(KeyCode::Esc));
+        a.key(key(KeyCode::Down));
+        a.key(key(KeyCode::Down)); // logs' .1
+        a.key(ctrl('r'));
+        assert!(
+            matches!(&a.mode, Mode::Rename { pane: Some(p), edit, .. } if p == "%7" && edit.as_string() == "✳ Fix the build")
+        );
+        a.key(ctrl('u'));
+        typed(&mut a, "tests");
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Action::RenamePane {
+                pane: "%7".into(),
+                name: "tests".into()
+            }
+        );
+        // build's row: its only pane, starting from its given name;
+        // empty clears it
+        a.key(key(KeyCode::Down));
+        assert_eq!(sel(&a), "@3");
+        a.key(ctrl('r'));
+        assert!(
+            matches!(&a.mode, Mode::Rename { pane: Some(p), edit, .. } if p == "%3" && edit.as_string() == "given")
+        );
+        assert_eq!(a.footer(), FOOTER_EDIT_PANE);
+        a.key(ctrl('u'));
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Action::RenamePane {
+                pane: "%3".into(),
+                name: String::new()
+            }
+        );
+        // a host-name title isn't offered
+        let mut s = snap();
+        s.panes[3].title = "host".into();
+        let mut a = app_of(&s);
+        a.host = "host.local".into();
+        a.key(key(KeyCode::Down));
+        a.key(key(KeyCode::Down));
+        assert_eq!(sel(&a), "@3");
+        a.key(ctrl('r'));
+        assert!(matches!(&a.mode, Mode::Rename { edit, .. } if edit.is_empty()));
     }
 
     #[test]
@@ -2403,7 +2580,7 @@ mod tests {
         assert_eq!(a.filter.as_string(), "o)");
         // in an editor the chord types the paren
         a.clear_filter();
-        a.key(ctrl('r'));
+        a.key(alt(KeyCode::Char('R')));
         a.key(ctrl('a'));
         a.key(paren(')'));
         assert!(matches!(&a.mode, Mode::Rename { edit, .. } if edit.as_string() == ")logs"));

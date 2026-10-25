@@ -243,6 +243,12 @@ impl Runtime {
                 }
                 self.refresh(app);
             }
+            Action::RenamePane { pane, name } => {
+                if let Err(e) = self.tx.rename_pane(&pane, &name) {
+                    app.notice = Some(format!(" rename failed: {e}"));
+                }
+                self.refresh(app);
+            }
             Action::ResetName(wid) => {
                 let _ = self.tx.reset_name(&wid);
                 // automatic-rename applies on tmux's next status tick
@@ -361,11 +367,18 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     };
     let mut app = App::new();
     app.home = rt.home.clone();
-    app.host = rt
+    // one call: the host name, and whether extended keys can be asked for
+    let info = rt
         .tx
-        .run(&["display-message", "-p", "#{host}"])
-        .map(|h| h.trim().to_string())
+        .run(&[
+            "display-message",
+            "-p",
+            "#{host}\x1f#{extended-keys}\x1f#{extended-keys-format}",
+        ])
         .unwrap_or_default();
+    let mut info = info.trim_end_matches('\n').split('\x1f');
+    app.host = info.next().unwrap_or("").trim().to_string();
+    let ext = term::ExtendedKeys::wanted(info.next().unwrap_or(""), info.next().unwrap_or(""));
     app.chord = app::Chord::from_env();
     app.preview_pct = rt
         .tx
@@ -387,7 +400,10 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     // popup whose program asks for them); off again when the guard drops,
     // whichever way the loop ends
     let mouse = term::MouseGuard::on();
+    // Ctrl+Shift+R apart from ^r, where tmux can say so
+    let keys = term::ExtendedKeys::on(ext);
     let result = event_loop(&mut term, &mut app, &mut rt, &feed);
+    drop(keys);
     drop(mouse);
     ratatui::restore();
     result
@@ -616,11 +632,7 @@ fn clip_w(s: &str, w: usize) -> String {
     out
 }
 
-/// Whether a pane title says more than the host name tmux gives a pane.
-fn shows_title(title: &str, host: &str) -> bool {
-    let short = host.split('.').next().unwrap_or(host);
-    !title.trim().is_empty() && title != host && title != short
-}
+use app::shows_title;
 
 /// The cells of a line, one per column (empty: nothing to show). A
 /// window row has only `#` and `NM`.
@@ -646,7 +658,9 @@ fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; NCOLS] {
                 Col::Idx,
                 Span::styled(format!("{branch} .{}", p.index), dim),
             );
-            if shows_title(&p.title, &app.host) {
+            if !p.name.is_empty() {
+                set(Col::Name, Span::raw(p.name.clone()));
+            } else if shows_title(&p.title, &app.host) {
                 set(Col::Name, Span::styled(p.title.clone(), dim));
             }
             set(Col::Cmd, Span::raw(p.cmd.clone()));
@@ -783,6 +797,11 @@ fn draw(f: &mut Frame, app: &mut App, live: bool, shot: &Shot, now: u64) {
     // prompt line
     let (prompt, edit) = match &app.mode {
         Mode::List | Mode::Help => ("> ".to_string(), Some(&app.filter)),
+        Mode::Rename {
+            pane: Some(_),
+            edit,
+            ..
+        } => ("rename pane › ".to_string(), Some(edit)),
         Mode::Rename { edit, .. } => ("rename › ".to_string(), Some(edit)),
         Mode::NewWindow { edit, .. } => ("new window › ".to_string(), Some(edit)),
         Mode::Confirm { prompt, .. } => (prompt.clone(), None),
@@ -958,10 +977,16 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect, t: &Table, now: u64) {
         let mut cells = cells(app, it, now);
         // the editor/confirm is on the selected line's window row (its
         // pinned copy or not)
-        let editing = it.pane.is_none()
-            && sel_row == Some(it.row)
+        let editing = sel_row == Some(it.row)
             && match &app.mode {
-                Mode::Rename { wid, .. } | Mode::Confirm { wid, .. } => wid == &r.wid,
+                Mode::Rename { pane: Some(id), .. } => match it.pane {
+                    Some(pi) => &r.panes[pi].id == id,
+                    // a window of one pane
+                    None => r.panes.len() == 1 && &r.panes[0].id == id,
+                },
+                Mode::Rename { wid, .. } | Mode::Confirm { wid, .. } => {
+                    it.pane.is_none() && wid == &r.wid
+                }
                 _ => false,
             };
         if editing {
@@ -2101,7 +2126,7 @@ mod tests {
     fn resize_keys_leave_the_editors_alone() {
         let mut a = app();
         screen(&mut a, 200, 50);
-        a.key(ctrl('r'));
+        a.key(alt('R')); // the window's name
         for c in ['j', 'k', '='] {
             a.key(alt(c));
         }
@@ -2372,7 +2397,7 @@ mod tests {
         let mut a = app();
         a.key(plain(KeyCode::Down));
         screen(&mut a, 200, 50);
-        a.key(ctrl('r'));
+        a.key(alt('R')); // the window's name
         for c in [
             KeyCode::Up,
             KeyCode::Down,

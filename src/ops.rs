@@ -12,6 +12,10 @@ const US: char = '\x1f';
 
 /// A pane's role in a format: tmux-home's `@home_role`, else
 /// tmux-agent-sidebar's `@pane_role` (either marks a sidebar `sidebar`).
+/// Pane option: the name given to a pane in the popup (^r), shown in
+/// place of its title.
+pub const PANE_NAME: &str = "@home_pane_name";
+
 pub const ROLE_FMT: &str = "#{?#{@home_role},#{@home_role},#{@pane_role}}";
 
 /// tmux format-expands names and paths given to `rename-window`,
@@ -90,6 +94,16 @@ impl Tx {
 
     pub fn rename(&self, wid: &str, name: &str) -> anyhow::Result<()> {
         self.run(&["rename-window", "-t", wid, "--", &literal(name)])?;
+        Ok(())
+    }
+
+    /// Names pane `pane` (`PANE_NAME`); an empty name clears it.
+    pub fn rename_pane(&self, pane: &str, name: &str) -> anyhow::Result<()> {
+        if name.is_empty() {
+            self.run(&["set-option", "-p", "-u", "-t", pane, PANE_NAME])?;
+        } else {
+            self.run(&["set-option", "-p", "-t", pane, PANE_NAME, name])?;
+        }
         Ok(())
     }
 

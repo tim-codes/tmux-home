@@ -91,6 +91,10 @@ pub struct Pane {
     pub current_command: String,
     pub current_path: String,
     pub title: String,
+    /// The name given in the popup (`@home_pane_name`; ^r on a pane):
+    /// shown in place of the title, which agents keep rewriting.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// The pane's role: tmux-home's own `@home_role`, else
     /// tmux-agent-sidebar's `@pane_role` (both mark a sidebar `sidebar`);
     /// sidebar panes are views, not work.
@@ -153,12 +157,15 @@ const REC_END: &str = "\x1e\n";
 // stored with newlines and `|` replaced, but a literal \x1f in one would
 // shift the fields after it (the record is then misread, not lost).
 const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{?#{@home_role},#{@home_role},#{@pane_role}}\x1f#{pane_tty}\x1f#{@home_role}\x1f#{pane_left}\x1f#{pane_top}\x1f#{pane_width}\x1f#{pane_height}\x1f#{window_width}\x1f#{window_height}\x1f#{@home_sidebar_pin}\x1f#{@home_sidebar_off}\x1f#{pane_pid}\x1f";
-const PANE_TAIL: &str = "#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
+const PANE_TAIL: &str =
+    "#{session_name}\x1f#{@home_pane_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
+/// Fields in `PANE_TAIL`.
+const TAIL_FIELDS: usize = 4;
 /// Fields before the agent options.
 const HEAD_FIELDS: usize = 22;
 /// Fields in a `list-panes` record.
 fn pane_fields() -> usize {
-    HEAD_FIELDS + crate::agent::OPTIONS.len() + 3
+    HEAD_FIELDS + crate::agent::OPTIONS.len() + TAIL_FIELDS
 }
 
 /// `#{@a}\x1f#{@b}\x1f…\x1f`: the agent options, each followed by a separator.
@@ -289,7 +296,7 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
         };
         let (sid, wid) = (f[0].to_string(), f[1].to_string());
         let n = f.len();
-        let (sname, title, wname) = (f[n - 3], f[n - 2], f[n - 1]);
+        let (sname, pname, title, wname) = (f[n - 4], f[n - 3], f[n - 2], f[n - 1]);
         if !s.sessions.iter().any(|x| x.id == sid) {
             s.sessions.push(Session {
                 id: sid.clone(),
@@ -318,10 +325,11 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
             current_command: f[8].to_string(),
             current_path: f[9].to_string(),
             title: title.to_string(),
+            name: pname.to_string(),
             role: f[10].to_string(),
             tty: f[11].to_string(),
             home_role: f[12].to_string(),
-            agent_opts: agent_opts_from(&f[HEAD_FIELDS..n - 3]),
+            agent_opts: agent_opts_from(&f[HEAD_FIELDS..n - TAIL_FIELDS]),
             left: num(f[13]),
             top: num(f[14]),
             width: num(f[15]),

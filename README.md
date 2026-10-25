@@ -239,7 +239,8 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | `^g` | jump to the next window that needs you, paging to its session if needed |
 | `Esc` | clear the filter; close when it is already empty |
 | `prefix` + home key | close, from any mode: the key that opened the popup (`prefix .` by default) toggles it. Anything but a home key after the prefix acts as usual (`^a` still moves to the start); an unsaved rename or new-window name is dropped, a pending close is not done |
-| `^r` | rename inline (`⏎` saves; `Esc` or an empty name cancels) |
+| `^r` | rename the pane inline: on a pane row, or the row of a window with one pane (`⏎` saves; `Esc` cancels; an empty name goes back to the pane's title). On the row of a window with several panes, the window |
+| `^S-r` `M-R` | rename the window inline, from any line (`⏎` saves; `Esc` or an empty name cancels). `^S-r` needs extended keys (below); `M-R` works everywhere |
 | `M-r` | back to the automatic name |
 | `^x` | close the window, staying in the popup (see below) |
 | `^t` | reopen the last closed window |
@@ -251,7 +252,22 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | C-M-S-F1 … F10 | go to window 1 … 10 of your session and close; F12 for window 3 (see [Switch keys](#switch-keys)) |
 | `F1` `^/` | help |
 
-Window keys (`^r`, `M-r`, `^x`, `M-↑↓`, `M-n`) act on a pane row's window.
+Window keys (`^S-r`/`M-R`, `M-r`, `^x`, `M-↑↓`, `M-n`) act on a pane row's
+window.
+
+A pane's name is kept in its `@home_pane_name` option and shown in place
+of its title, which an agent keeps rewriting (Claude Code sets it to the
+task at hand); `select-pane -T` would be overwritten at once. The agents
+snapshot keeps it, so a restored agent pane gets its name back.
+
+Ctrl+Shift+R is told apart from `^r` only when tmux reports extended
+keys in the format the popup can read: `set -s extended-keys on` (or
+`always`) and `set -s extended-keys-format csi-u`. The popup then asks
+for modifyOtherKeys mode 2 (`CSI > 4;2m`) and gets `CSI 114;6u`. With
+`extended-keys-format xterm` tmux would send `CSI 27;6;114~`, which the
+popup's terminal library (crossterm) doesn't parse; in mode 2 every
+Ctrl and Alt key would arrive that way and be lost, so the popup leaves
+the mode off, `^S-r` reads as `^r`, and `M-R` is the window key.
 The preview keys work in the list only; the rename and new-window editors
 ignore them.
 

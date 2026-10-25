@@ -77,6 +77,42 @@ pub fn on_panic(quiet: bool, mouse_on: bool, out: &mut impl Write) -> bool {
     true
 }
 
+/// xterm's modifyOtherKeys mode 2 (`CSI > 4;2m`) while alive, reset
+/// (`CSI > 4m`) on drop. tmux (`extended-keys on`) then reports every
+/// modified key in its extended form, so Ctrl+Shift+R is no longer plain
+/// ^r. Only asked for when tmux's `extended-keys-format` is `csi-u`
+/// (`wanted`): crossterm reads `CSI 114;6u`, but drops the xterm form
+/// (`CSI 27;6;114~`) — and in mode 2 that would be every Ctrl and Alt key.
+/// The popup's screen goes with the popup, so a panic needs no reset.
+pub struct ExtendedKeys(bool);
+
+impl ExtendedKeys {
+    /// tmux's `extended-keys` (`on`/`always`) and `extended-keys-format`
+    /// allow mode 2 to be read.
+    pub fn wanted(extended_keys: &str, format: &str) -> bool {
+        matches!(extended_keys.trim(), "on" | "always") && format.trim() == "csi-u"
+    }
+
+    pub fn on(want: bool) -> ExtendedKeys {
+        if want {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(b"\x1b[>4;2m");
+            let _ = out.flush();
+        }
+        ExtendedKeys(want)
+    }
+}
+
+impl Drop for ExtendedKeys {
+    fn drop(&mut self) {
+        if self.0 {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(b"\x1b[>4m");
+            let _ = out.flush();
+        }
+    }
+}
+
 /// Chains a hook in front of the current one, once per process. In the
 /// popup it is installed right after `ratatui::init`, so a real panic
 /// turns the mouse off, then ratatui restores the terminal and the default
@@ -117,6 +153,15 @@ pub fn test_panic(at: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_keys_only_where_crossterm_reads_them() {
+        assert!(ExtendedKeys::wanted("on", "csi-u"));
+        assert!(ExtendedKeys::wanted("always", "csi-u\n"));
+        assert!(!ExtendedKeys::wanted("on", "xterm"));
+        assert!(!ExtendedKeys::wanted("off", "csi-u"));
+        assert!(!ExtendedKeys::wanted("", ""));
+    }
 
     #[test]
     fn the_hook_turns_the_mouse_off() {

@@ -181,7 +181,7 @@ fn rename_inline() {
     let (_env, s, o) = popup_fixture();
     let target = wid(&s, "alpha:editor");
     o.open_popup();
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › editor");
     o.keys(&["C-u"]);
     o.typed("renamed (x)+y, z");
@@ -192,13 +192,13 @@ fn rename_inline() {
     o.wait_for(r"^> +.*2/2");
     o.wait_for(r"▶ 0 +renamed \(x\)\+y, z");
     // the pre-fill round-trips ( ) + ,
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for(r"^rename › renamed \(x\)\+y, z");
     o.keys(&["Escape"]);
     o.wait_for(r"^> +.*2/2");
     assert_eq!(fmt(&s, &target, "#{window_name}"), "renamed (x)+y, z");
     // an empty name cancels
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › renamed");
     o.keys(&["C-u"]);
     o.keys(&["Enter"]);
@@ -207,7 +207,7 @@ fn rename_inline() {
     // a filter with ( ) + survives an editor round-trip
     o.typed("(x)+");
     o.wait_for(r"^> \(x\)\+ .*1/2");
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › renamed");
     o.keys(&["Escape"]);
     o.wait_for(r"^> \(x\)\+ .*1/2");
@@ -216,7 +216,7 @@ fn rename_inline() {
     // renaming a filtered selection hits that window; the filter stays
     o.typed("win");
     o.wait_for(r"^> win .*1/2");
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › win two");
     o.keys(&["BSpace", "BSpace", "BSpace"]);
     o.typed("2");

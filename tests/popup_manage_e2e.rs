@@ -83,7 +83,7 @@ fn close_idle_current_and_cursor() {
     assert!(!window_names(&s, "alpha").contains(&"qtwo".to_string()));
 
     // ^x does nothing while the rename editor is open
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › qnext");
     o.keys(&["C-x"]);
     std::thread::sleep(Duration::from_millis(500));
@@ -346,7 +346,7 @@ fn reorder_and_new_window() {
 fn live_redraw_keeps_the_editor() {
     let (_env, s, o) = popup_fixture();
     o.open_popup();
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › editor");
     o.typed("-x");
     s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "pushed"]);
@@ -356,7 +356,7 @@ fn live_redraw_keeps_the_editor() {
     o.wait_for(r"^> +.*3/3");
     o.keys(&["Down", "Down"]);
     o.wait_cursor_on("win two");
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › win two");
     s.tmux(&["kill-window", "-t", "alpha:1"]);
     o.wait_for("that window has gone");
