@@ -310,6 +310,7 @@ fn write_snapshot(s: &TestServer, id: &str, proj: &Path, transcript: &Path) {
             transcript: transcript.to_str().unwrap().into(),
             cwd: proj.to_str().unwrap().into(),
             config_dir: None,
+            pane_name: Some("api work".into()),
         }],
     };
     let file = snapshot_file(s);
@@ -416,6 +417,7 @@ fn a_restore_that_claims_nothing_leaves_the_next_free() {
         assert!(c.wait().unwrap().success());
     }
     assert_eq!(opt(&s, &p, "@home_restore"), id, "claimed");
+    assert_eq!(opt(&s, &p, "@home_pane_name"), "api work", "its name back");
     wait_until("resumed", || {
         std::fs::read_to_string(&log).is_ok_and(|l| !l.is_empty())
     });

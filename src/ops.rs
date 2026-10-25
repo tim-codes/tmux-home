@@ -12,6 +12,10 @@ const US: char = '\x1f';
 
 /// A pane's role in a format: tmux-home's `@home_role`, else
 /// tmux-agent-sidebar's `@pane_role` (either marks a sidebar `sidebar`).
+/// Pane option: the name given to a pane in the popup (^r), shown in
+/// place of its title.
+pub const PANE_NAME: &str = "@home_pane_name";
+
 pub const ROLE_FMT: &str = "#{?#{@home_role},#{@home_role},#{@pane_role}}";
 
 /// tmux format-expands names and paths given to `rename-window`,
@@ -90,6 +94,16 @@ impl Tx {
 
     pub fn rename(&self, wid: &str, name: &str) -> anyhow::Result<()> {
         self.run(&["rename-window", "-t", wid, "--", &literal(name)])?;
+        Ok(())
+    }
+
+    /// Names pane `pane` (`PANE_NAME`); an empty name clears it.
+    pub fn rename_pane(&self, pane: &str, name: &str) -> anyhow::Result<()> {
+        if name.is_empty() {
+            self.run(&["set-option", "-p", "-u", "-t", pane, PANE_NAME])?;
+        } else {
+            self.run(&["set-option", "-p", "-t", pane, PANE_NAME, name])?;
+        }
         Ok(())
     }
 
@@ -186,11 +200,20 @@ impl Tx {
             if let Some(a) = &agent {
                 busy.agent_working |= a.state.status.working();
             }
-            if !is_shell(&pane.current_command) {
-                match agent {
-                    Some(a) => add(a.state.kind.name().to_string()),
-                    None => add(pane.current_command.clone()),
-                }
+            // an agent a wrapper left under the pane's shell runs all the
+            // same (`agent::procs`); its hooks may not have said so yet
+            let found = pane
+                .proc_agent
+                .as_ref()
+                .and_then(|_| crate::agent::kind_of(pane, None));
+            if let Some(a) = &agent
+                && (!is_shell(&pane.current_command) || pane.proc_agent.is_some())
+            {
+                add(a.state.kind.name().to_string());
+            } else if let Some(k) = found {
+                add(k.name().to_string());
+            } else if !is_shell(&pane.current_command) {
+                add(pane.current_command.clone());
             } else {
                 for job in stopped_jobs(&pane.tty) {
                     add(format!("{job} (stopped)"));

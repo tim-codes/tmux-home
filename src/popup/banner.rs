@@ -120,13 +120,14 @@ fn identity(p: &PaneRow, now: u64) -> Vec<Piece> {
                 vec![Span::raw(crate::agent::elapsed(t, now))],
             ));
         }
-        if let Some(m) = a.state.model.as_deref().filter(|m| !m.is_empty()) {
-            v.push(piece(
-                "  ",
-                3,
-                vec![Span::styled(agents::short_model(m), dim())],
-            ));
-        }
+    }
+    // the launcher's model shows without hook state too
+    if let Some(m) = p.model.as_deref().filter(|m| !m.is_empty()) {
+        v.push(piece(
+            "  ",
+            3,
+            vec![Span::styled(agents::short_model(m), dim())],
+        ));
     }
     v
 }

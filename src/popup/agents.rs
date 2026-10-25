@@ -38,9 +38,12 @@ pub fn clip(s: &str, n: usize) -> String {
 /// A model ID as the banner shows it: `claude-opus-5-5` → `opus 5.5`
 /// (a date suffix dropped, `[1m]` kept as ` 1m`; the old
 /// `claude-3-5-sonnet-…` order too); anything else without its
-/// `claude-` prefix.
+/// `claude-` prefix. An OpenRouter-style ID loses its provider and preset
+/// (`moonshotai/kimi-k3@preset/tim-k3` → `kimi-k3`).
 pub fn short_model(id: &str) -> String {
     let id = id.trim();
+    let id = id.split('@').next().unwrap_or(id);
+    let id = id.rsplit('/').next().unwrap_or(id);
     let (base, ctx) = match id.split_once('[') {
         Some((b, rest)) => (b, rest.trim_end_matches(']')),
         None => (id, ""),
@@ -108,6 +111,7 @@ mod tests {
             ("claude-opus-4-6[1m]", "opus 4.6 1m"),
             ("claude-example-model", "example-model"),
             ("fable", "fable"),
+            ("moonshotai/kimi-k3@preset/tim-k3", "kimi-k3"),
             ("  claude-opus-5-5 ", "opus 5.5"),
         ] {
             assert_eq!(short_model(id), short, "{id}");

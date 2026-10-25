@@ -80,6 +80,10 @@ pub struct Entry {
     /// `$CLAUDE_CONFIG_DIR`; `None` for the default account.
     #[serde(default)]
     pub config_dir: Option<String>,
+    /// The name given to the pane in the popup (`@home_pane_name`),
+    /// given back to the pane it is restored into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_name: Option<String>,
 }
 
 impl Entry {
@@ -111,12 +115,18 @@ pub struct LivePane {
     pub transcript: String,
     pub cwd: String,
     pub config_dir: String,
+    /// `pane_pid`.
+    pub pid: u32,
+    /// A Claude Code process runs under the pane (`agent::procs`; set by
+    /// `list_panes`): a wrapper can leave it under the pane's shell.
+    pub agent_proc: bool,
+    pub pane_name: String,
     pub path: String,
     pub session: String,
 }
 
 /// The fields `LivePane` reads; free text (path, session name) last.
-pub const PANE_FMT: &str = "#{pane_id}\x1f#{window_index}\x1f#{pane_index}\x1f#{pane_current_command}\x1f#{pane_in_mode}\x1f#{pane_dead}\x1f#{@home_agent}\x1f#{@home_session_id}\x1f#{@home_restore}\x1f#{@home_restore_typed}\x1f#{@home_transcript}\x1f#{@home_cwd}\x1f#{@home_config_dir}\x1f#{pane_current_path}\x1f#{session_name}\x1e";
+pub const PANE_FMT: &str = "#{pane_id}\x1f#{window_index}\x1f#{pane_index}\x1f#{pane_current_command}\x1f#{pane_in_mode}\x1f#{pane_dead}\x1f#{@home_agent}\x1f#{@home_session_id}\x1f#{@home_restore}\x1f#{@home_restore_typed}\x1f#{@home_transcript}\x1f#{@home_cwd}\x1f#{@home_config_dir}\x1f#{pane_pid}\x1f#{@home_pane_name}\x1f#{pane_current_path}\x1f#{session_name}\x1e";
 
 /// Parses `list-panes -F PANE_FMT` output; malformed records are dropped.
 pub fn parse_panes(out: &str) -> Vec<LivePane> {
@@ -124,8 +134,8 @@ pub fn parse_panes(out: &str) -> Vec<LivePane> {
         .map(|r| r.trim_start_matches('\n'))
         .filter(|r| !r.is_empty())
         .filter_map(|r| {
-            let f: Vec<&str> = r.splitn(15, '\x1f').collect();
-            if f.len() != 15 {
+            let f: Vec<&str> = r.splitn(17, '\x1f').collect();
+            if f.len() != 17 {
                 return None;
             }
             Some(LivePane {
@@ -142,15 +152,18 @@ pub fn parse_panes(out: &str) -> Vec<LivePane> {
                 transcript: f[10].into(),
                 cwd: f[11].into(),
                 config_dir: f[12].into(),
-                path: f[13].into(),
-                session: f[14].into(),
+                pid: f[13].parse().unwrap_or(0),
+                agent_proc: false,
+                pane_name: f[14].into(),
+                path: f[15].into(),
+                session: f[16].into(),
             })
         })
         .collect()
 }
 
 /// The entries to save from the live panes. A pane is saved when it runs
-/// Claude (`looks_alive`) and its hooks have recorded a session with a
+/// Claude (a Claude Code process under it, or `looks_alive`) and its hooks have recorded a session with a
 /// transcript. A pane `restore-agents` claimed whose claude hasn't
 /// recorded its session yet (still waiting for its turn, or sitting at
 /// the resume dialog) keeps its `prev` entry, at its current location,
@@ -158,7 +171,7 @@ pub fn parse_panes(out: &str) -> Vec<LivePane> {
 pub fn snapshot_entries(panes: &[LivePane], prev: &Snapshot) -> Vec<Entry> {
     let mut out = Vec::new();
     for p in panes.iter().filter(|p| !p.dead) {
-        let alive = AgentKind::Claude.looks_alive(&p.command);
+        let alive = p.agent_proc || AgentKind::Claude.looks_alive(&p.command);
         if alive && p.agent == "claude" && !p.session_id.is_empty() && !p.transcript.is_empty() {
             out.push(Entry {
                 session: p.session.clone(),
@@ -173,6 +186,7 @@ pub fn snapshot_entries(panes: &[LivePane], prev: &Snapshot) -> Vec<Entry> {
                     p.cwd.clone()
                 },
                 config_dir: (!p.config_dir.is_empty()).then(|| p.config_dir.clone()),
+                pane_name: (!p.pane_name.is_empty()).then(|| p.pane_name.clone()),
             });
         } else if !p.claim.is_empty()
             && p.session_id.is_empty()
@@ -354,12 +368,13 @@ pub fn load(socket: &Path) -> anyhow::Result<Snapshot> {
 }
 
 fn list_panes(t: &Tmux) -> anyhow::Result<Vec<LivePane>> {
-    Ok(parse_panes(&t.run(&[
-        "list-panes",
-        "-a",
-        "-F",
-        PANE_FMT,
-    ])?))
+    let mut panes = parse_panes(&t.run(&["list-panes", "-a", "-F", PANE_FMT])?);
+    if let Some(procs) = crate::agent::procs::ProcTable::read() {
+        for p in panes.iter_mut().filter(|p| p.pid != 0) {
+            p.agent_proc = procs.agent_under(p.pid).is_some();
+        }
+    }
+    Ok(panes)
 }
 
 fn global(t: &Tmux, name: &str) -> String {
@@ -451,6 +466,9 @@ fn claim(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
         match r {
             Ok(p) => {
                 t.run(&["set-option", "-p", "-t", &p.id, CLAIM, &e.session_id])?;
+                if let Some(n) = e.pane_name.as_deref().filter(|n| !n.is_empty()) {
+                    t.run(&["set-option", "-p", "-t", &p.id, crate::ops::PANE_NAME, n])?;
+                }
                 claimed += 1;
             }
             Err(why) => log(
@@ -573,6 +591,7 @@ mod tests {
                 .into(),
             cwd: "/w/api".into(),
             config_dir: None,
+            pane_name: None,
         }
     }
 
@@ -602,7 +621,7 @@ mod tests {
 
     #[test]
     fn parses_list_panes() {
-        let out = "%3\x1f1\x1f0\x1f2.1.295\x1f0\x1f0\x1fclaude\x1fsid\x1f\x1f\x1f/t/sid.jsonl\x1f/w\x1f/h/.c\x1f/w/x\x1fmain\x1e\n%4\x1f2\x1f1\x1ffish\x1f1\x1f0\x1f\x1f\x1fsid2\x1f1\x1f\x1f\x1f\x1f/w\x1fmy session\x1e\nbroken\x1e\n";
+        let out = "%3\x1f1\x1f0\x1f2.1.295\x1f0\x1f0\x1fclaude\x1fsid\x1f\x1f\x1f/t/sid.jsonl\x1f/w\x1f/h/.c\x1f42\x1fapi\x1f/w/x\x1fmain\x1e\n%4\x1f2\x1f1\x1ffish\x1f1\x1f0\x1f\x1f\x1fsid2\x1f1\x1f\x1f\x1f\x1f\x1f\x1f/w\x1fmy session\x1e\nbroken\x1e\n";
         let p = parse_panes(out);
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].id, "%3");
@@ -611,6 +630,10 @@ mod tests {
         assert_eq!(p[0].transcript, "/t/sid.jsonl");
         assert_eq!(p[0].config_dir, "/h/.c");
         assert_eq!(p[0].path, "/w/x");
+        assert_eq!(
+            (p[0].pane_name.as_str(), p[1].pane_name.as_str()),
+            ("api", "")
+        );
         assert!(!p[0].typed && p[0].claim.is_empty());
         assert_eq!(p[1].session, "my session");
         assert!(p[1].in_mode && p[1].typed);
@@ -655,6 +678,7 @@ mod tests {
                 transcript: "/t/a.jsonl".into(),
                 cwd: "/w/api".into(),
                 config_dir: Some("/h/.claude-work".into()),
+                pane_name: None,
             }
         );
         // no cwd recorded: the pane's directory; no account: None
@@ -668,6 +692,18 @@ mod tests {
             (e[0].cwd.as_str(), e[0].config_dir.clone()),
             ("/w/api/sub", None)
         );
+        // a wrapper left claude under the shell (Kimi's launcher): the
+        // process under the pane says it runs
+        let p = LivePane {
+            command: "fish".into(),
+            agent_proc: true,
+            pane_name: "api work".into(),
+            ..agent_pane("%1", "k")
+        };
+        let e = snapshot_entries(&[p], &Snapshot::default());
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].session_id, "k");
+        assert_eq!(e[0].pane_name.as_deref(), Some("api work"), "its name kept");
     }
 
     #[test]

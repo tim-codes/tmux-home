@@ -43,10 +43,11 @@ fn opens_on_the_client_session_with_tabs_and_bottom_preview() {
         "current window marked and selected:\n{screen}"
     );
     assert!(
-        regex::Regex::new(r"(?m)^   └ \.0 ")
+        regex::Regex::new(r"(?m)^▌▶ 0 +editor +\S+ +/")
             .unwrap()
-            .is_match(&screen),
-        "a pane row under each window:\n{screen}"
+            .is_match(&screen)
+            && !screen.contains("└ .0"),
+        "a window of one pane is one line, with the pane's columns:\n{screen}"
     );
     assert!(bottom_preview(&screen, 200), "{screen}");
     // beta:logs previews its main pane, never its (active) sidebar
@@ -70,22 +71,17 @@ fn filter_esc_and_navigation() {
     o.wait_for(r"^> +.*2/2");
     assert!(o.popup_open(), "Esc on a filter only clears it");
     o.wait_cursor_on("editor");
-    // windows and their pane rows, wrapping within the page
+    // windows (of one pane each: one line), wrapping within the page
     for (k, name) in [
-        ("C-n", None),
-        ("C-j", Some("win two")),
-        ("Down", None),
-        ("Down", Some("editor")), // cycles, never to beta
-        ("C-p", None),
-        ("C-k", Some("win two")),
-        ("Up", None),
-        ("Up", Some("editor")),
+        ("C-n", "win two"),
+        ("C-j", "editor"), // cycles, never to beta
+        ("C-p", "win two"),
+        ("C-k", "editor"),
+        ("Up", "win two"),
+        ("Down", "editor"),
     ] {
         o.keys(&[k]);
-        match name {
-            Some(n) => o.wait_cursor_on(n),
-            None => o.wait_cursor_on_pane(""),
-        }
+        o.wait_cursor_on(name);
     }
 }
 
@@ -181,7 +177,7 @@ fn rename_inline() {
     let (_env, s, o) = popup_fixture();
     let target = wid(&s, "alpha:editor");
     o.open_popup();
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › editor");
     o.keys(&["C-u"]);
     o.typed("renamed (x)+y, z");
@@ -192,13 +188,13 @@ fn rename_inline() {
     o.wait_for(r"^> +.*2/2");
     o.wait_for(r"▶ 0 +renamed \(x\)\+y, z");
     // the pre-fill round-trips ( ) + ,
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for(r"^rename › renamed \(x\)\+y, z");
     o.keys(&["Escape"]);
     o.wait_for(r"^> +.*2/2");
     assert_eq!(fmt(&s, &target, "#{window_name}"), "renamed (x)+y, z");
     // an empty name cancels
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › renamed");
     o.keys(&["C-u"]);
     o.keys(&["Enter"]);
@@ -207,7 +203,7 @@ fn rename_inline() {
     // a filter with ( ) + survives an editor round-trip
     o.typed("(x)+");
     o.wait_for(r"^> \(x\)\+ .*1/2");
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › renamed");
     o.keys(&["Escape"]);
     o.wait_for(r"^> \(x\)\+ .*1/2");
@@ -216,7 +212,7 @@ fn rename_inline() {
     // renaming a filtered selection hits that window; the filter stays
     o.typed("win");
     o.wait_for(r"^> win .*1/2");
-    o.keys(&["C-r"]);
+    o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › win two");
     o.keys(&["BSpace", "BSpace", "BSpace"]);
     o.typed("2");
@@ -483,8 +479,8 @@ fn answered_while_its_pinned_copy_is_selected() {
     assert!(
         screen
             .lines()
-            .any(|l| l.contains(" .0") && l.contains("● running")),
-        "the state on its pane row:\n{screen}"
+            .any(|l| l.contains(" agent ") && l.contains("● running")),
+        "the state on its (one-pane) window's row:\n{screen}"
     );
     assert_eq!(
         row_windows(&o.screen()),
@@ -505,8 +501,7 @@ fn waiting_filter_and_stale_agent() {
     }
     o.open_popup();
     o.wait_for("beta ●1");
-    o.wait_for(r"win two$");
-    o.wait_for(r"[└├] \.0 .*\(ended\?\)");
+    o.wait_for(r" win two .*\(ended\?\)");
     let screen = o.screen();
     assert!(!screen.contains("NEEDS YOU"), "{screen}");
     assert!(

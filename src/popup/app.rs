@@ -67,12 +67,30 @@ pub struct PaneRow {
     pub path: String,
     /// The pane title (often just the host name; see `App::host`).
     pub title: String,
+    /// The name given with ^r (`@home_pane_name`): shown instead of the
+    /// title, which agents keep rewriting.
+    pub name: String,
     pub agent: Option<PaneAgent>,
+    /// The agent's model: the launcher's (`@agent_model`), else the
+    /// hooks'.
+    pub model: Option<String>,
     /// Git status (root, status) of the repo the pane's cwd is in.
     pub git: Option<(String, RepoStatus)>,
     /// Geometry in its window, in cells: left, top, width, height.
     pub rect: (u32, u32, u32, u32),
     pub(crate) hay: String,
+}
+
+impl PaneRow {
+    /// What the pane is called: the name given with ^r, else its title
+    /// (which may be just the host name; see `App::host`).
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.title
+        } else {
+            &self.name
+        }
+    }
 }
 
 impl Row {
@@ -88,19 +106,48 @@ impl Row {
     pub fn needs_you(&self) -> bool {
         self.agents.as_ref().is_some_and(WindowAgents::needs_you)
     }
+
+    /// A window of one pane is one line: its row stands for the pane too
+    /// (its columns, ^r, the preview's outline and scrolling, ⏎).
+    pub fn collapsed(&self) -> bool {
+        self.panes.len() == 1
+    }
+
+    /// The row's list lines (`row` its index): the window, then each pane
+    /// unless it is `collapsed`.
+    pub fn items(&self, row: usize) -> impl Iterator<Item = Item> + use<> {
+        let panes = if self.collapsed() {
+            0
+        } else {
+            self.panes.len()
+        };
+        std::iter::once(Item { row, pane: None })
+            .chain((0..panes).map(move |p| Item { row, pane: Some(p) }))
+    }
 }
 
-/// The command a pane shows: Claude Code's executable is named after its
-/// version (`2.1.296`), so a pane tagged as an agent whose command is a
-/// bare `N.N.N` shows the agent's name instead: `@home_agent` (tmux-home's
-/// hooks), else the legacy `@pane_agent` older sessions still carry.
-/// Anything else, an untagged version-named process included, is shown as
-/// tmux reports it.
+/// The command a pane shows. The launcher's marker (`@agent`) as it is
+/// set; else, where an agent is known to run — a Claude Code process under
+/// the pane (`agent::procs`; a wrapper can leave it under the shell, which
+/// tmux then reports), or a pane tagged as an agent whose command is a
+/// bare `N.N.N` (Claude Code's executable is named after its version) —
+/// the agent's name (`agent::kind_of`: claude, kimi, or the tag of
+/// `@home_agent`, else the legacy `@pane_agent`). Anything else, an
+/// untagged version-named process included, is shown as tmux reports it.
 pub fn display_cmd(p: &crate::tmux::snapshot::Pane) -> String {
+    use crate::agent::{AgentKind, kind_of, marker};
+    if let Some(m) = marker(p) {
+        return m.to_string();
+    }
     let tag = |k: &str| p.agent_opts.get(k).filter(|v| !v.is_empty());
-    match tag("@home_agent").or_else(|| tag("@pane_agent")) {
-        Some(agent) if crate::agent::is_version(&p.current_command) => agent.clone(),
-        _ => p.current_command.clone(),
+    let hooks = tag("@home_agent")
+        .or_else(|| tag("@pane_agent"))
+        .map(|t| AgentKind::parse(t));
+    let known =
+        p.proc_agent.is_some() || (hooks.is_some() && crate::agent::is_version(&p.current_command));
+    match kind_of(p, hooks).filter(|_| known) {
+        Some(k) => k.name().to_string(),
+        None => p.current_command.clone(),
     }
 }
 
@@ -180,22 +227,31 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                     let git = git_of(&p.current_path);
                     let path = short_path(&p.current_path, home);
                     let title = p.title.replace(['\t', '\n'], " ");
+                    let name = p.name.replace(['\t', '\n'], " ");
                     let cmd = display_cmd(p);
                     let hay = format!(
-                        "{} {} {} {} {}",
+                        "{} {} {} {} {} {}",
                         cmd,
                         path,
+                        name,
                         title,
                         agent.as_ref().map(|a| a.state.kind.name()).unwrap_or(""),
                         git.as_ref().map(|(_, g)| g.branch.as_str()).unwrap_or("")
                     );
+                    let model = crate::agent::model_of(
+                        p,
+                        agent.as_ref().and_then(|a| a.state.model.as_deref()),
+                    )
+                    .map(str::to_string);
                     PaneRow {
+                        model,
                         id: p.id.clone(),
                         index: p.index,
                         cmd,
                         cwd: p.current_path.clone(),
                         path,
                         title,
+                        name,
                         agent,
                         git,
                         rect: (p.left, p.top, p.width, p.height),
@@ -423,8 +479,10 @@ impl Chord {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
     List,
+    /// Renaming window `wid`, or its pane `pane` (^r on a pane).
     Rename {
         wid: String,
+        pane: Option<String>,
         edit: LineEdit,
     },
     NewWindow {
@@ -452,6 +510,12 @@ pub enum Action {
     },
     Rename {
         wid: String,
+        name: String,
+    },
+    /// Name a pane (`@home_pane_name`); an empty name clears it, back to
+    /// the pane's title.
+    RenamePane {
+        pane: String,
         name: String,
     },
     ResetName(String),
@@ -500,10 +564,36 @@ pub fn switch_key(k: &KeyEvent) -> Option<u32> {
     }
 }
 
-pub const FOOTER_LIST: &str = " ⏎ go   ^r rename   M-r auto-name   ^x close   ^t reopen   M-↑↓ move   M-n new   ^o preview   M-j/k size   pfx ( ) session   Esc clear/close   F1 keys";
+pub const FOOTER_LIST: &str = " ⏎ go   ^r rename pane   ^S-r rename window   M-r auto-name   ^x close   ^t reopen   M-↑↓ move   M-n new   ^o preview   M-j/k size   pfx ( ) session   Esc clear/close   F1 keys";
 pub const FOOTER_EDIT: &str = " ⏎ save   Esc cancel   (empty name cancels)";
+pub const FOOTER_EDIT_PANE: &str = " ⏎ save   Esc cancel   (empty: back to the pane's title)";
 pub const FOOTER_NEW: &str = " ⏎ create   Esc cancel   (empty = automatic name)";
 pub const FOOTER_CLOSE: &str = " y close   any other key or Esc cancels";
+
+/// Ctrl+Shift+R, the window-rename key: with the terminal's extended keys
+/// on (tmux's `extended-keys` and `extended-keys-format csi-u`; see
+/// `popup::term::ExtendedKeys`) it arrives as `CSI 114;6u`, Ctrl+Shift
+/// and `r` (or `R`); otherwise it reads as plain ^r. M-R (Alt+Shift+R)
+/// works on every setup.
+pub fn is_rename_window_key(k: &KeyEvent) -> bool {
+    let m = k.modifiers;
+    match k.code {
+        KeyCode::Char('r') | KeyCode::Char('R')
+            if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+        {
+            true
+        }
+        // ESC R reads as Alt (+ Shift) R
+        KeyCode::Char('R') => m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+/// Whether a pane title says more than the host name tmux gives a pane.
+pub fn shows_title(title: &str, host: &str) -> bool {
+    let short = host.split('.').next().unwrap_or(host);
+    !title.trim().is_empty() && title != host && title != short
+}
 
 /// A session page, as the tab strip shows it.
 #[derive(Clone, Debug, PartialEq)]
@@ -667,10 +757,16 @@ impl App {
         self.selected_item().map(|it| &self.rows[it.row])
     }
 
-    /// The selected pane row's pane; `None` on a window row.
+    /// The selected pane row's pane, or a collapsed window row's only
+    /// pane; `None` on the row of a window of several panes.
     pub fn selected_pane(&self) -> Option<&PaneRow> {
         let it = self.selected_item()?;
-        self.rows[it.row].panes.get(it.pane?)
+        let r = &self.rows[it.row];
+        match it.pane {
+            Some(p) => r.panes.get(p),
+            None if r.collapsed() => r.panes.first(),
+            None => None,
+        }
     }
 
     pub fn item_key(&self, it: Item) -> String {
@@ -953,14 +1049,7 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(i, r)| self.matched.get(*i) == Some(&true) && Some(&r.sid) == tab.as_ref())
-            .flat_map(|(i, r)| {
-                std::iter::once(Item { row: i, pane: None }).chain((0..r.panes.len()).map(
-                    move |p| Item {
-                        row: i,
-                        pane: Some(p),
-                    },
-                ))
-            })
+            .flat_map(|(i, r)| r.items(i))
             .collect();
     }
 
@@ -1142,18 +1231,18 @@ impl App {
                     _ => Action::Redraw,
                 }
             }
-            Mode::Rename { wid, edit } => match k.code {
+            Mode::Rename { wid, pane, edit } => match k.code {
                 KeyCode::Esc => {
                     self.mode = Mode::List;
                     Action::Redraw
                 }
                 KeyCode::Enter => {
-                    let (wid, name) = (wid.clone(), edit.as_string());
+                    let (wid, pane, name) = (wid.clone(), pane.clone(), edit.as_string());
                     self.mode = Mode::List;
-                    if name.is_empty() {
-                        Action::Redraw
-                    } else {
-                        Action::Rename { wid, name }
+                    match pane {
+                        Some(pane) => Action::RenamePane { pane, name },
+                        None if name.is_empty() => Action::Redraw,
+                        None => Action::Rename { wid, name },
                     }
                 }
                 _ => {
@@ -1224,13 +1313,18 @@ impl App {
             }
             KeyCode::Char('c') | KeyCode::Char('q') if ctrl => return Action::Quit,
             KeyCode::Char('g') if ctrl => self.jump_attention(),
+            // ^S-r (or its fallback M-R): the window, from any line
+            _ if is_rename_window_key(&k) => {
+                if let Some(r) = sel {
+                    self.start_rename(r, None);
+                }
+            }
+            // ^r: the line's pane (a window of one pane is that pane);
+            // on a window of several, the window
             KeyCode::Char('r') if ctrl => {
                 if let Some(r) = sel {
-                    self.notice = None;
-                    self.mode = Mode::Rename {
-                        wid: r.wid,
-                        edit: LineEdit::with(&r.name),
-                    };
+                    let pane = self.rename_pane().map(|p| p.id.clone());
+                    self.start_rename(r, pane);
                 }
             }
             KeyCode::Char('r') if alt => {
@@ -1274,6 +1368,40 @@ impl App {
             }
         }
         Action::Redraw
+    }
+
+    /// The pane ^r renames: the selected pane row's, or the only pane of
+    /// the selected window row's window.
+    pub fn rename_pane(&self) -> Option<&PaneRow> {
+        self.selected_pane()
+    }
+
+    /// The rename editor for window `r`, or its pane `pane`, filled with
+    /// the name shown now (a pane's title only when it says something).
+    fn start_rename(&mut self, r: Row, pane: Option<String>) {
+        self.notice = None;
+        let text = match &pane {
+            Some(id) => r
+                .panes
+                .iter()
+                .find(|p| &p.id == id)
+                .map(|p| {
+                    if !p.name.is_empty() {
+                        p.name.clone()
+                    } else if shows_title(&p.title, &self.host) {
+                        p.title.clone()
+                    } else {
+                        String::new()
+                    }
+                })
+                .unwrap_or_default(),
+            None => r.name.clone(),
+        };
+        self.mode = Mode::Rename {
+            wid: r.wid,
+            pane,
+            edit: LineEdit::with(&text),
+        };
     }
 
     /// M-k (`up`: the divider up, the preview larger) / M-j (down,
@@ -1354,6 +1482,7 @@ impl App {
                 FOOTER_LIST.replacen("   ^r rename", "   ^g needs you   ^r rename", 1)
             }
             Mode::List | Mode::Help => FOOTER_LIST.into(),
+            Mode::Rename { pane: Some(_), .. } => FOOTER_EDIT_PANE.into(),
             Mode::Rename { .. } => FOOTER_EDIT.into(),
             Mode::NewWindow { .. } => FOOTER_NEW.into(),
             Mode::Confirm { .. } => FOOTER_CLOSE.into(),
@@ -1380,7 +1509,8 @@ pub const HELP: &str = "tmux-home — keys   (press any key to return)
   ↑ ↓  ^p ^n  ^k ^j   move selection over windows and panes
   PgUp PgDn       page
   S-↑ S-↓         scroll the selected pane in the preview a line (the
-                  mouse wheel: 3 lines); nothing on a window row
+                  mouse wheel: 3 lines); nothing on the row of a window
+                  of several panes
   S-PgUp S-PgDn   scroll it half a page; moving the selection returns it
                   to the latest output
   ← →  Home End   edit the filter
@@ -1389,7 +1519,12 @@ pub const HELP: &str = "tmux-home — keys   (press any key to return)
   ^g              jump to the next window that needs you, on any page
   Esc             clear the filter; close if it is already empty
   prefix + key    the key that opened the popup closes it, from any mode
-  ^r              rename the window inline (⏎ save, Esc/empty cancel)
+  ^r              rename the pane inline: on a pane row, or a window of
+                  one pane (⏎ save, Esc cancel; empty: back to its title);
+                  on a window of several panes, the window
+  ^S-r  M-R       rename the window inline, from any line (⏎ save,
+                  Esc/empty cancel); ^S-r needs tmux's extended-keys on
+                  and extended-keys-format csi-u, M-R always works
   M-r             reset the window to its automatic name
   ^x              close the window; asks first (y/N) if anything but a
                   shell is running in it (a job stopped with ^z counts),
@@ -1411,10 +1546,12 @@ pub const HELP: &str = "tmux-home — keys   (press any key to return)
   F1  ^/          this help
   (window keys act on a pane row's window)";
 
-pub const COLUMNS: &str = "  columns         window row / pane row
+pub const COLUMNS: &str = "  columns         window row / pane row (a window of one pane is one
+                  line: its row carries the pane's columns)
   #               window index / ├ .N └ .N pane index
-  NM              window name / pane title (blank: the host name)
-  CM              — / the pane's command
+  NM              window name (one pane: then its name or title, dim) /
+                  pane name (^r) or title (blank: the host name)
+  CM              — / the pane's command, or its agent (claude, kimi)
   ST              — / the agent's state, icon and word (● running
                   ◐ waiting ✕ error ◎ background ○ idle; dim with
                   (ended?): the agent has gone)
@@ -1487,6 +1624,25 @@ mod tests {
             session_id: "$1".into(),
         });
         s
+    }
+
+    /// `s` with a second (plain) pane `id` in window `wid` of beta or
+    /// alpha: a window of two panes keeps its pane rows.
+    fn split(s: &mut Snapshot, wid: &str, id: &str) {
+        let first = s
+            .panes
+            .iter()
+            .find(|p| p.window_id == wid && p.role.is_empty())
+            .unwrap()
+            .clone();
+        s.panes.push(Pane {
+            id: id.into(),
+            index: 2,
+            active: false,
+            current_command: "vim".into(),
+            agent_opts: Default::default(),
+            ..first
+        });
     }
 
     fn key(c: KeyCode) -> KeyEvent {
@@ -1567,6 +1723,25 @@ mod tests {
         assert_eq!(display_cmd(&tagged("2.1.296", &both)), "claude");
         let empty = [("@home_agent", ""), ("@pane_agent", "claude")];
         assert_eq!(display_cmd(&tagged("2.1.296", &empty)), "claude");
+        // the launcher's marker, as it is set, on any command
+        let marked = [("@agent", "kimi"), ("@home_agent", "claude")];
+        assert_eq!(display_cmd(&tagged("fish", &marked)), "kimi");
+        // a Claude Code process under the shell (a wrapper's launch):
+        // claude, or kimi on Kimi's account; tagged or not
+        let found = |cmd: &str, opts: &[(&str, &str)]| {
+            let mut p = tagged(cmd, opts);
+            p.proc_agent = Some(crate::agent::procs::ProcAgent {
+                pid: 7,
+                config_dir: None,
+            });
+            display_cmd(&p)
+        };
+        assert_eq!(found("fish", &[]), "claude");
+        let kimi = [("@home_config_dir", "/u/.claude-exxo-openrouter")];
+        assert_eq!(found("fish", &kimi), "kimi");
+        assert_eq!(display_cmd(&tagged("fish", &kimi)), "fish", "no process");
+        let kimi_tagged = [("@home_agent", "claude"), kimi[0]];
+        assert_eq!(display_cmd(&tagged("2.1.310", &kimi_tagged)), "kimi");
         // in the rows: the pane's command, the hay and an automatic name
         let mut s = snap();
         s.panes[3] = Pane {
@@ -1598,7 +1773,11 @@ mod tests {
         let tabs: Vec<_> = a.tabs.iter().map(|t| (t.name.as_str(), t.client)).collect();
         assert_eq!(tabs, [("alpha", false), ("beta", true)], "tabs by name");
         assert_eq!(a.tab.as_deref(), Some("$1"));
-        assert_eq!(keys_visible(&a), ["@2", "@2/%2", "@3", "@3/%3"]);
+        assert_eq!(
+            keys_visible(&a),
+            ["@2", "@3"],
+            "windows of one pane are one line"
+        );
         assert_eq!(sel(&a), "@2");
         assert_eq!(a.counts(), (2, 2), "the page's windows");
         let logs = a.selected().unwrap();
@@ -1643,32 +1822,60 @@ mod tests {
     #[test]
     fn move_wraps_within_the_page_over_windows_and_panes() {
         let mut a = app();
-        for want in ["@2/%2", "@3", "@3/%3", "@2"] {
+        for want in ["@3", "@2"] {
             a.key(key(KeyCode::Down));
             assert_eq!(sel(&a), want);
         }
         a.key(ctrl('k'));
-        assert_eq!(sel(&a), "@3/%3", "cycles, never to another page");
+        assert_eq!(sel(&a), "@3", "cycles, never to another page");
         a.key(ctrl('p'));
         a.key(ctrl('j'));
         a.key(ctrl('n'));
         assert_eq!(sel(&a), "@2");
-        assert_eq!(a.selected_pane(), None);
+        assert_eq!(
+            a.selected_pane().unwrap().id,
+            "%2",
+            "a window of one pane: its row is the pane's"
+        );
+        // a window of two panes: its row, then a row per pane
+        let mut s = snap();
+        split(&mut s, "@3", "%5");
+        let mut a = app_of(&s);
+        for want in ["@3", "@3/%3", "@3/%5", "@2"] {
+            a.key(key(KeyCode::Down));
+            assert_eq!(sel(&a), want);
+        }
         a.key(key(KeyCode::Down));
-        assert_eq!(a.selected_pane().unwrap().id, "%2");
-        assert_eq!(a.selected().unwrap().wid, "@2", "a pane row's window");
+        assert_eq!(a.selected_pane(), None, "the row of a window of two");
+        a.key(key(KeyCode::Down));
+        assert_eq!(a.selected_pane().unwrap().id, "%3");
+        assert_eq!(a.selected().unwrap().wid, "@3", "a pane row's window");
     }
 
     #[test]
     fn filter_enter_and_esc() {
+        // a window of one pane: ⏎ focuses that pane
         let mut a = app();
         typed(&mut a, "bui");
-        assert_eq!(keys_visible(&a), ["@3", "@3/%3"], "a window with its panes");
+        assert_eq!(keys_visible(&a), ["@3"]);
+        assert!(matches!(
+            a.key(key(KeyCode::Enter)),
+            Action::Switch { pane: Some(p), .. } if p == "%3"
+        ));
+        let mut s = snap();
+        split(&mut s, "@3", "%5");
+        let mut a = app_of(&s);
+        typed(&mut a, "bui");
+        assert_eq!(
+            keys_visible(&a),
+            ["@3", "@3/%3", "@3/%5"],
+            "a window with its panes"
+        );
         assert_eq!(sel(&a), "@3");
         assert_eq!(a.counts(), (1, 2));
         // the selection is kept by key across an update
         a.key(key(KeyCode::Down));
-        a.set_rows(rows_of(&snap()));
+        a.set_rows(rows_of(&s));
         assert_eq!(sel(&a), "@3/%3");
         // ⏎ on a pane row: its window, and that pane
         assert_eq!(
@@ -1724,14 +1931,59 @@ mod tests {
         assert_eq!(build.cmd, "fish", "the active pane describes the window");
     }
 
+    /// A squad window: its tmux-home sidebar at index 0, then claude
+    /// launched by a wrapper under fish, on Kimi's account, its hooks
+    /// running. One line (the sidebar isn't a pane of it), CM kimi, the
+    /// hooks' state, not ended.
+    #[test]
+    fn a_kimi_window_with_its_sidebar_is_one_line() {
+        let mut s = snap();
+        let w = &mut s.windows[3];
+        w.name = "k3-b13-budget".into();
+        let mut side = s.panes[3].clone();
+        side.id = "%8".into();
+        side.index = 0;
+        side.current_command = "bash".into();
+        side.role = "sidebar".into();
+        side.home_role = "sidebar".into();
+        let work = &mut s.panes[3];
+        work.index = 1;
+        work.current_command = "fish".into();
+        for (k, v) in [
+            ("@home_agent", "claude"),
+            ("@home_status", "running"),
+            ("@home_config_dir", "/home/u/.claude-exxo-openrouter"),
+        ] {
+            work.agent_opts.insert(k.into(), v.into());
+        }
+        work.proc_agent = Some(crate::agent::procs::ProcAgent {
+            pid: 9,
+            config_dir: None,
+        });
+        s.panes.push(side);
+        let a = app_of(&s);
+        let r = a.rows.iter().find(|r| r.wid == "@3").unwrap();
+        assert!(r.collapsed());
+        assert_eq!(keys_visible(&a), ["@2", "@3"]);
+        assert_eq!(r.panes[0].cmd, "kimi");
+        assert_eq!(r.cmd, "kimi");
+        let ag = r.panes[0].agent.as_ref().unwrap();
+        assert_eq!(ag.state.kind, crate::agent::AgentKind::Kimi);
+        assert!(!ag.stale, "claude runs under fish");
+        assert_eq!(ag.state.status, crate::agent::Status::Running);
+    }
+
     #[test]
     fn rename_mode() {
         let mut a = app();
         typed(&mut a, "bui");
-        a.key(key(KeyCode::Down)); // the pane row: acts on its window
-        a.key(ctrl('r'));
+        a.key(key(KeyCode::Down)); // the pane row: ^S-r acts on its window
+        a.key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert!(
-            matches!(&a.mode, Mode::Rename { wid, edit } if wid == "@3" && edit.as_string() == "build")
+            matches!(&a.mode, Mode::Rename { wid, pane: None, edit } if wid == "@3" && edit.as_string() == "build")
         );
         // list keys don't act while editing; a snapshot leaves the editor alone
         a.key(ctrl('x'));
@@ -1746,20 +1998,90 @@ mod tests {
         );
         assert_eq!(a.mode, Mode::List);
         assert_eq!(a.filter.as_string(), "bui", "filter kept");
+        // M-R (Alt+Shift+R, however the terminal reports the shift) too
+        for m in [KeyModifiers::ALT, KeyModifiers::ALT | KeyModifiers::SHIFT] {
+            a.key(KeyEvent::new(KeyCode::Char('R'), m));
+            assert!(matches!(&a.mode, Mode::Rename { pane: None, .. }), "{m:?}");
+            a.key(key(KeyCode::Esc));
+        }
         // Esc cancels; empty name cancels
-        a.key(ctrl('r'));
+        a.key(alt(KeyCode::Char('R')));
         assert_eq!(a.key(key(KeyCode::Esc)), Action::Redraw);
         assert_eq!(a.mode, Mode::List);
-        a.key(ctrl('r'));
+        a.key(alt(KeyCode::Char('R')));
         a.key(ctrl('u'));
         assert_eq!(a.key(key(KeyCode::Enter)), Action::Redraw);
         // a vanished target closes the editor with a notice
-        a.key(ctrl('r'));
+        a.key(alt(KeyCode::Char('R')));
         let mut s = snap();
         s.windows.retain(|w| w.id != "@3");
         a.set_rows(rows_of(&s));
         assert_eq!(a.mode, Mode::List);
         assert!(a.notice.is_some());
+    }
+
+    /// ^r names the line's pane: a pane row's, or a window of one pane's
+    /// only pane; on a window of several it renames the window. The
+    /// editor starts from the name given, else a title worth showing.
+    #[test]
+    fn ctrl_r_renames_the_pane() {
+        let mut s = snap();
+        let mut second = s.panes[2].clone();
+        second.id = "%7".into();
+        second.index = 1;
+        second.title = "✳ Fix the build".into();
+        s.panes.push(second);
+        s.panes[3].name = "given".into();
+        let mut a = app_of(&s);
+        a.host = "host.local".into();
+        // beta: logs (two panes, and a sidebar) and build (one)
+        assert_eq!(sel(&a), "@2");
+        a.key(ctrl('r'));
+        assert!(
+            matches!(&a.mode, Mode::Rename { wid, pane: None, edit } if wid == "@2" && edit.as_string() == "logs")
+        );
+        a.key(key(KeyCode::Esc));
+        a.key(key(KeyCode::Down));
+        a.key(key(KeyCode::Down)); // logs' .1
+        a.key(ctrl('r'));
+        assert!(
+            matches!(&a.mode, Mode::Rename { pane: Some(p), edit, .. } if p == "%7" && edit.as_string() == "✳ Fix the build")
+        );
+        a.key(ctrl('u'));
+        typed(&mut a, "tests");
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Action::RenamePane {
+                pane: "%7".into(),
+                name: "tests".into()
+            }
+        );
+        // build's row: its only pane, starting from its given name;
+        // empty clears it
+        a.key(key(KeyCode::Down));
+        assert_eq!(sel(&a), "@3");
+        a.key(ctrl('r'));
+        assert!(
+            matches!(&a.mode, Mode::Rename { pane: Some(p), edit, .. } if p == "%3" && edit.as_string() == "given")
+        );
+        assert_eq!(a.footer(), FOOTER_EDIT_PANE);
+        a.key(ctrl('u'));
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Action::RenamePane {
+                pane: "%3".into(),
+                name: String::new()
+            }
+        );
+        // a host-name title isn't offered
+        let mut s = snap();
+        s.panes[3].title = "host".into();
+        let mut a = app_of(&s);
+        a.host = "host.local".into();
+        a.key(key(KeyCode::Down));
+        assert_eq!(sel(&a), "@3");
+        a.key(ctrl('r'));
+        assert!(matches!(&a.mode, Mode::Rename { edit, .. } if edit.is_empty()));
     }
 
     #[test]
@@ -1845,12 +2167,15 @@ mod tests {
 
     #[test]
     fn alt_r_resets_the_selected_lines_window() {
-        let mut a = app();
+        let mut s = snap();
+        split(&mut s, "@2", "%5");
+        let mut a = app_of(&s);
         a.key(key(KeyCode::Down));
         assert_eq!(
             a.key(alt(KeyCode::Char('r'))),
             Action::ResetName("@2".into())
         );
+        a.key(key(KeyCode::Down));
         a.key(key(KeyCode::Down));
         assert_eq!(
             a.key(alt(KeyCode::Char('r'))),
@@ -1885,7 +2210,9 @@ mod tests {
     #[test]
     fn close_verdicts() {
         use crate::ops::ClosePlan;
-        let mut a = app();
+        let mut s = snap();
+        split(&mut s, "@2", "%5");
+        let mut a = app_of(&s);
         assert_eq!(a.key(ctrl('x')), Action::CloseStart("@2".into()));
         a.key(key(KeyCode::Down));
         assert_eq!(
@@ -1933,7 +2260,9 @@ mod tests {
 
     #[test]
     fn alt_n_names_a_new_window_after_the_selection() {
-        let mut a = app();
+        let mut s = snap();
+        split(&mut s, "@2", "%5");
+        let mut a = app_of(&s);
         a.key(alt(KeyCode::Char('n')));
         assert!(matches!(&a.mode, Mode::NewWindow { after, .. } if after == "@2"));
         assert_eq!(a.key(key(KeyCode::Esc)), Action::Redraw);
@@ -2018,6 +2347,7 @@ mod tests {
         a.select_wid("@0"); // alpha/editor, first row of alpha
         assert_eq!(a.tab.as_deref(), Some("$0"), "select pages");
         let mut s = snap();
+        split(&mut s, "@1", "%5");
         s.windows.retain(|w| w.id != "@0");
         a.set_rows(rows_of(&s));
         let under = sel(&a);
@@ -2038,7 +2368,8 @@ mod tests {
             .for_each(|w| w.index += 1);
         a.set_rows(rows_of(&s));
         assert_eq!(sel(&a), under);
-        // its pane is selected, then goes: the window row
+        // its pane is selected, then goes: the window row (now of one
+        // pane, one line)
         a.key(key(KeyCode::Down));
         assert_eq!(sel(&a), "@1/%1");
         s.panes.retain(|p| p.id != "%1");
@@ -2093,10 +2424,10 @@ mod tests {
         a.select_wid("@0");
         assert_eq!(
             keys_visible(&a),
-            ["!@1", "!@1/%1", "@0", "@0/%0", "@1", "@1/%1"],
-            "the copy with its panes, then the windows"
+            ["!@1", "@0", "@1"],
+            "the copy, then the windows (of one pane each: one line)"
         );
-        let panes = &a.rows[a.visible[1].row].panes;
+        let panes = &a.rows[a.visible[0].row].panes;
         assert_eq!(
             panes[0].agent.as_ref().unwrap().state.status,
             crate::agent::Status::Waiting
@@ -2148,10 +2479,7 @@ mod tests {
             .agent_opts
             .insert("@pane_attention".into(), "notification".into());
         let mut a = app_of(&s);
-        assert_eq!(
-            keys_visible(&a),
-            ["!@2", "!@2/%2", "@2", "@2/%2", "@3", "@3/%3"]
-        );
+        assert_eq!(keys_visible(&a), ["!@2", "@2", "@3"]);
         assert_eq!(sel(&a), "@2");
         // from beta/logs: next is alpha/win two, paging there, in NEEDS YOU
         a.key(ctrl('g'));
@@ -2162,8 +2490,8 @@ mod tests {
         assert_eq!(a.tab.as_deref(), Some("$1"));
         a.key(ctrl('g'));
         assert_eq!(sel(&a), "!@1");
-        // from a pane row of a window that doesn't need you: the next one
-        a.select_key("@0/%0");
+        // from a window that doesn't need you: the next one
+        a.select_wid("@0");
         a.key(ctrl('g'));
         assert_eq!(sel(&a), "!@1");
         // nothing needs you: a notice, the selection stays
@@ -2182,13 +2510,16 @@ mod tests {
         assert_eq!(a.key(alt(KeyCode::Down)), Action::None);
         // the agent was answered: the selection stays on the window
         let mut s = agent_snap();
+        split(&mut s, "@1", "%5");
         s.panes[1]
             .agent_opts
             .insert("@pane_status".into(), "running".into());
         a.set_rows(rows_of(&s));
         assert_eq!(sel(&a), "@1");
         // and from the copy's pane row: that pane in the window
-        let mut a = agent_app();
+        let mut two = agent_snap();
+        split(&mut two, "@1", "%5");
+        let mut a = app_of(&two);
         a.key(ctrl('g'));
         a.key(key(KeyCode::Down));
         assert_eq!(sel(&a), "!@1/%1");
@@ -2230,10 +2561,11 @@ mod tests {
                 pane: Some("%7".into()),
             }
         );
+        // no agent, one pane: that pane
         a.select_wid("@2");
         assert!(matches!(
             a.key(key(KeyCode::Enter)),
-            Action::Switch { pane: None, .. }
+            Action::Switch { pane: Some(p), .. } if p == "%2"
         ));
     }
 
@@ -2259,7 +2591,7 @@ mod tests {
         let mut a = agent_app();
         a.select_wid("@3");
         assert_eq!(a.next_after_close("@3"), None, "the page's last");
-        a.select_key("@2/%2");
+        a.select_wid("@2");
         assert_eq!(a.next_after_close("@2").as_deref(), Some("@3"));
         // alpha: [!@1, @0, @1]
         a.key(ctrl('g'));
@@ -2296,7 +2628,9 @@ mod tests {
 
     #[test]
     fn swap_moves_over_windows_not_lines() {
-        let mut a = app();
+        let mut s = snap();
+        split(&mut s, "@2", "%5");
+        let mut a = app_of(&s);
         let swap = Action::Swap {
             a: "@2".into(),
             b: "@3".into(),
@@ -2304,6 +2638,7 @@ mod tests {
         assert_eq!(a.key(alt(KeyCode::Down)), swap);
         a.key(key(KeyCode::Down));
         assert_eq!(a.key(alt(KeyCode::Down)), swap, "from its pane row too");
+        a.key(key(KeyCode::Down));
         a.key(key(KeyCode::Down));
         assert_eq!(
             a.key(alt(KeyCode::Down)),
@@ -2373,7 +2708,7 @@ mod tests {
         assert_eq!(a.filter.as_string(), "o)");
         // in an editor the chord types the paren
         a.clear_filter();
-        a.key(ctrl('r'));
+        a.key(alt(KeyCode::Char('R')));
         a.key(ctrl('a'));
         a.key(paren(')'));
         assert!(matches!(&a.mode, Mode::Rename { edit, .. } if edit.as_string() == ")logs"));

@@ -15,6 +15,7 @@
 pub mod adapter;
 pub mod claude;
 pub mod home;
+pub mod procs;
 pub mod sidebar;
 
 use crate::tmux::snapshot::Pane;
@@ -23,11 +24,23 @@ use std::sync::LazyLock;
 /// Sources in priority order: the first that recognises a pane wins.
 pub const SOURCES: &[&dyn AgentSource] = &[&home::Home, &sidebar::Sidebar];
 
-/// Every pane option any source reads, each once, in source order; the
-/// snapshot fetches these.
+/// Pane option a launcher sets to say which agent the pane runs
+/// (`claude`, `kimi`): shown as it is, ahead of anything detected.
+pub const MARKER: &str = "@agent";
+/// Pane option the launcher sets with the agent's model (a detail line).
+pub const MARKER_MODEL: &str = "@agent_model";
+/// The hooks' account directory (`$CLAUDE_CONFIG_DIR`; `home::Key::ConfigDir`):
+/// tells Kimi from Claude.
+pub const CONFIG_DIR: &str = "@home_config_dir";
+
+/// Options read besides the sources' (`kind_of`).
+const EXTRA: &[&str] = &[MARKER, MARKER_MODEL, CONFIG_DIR];
+
+/// Every pane option any source reads, each once, in source order, then
+/// `EXTRA`; the snapshot fetches these.
 pub static OPTIONS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     let mut v: Vec<&'static str> = Vec::new();
-    for o in SOURCES.iter().flat_map(|s| s.options()) {
+    for o in SOURCES.iter().flat_map(|s| s.options()).chain(EXTRA) {
         if !v.contains(o) {
             v.push(o);
         }
@@ -48,7 +61,7 @@ pub trait AgentSource: Sync {
     /// hook; a crash or `kill -9` leaves them behind on a pane that has
     /// moved on (back at its shell prompt, or running something else).
     fn looks_alive(&self, pane: &Pane, state: &AgentState) -> bool {
-        state.kind.looks_alive(&pane.current_command)
+        alive(pane, &state.kind)
     }
 
     /// Unix seconds this source is known to have last written the pane's
@@ -87,6 +100,8 @@ pub fn later_wins(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentKind {
     Claude,
+    /// Claude Code against Kimi (the OpenRouter account; `kimi_account`).
+    Kimi,
     Codex,
     OpenCode,
     Other(String),
@@ -96,6 +111,7 @@ impl AgentKind {
     pub fn parse(s: &str) -> AgentKind {
         match s {
             "claude" => AgentKind::Claude,
+            "kimi" => AgentKind::Kimi,
             "codex" => AgentKind::Codex,
             "opencode" => AgentKind::OpenCode,
             o => AgentKind::Other(o.to_string()),
@@ -106,23 +122,99 @@ impl AgentKind {
     /// this agent. Claude is checked positively: it runs as its version
     /// (`2.1.283`, the name of its versioned binary), or as `claude` or
     /// `node` (npm installs); anything else means it has gone. Other kinds
-    /// are alive unless the pane is back at a shell.
+    /// are alive unless the pane is back at a shell. (`alive` checks the
+    /// process tree first.)
     pub fn looks_alive(&self, cmd: &str) -> bool {
         match self {
-            AgentKind::Claude => matches!(cmd, "claude" | "node") || is_version(cmd),
+            k if k.claude_code() => matches!(cmd, "claude" | "node") || is_version(cmd),
             _ => !crate::ops::is_shell(cmd),
         }
     }
 
+    /// Runs as Claude Code's own binary (Claude, Kimi).
+    pub fn claude_code(&self) -> bool {
+        matches!(self, AgentKind::Claude | AgentKind::Kimi)
+    }
+
+    /// The name shown for it (CM, filters).
     pub fn name(&self) -> &str {
         match self {
             AgentKind::Claude => "claude",
+            AgentKind::Kimi => "kimi",
             AgentKind::Codex => "codex",
             AgentKind::OpenCode => "opencode",
             AgentKind::Other(s) if s.is_empty() => "agent",
             AgentKind::Other(s) => s,
         }
     }
+}
+
+/// Whether the agent of `kind` still runs in `pane`: for Claude Code, a
+/// Claude Code process under the pane (`procs`) settles it, wherever it
+/// sits in the tree; otherwise (or with no process table) the pane's
+/// command decides (`AgentKind::looks_alive`).
+pub fn alive(pane: &Pane, kind: &AgentKind) -> bool {
+    (kind.claude_code() && pane.proc_agent.is_some()) || kind.looks_alive(&pane.current_command)
+}
+
+/// A Claude Code account directory that is Kimi's: the OpenRouter one
+/// (`~/.claude-exxo-openrouter`).
+pub fn kimi_account(dir: &str) -> bool {
+    let base = dir.trim_end_matches('/').rsplit('/').next().unwrap_or(dir);
+    base.starts_with(".claude") && base.contains("openrouter")
+}
+
+fn opt<'a>(pane: &'a Pane, k: &str) -> Option<&'a str> {
+    pane.agent_opts
+        .get(k)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+}
+
+/// The launcher's marker (`@agent`), as it is set.
+pub fn marker(pane: &Pane) -> Option<&str> {
+    opt(pane, MARKER)
+}
+
+/// The account the pane's Claude Code runs under: the hooks' record, else
+/// its process's environment.
+fn account(pane: &Pane) -> Option<&str> {
+    opt(pane, CONFIG_DIR).or_else(|| pane.proc_agent.as_ref()?.config_dir.as_deref())
+}
+
+/// `kind` as the pane shows it: Claude Code on Kimi's account is Kimi.
+fn refine(kind: AgentKind, pane: &Pane) -> AgentKind {
+    match kind {
+        AgentKind::Claude if account(pane).is_some_and(kimi_account) => AgentKind::Kimi,
+        k => k,
+    }
+}
+
+/// What agent the pane runs, by its own evidence: the launcher's marker,
+/// else a Claude Code process under it (Claude, or Kimi by account), else
+/// what the hooks recorded (`hooks`). `None` for a sidebar pane, or none
+/// of these.
+pub fn kind_of(pane: &Pane, hooks: Option<AgentKind>) -> Option<AgentKind> {
+    if pane.role == "sidebar" {
+        return None;
+    }
+    if let Some(m) = marker(pane) {
+        return Some(AgentKind::parse(m));
+    }
+    let k = match (&pane.proc_agent, hooks) {
+        // a Claude Code process: what the hooks say if they say Claude
+        // Code, else Claude
+        (Some(_), Some(h)) if h.claude_code() => h,
+        (Some(_), _) => AgentKind::Claude,
+        (None, h) => h?,
+    };
+    Some(refine(k, pane))
+}
+
+/// The model to show for the pane's agent: the launcher's
+/// (`@agent_model`), else the hooks'.
+pub fn model_of<'a>(pane: &'a Pane, hooks: Option<&'a str>) -> Option<&'a str> {
+    opt(pane, MARKER_MODEL).or(hooks.filter(|m| !m.is_empty()))
 }
 
 /// `^\d+\.\d+\.\d+$`.
@@ -292,7 +384,11 @@ pub fn pane_agent_at(pane: &Pane, now: u64) -> Option<PaneAgent> {
             _ => Some((src, state, t)),
         };
     }
-    let (src, state, _) = best?;
+    let (src, mut state, _) = best?;
+    if let Some(k) = kind_of(pane, Some(state.kind.clone())) {
+        state.kind = k;
+    }
+    state.model = model_of(pane, state.model.as_deref()).map(str::to_string);
     let stale = !src.looks_alive(pane, &state);
     Some(PaneAgent {
         pane: pane.id.clone(),
@@ -602,6 +698,117 @@ pub(crate) mod tests {
         }
         assert!(!stale("codex", "nvim") && !stale("codex", "codex"));
         assert!(stale("codex", "zsh") && stale("opencode", "bash"));
+    }
+
+    /// A pane whose agent was found by process (`procs`), with these options.
+    fn proc_pane(cmd: &str, config_dir: Option<&str>, opts: &[(&str, &str)]) -> Pane {
+        let mut p = pane("%1", cmd, opts);
+        p.proc_agent = Some(procs::ProcAgent {
+            pid: 42,
+            config_dir: config_dir.map(str::to_string),
+        });
+        p
+    }
+
+    const KIMI_DIR: &str = "/Users/u/.claude-exxo-openrouter";
+
+    #[test]
+    fn kimi_accounts() {
+        assert!(kimi_account(KIMI_DIR) && kimi_account("/u/.claude-exxo-openrouter/"));
+        assert!(!kimi_account("/u/.claude-exxo") && !kimi_account("/u/.claude"));
+        assert!(!kimi_account("/u/openrouter-notes"));
+    }
+
+    /// The marker wins; then a Claude Code process (Kimi by the hooks'
+    /// account, else its environment's); then the hooks' tag.
+    #[test]
+    fn kind_by_marker_then_process_then_hooks() {
+        let kind =
+            |p: &Pane, hooks: Option<AgentKind>| kind_of(p, hooks).map(|k| k.name().to_string());
+        let claude = Some(AgentKind::Claude);
+        // marker as set, over everything else
+        let p = proc_pane(
+            "fish",
+            None,
+            &[("@agent", "kimi"), ("@home_config_dir", "/u/.claude")],
+        );
+        assert_eq!(kind(&p, claude.clone()).as_deref(), Some("kimi"));
+        let p = proc_pane("fish", Some(KIMI_DIR), &[("@agent", "claude")]);
+        assert_eq!(kind(&p, None).as_deref(), Some("claude"));
+        // a process: Claude, or Kimi by account (hooks' first)
+        assert_eq!(
+            kind(&proc_pane("fish", None, &[]), None).as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            kind(&proc_pane("fish", Some(KIMI_DIR), &[]), None).as_deref(),
+            Some("kimi")
+        );
+        let p = proc_pane(
+            "fish",
+            Some("/u/.claude"),
+            &[("@home_config_dir", KIMI_DIR)],
+        );
+        assert_eq!(kind(&p, claude.clone()).as_deref(), Some("kimi"));
+        let p = proc_pane(
+            "fish",
+            Some(KIMI_DIR),
+            &[("@home_config_dir", "/u/.claude-exxo")],
+        );
+        assert_eq!(kind(&p, claude.clone()).as_deref(), Some("claude"));
+        // hooks only
+        let p = pane("%1", "2.1.3", &[("@home_config_dir", KIMI_DIR)]);
+        assert_eq!(kind(&p, claude.clone()).as_deref(), Some("kimi"));
+        assert_eq!(kind(&p, Some(AgentKind::Codex)).as_deref(), Some("codex"));
+        assert_eq!(kind(&pane("%1", "fish", &[]), None), None);
+        // a sidebar is never an agent
+        let mut p = proc_pane("fish", None, &[("@agent", "kimi")]);
+        p.role = "sidebar".into();
+        assert_eq!(kind(&p, claude), None);
+    }
+
+    /// Hooks drive the state of a Kimi pane as of a Claude one; a live
+    /// Claude Code under the shell is not "ended"; the launcher's model
+    /// is the one shown.
+    #[test]
+    fn a_kimi_pane_under_its_shell_is_live_with_hook_state() {
+        let opts = [
+            ("@home_agent", "claude"),
+            ("@home_status", "running"),
+            ("@home_model", "hooks-model"),
+            ("@home_config_dir", KIMI_DIR),
+        ];
+        let a = pane_agent(&proc_pane("fish", None, &opts)).unwrap();
+        assert_eq!(
+            (a.state.kind.clone(), a.state.status),
+            (AgentKind::Kimi, Status::Running)
+        );
+        assert!(!a.stale, "claude runs under fish");
+        assert_eq!(a.state.model.as_deref(), Some("hooks-model"));
+        // the same without the process: back at the shell, ended
+        assert!(pane_agent(&pane("%1", "fish", &opts)).unwrap().stale);
+        // marker and its model
+        let mut o = opts.to_vec();
+        o.extend([("@agent", "kimi"), ("@agent_model", "kimi-k3")]);
+        let a = pane_agent(&proc_pane("fish", None, &o)).unwrap();
+        assert_eq!(a.state.kind, AgentKind::Kimi);
+        assert_eq!(a.state.model.as_deref(), Some("kimi-k3"));
+        // the sidebar's tags count as well
+        let a = pane_agent(&proc_pane(
+            "fish",
+            Some(KIMI_DIR),
+            &[("@pane_agent", "claude"), ("@pane_status", "waiting")],
+        ))
+        .unwrap();
+        assert_eq!(a.state.kind, AgentKind::Kimi);
+        assert!(!a.stale && a.needs_you());
+    }
+
+    #[test]
+    fn kimi_lives_as_claude_does() {
+        assert!(AgentKind::Kimi.looks_alive("2.1.310") && !AgentKind::Kimi.looks_alive("fish"));
+        assert_eq!(AgentKind::parse("kimi"), AgentKind::Kimi);
+        assert_eq!(AgentKind::Kimi.name(), "kimi");
     }
 
     #[test]
