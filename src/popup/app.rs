@@ -71,6 +71,9 @@ pub struct PaneRow {
     /// title, which agents keep rewriting.
     pub name: String,
     pub agent: Option<PaneAgent>,
+    /// The agent's model: the launcher's (`@agent_model`), else the
+    /// hooks'.
+    pub model: Option<String>,
     /// Git status (root, status) of the repo the pane's cwd is in.
     pub git: Option<(String, RepoStatus)>,
     /// Geometry in its window, in cells: left, top, width, height.
@@ -102,6 +105,24 @@ impl Row {
 
     pub fn needs_you(&self) -> bool {
         self.agents.as_ref().is_some_and(WindowAgents::needs_you)
+    }
+
+    /// A window of one pane is one line: its row stands for the pane too
+    /// (its columns, ^r, the preview's outline and scrolling, ⏎).
+    pub fn collapsed(&self) -> bool {
+        self.panes.len() == 1
+    }
+
+    /// The row's list lines (`row` its index): the window, then each pane
+    /// unless it is `collapsed`.
+    pub fn items(&self, row: usize) -> impl Iterator<Item = Item> + use<> {
+        let panes = if self.collapsed() {
+            0
+        } else {
+            self.panes.len()
+        };
+        std::iter::once(Item { row, pane: None })
+            .chain((0..panes).map(move |p| Item { row, pane: Some(p) }))
     }
 }
 
@@ -217,7 +238,13 @@ pub fn build_rows(s: &Snapshot, client: Option<&str>, home: &str) -> Vec<Row> {
                         agent.as_ref().map(|a| a.state.kind.name()).unwrap_or(""),
                         git.as_ref().map(|(_, g)| g.branch.as_str()).unwrap_or("")
                     );
+                    let model = crate::agent::model_of(
+                        p,
+                        agent.as_ref().and_then(|a| a.state.model.as_deref()),
+                    )
+                    .map(str::to_string);
                     PaneRow {
+                        model,
                         id: p.id.clone(),
                         index: p.index,
                         cmd,
@@ -730,10 +757,16 @@ impl App {
         self.selected_item().map(|it| &self.rows[it.row])
     }
 
-    /// The selected pane row's pane; `None` on a window row.
+    /// The selected pane row's pane, or a collapsed window row's only
+    /// pane; `None` on the row of a window of several panes.
     pub fn selected_pane(&self) -> Option<&PaneRow> {
         let it = self.selected_item()?;
-        self.rows[it.row].panes.get(it.pane?)
+        let r = &self.rows[it.row];
+        match it.pane {
+            Some(p) => r.panes.get(p),
+            None if r.collapsed() => r.panes.first(),
+            None => None,
+        }
     }
 
     pub fn item_key(&self, it: Item) -> String {
@@ -1016,14 +1049,7 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(i, r)| self.matched.get(*i) == Some(&true) && Some(&r.sid) == tab.as_ref())
-            .flat_map(|(i, r)| {
-                std::iter::once(Item { row: i, pane: None }).chain((0..r.panes.len()).map(
-                    move |p| Item {
-                        row: i,
-                        pane: Some(p),
-                    },
-                ))
-            })
+            .flat_map(|(i, r)| r.items(i))
             .collect();
     }
 
@@ -1347,13 +1373,7 @@ impl App {
     /// The pane ^r renames: the selected pane row's, or the only pane of
     /// the selected window row's window.
     pub fn rename_pane(&self) -> Option<&PaneRow> {
-        let it = self.selected_item()?;
-        let r = &self.rows[it.row];
-        match it.pane {
-            Some(p) => r.panes.get(p),
-            None if r.panes.len() == 1 => r.panes.first(),
-            None => None,
-        }
+        self.selected_pane()
     }
 
     /// The rename editor for window `r`, or its pane `pane`, filled with
@@ -1489,7 +1509,8 @@ pub const HELP: &str = "tmux-home — keys   (press any key to return)
   ↑ ↓  ^p ^n  ^k ^j   move selection over windows and panes
   PgUp PgDn       page
   S-↑ S-↓         scroll the selected pane in the preview a line (the
-                  mouse wheel: 3 lines); nothing on a window row
+                  mouse wheel: 3 lines); nothing on the row of a window
+                  of several panes
   S-PgUp S-PgDn   scroll it half a page; moving the selection returns it
                   to the latest output
   ← →  Home End   edit the filter
@@ -1525,10 +1546,12 @@ pub const HELP: &str = "tmux-home — keys   (press any key to return)
   F1  ^/          this help
   (window keys act on a pane row's window)";
 
-pub const COLUMNS: &str = "  columns         window row / pane row
+pub const COLUMNS: &str = "  columns         window row / pane row (a window of one pane is one
+                  line: its row carries the pane's columns)
   #               window index / ├ .N └ .N pane index
-  NM              window name / pane title (blank: the host name)
-  CM              — / the pane's command
+  NM              window name (one pane: then its name or title, dim) /
+                  pane name (^r) or title (blank: the host name)
+  CM              — / the pane's command, or its agent (claude, kimi)
   ST              — / the agent's state, icon and word (● running
                   ◐ waiting ✕ error ◎ background ○ idle; dim with
                   (ended?): the agent has gone)
@@ -1601,6 +1624,25 @@ mod tests {
             session_id: "$1".into(),
         });
         s
+    }
+
+    /// `s` with a second (plain) pane `id` in window `wid` of beta or
+    /// alpha: a window of two panes keeps its pane rows.
+    fn split(s: &mut Snapshot, wid: &str, id: &str) {
+        let first = s
+            .panes
+            .iter()
+            .find(|p| p.window_id == wid && p.role.is_empty())
+            .unwrap()
+            .clone();
+        s.panes.push(Pane {
+            id: id.into(),
+            index: 2,
+            active: false,
+            current_command: "vim".into(),
+            agent_opts: Default::default(),
+            ..first
+        });
     }
 
     fn key(c: KeyCode) -> KeyEvent {
@@ -1731,7 +1773,11 @@ mod tests {
         let tabs: Vec<_> = a.tabs.iter().map(|t| (t.name.as_str(), t.client)).collect();
         assert_eq!(tabs, [("alpha", false), ("beta", true)], "tabs by name");
         assert_eq!(a.tab.as_deref(), Some("$1"));
-        assert_eq!(keys_visible(&a), ["@2", "@2/%2", "@3", "@3/%3"]);
+        assert_eq!(
+            keys_visible(&a),
+            ["@2", "@3"],
+            "windows of one pane are one line"
+        );
         assert_eq!(sel(&a), "@2");
         assert_eq!(a.counts(), (2, 2), "the page's windows");
         let logs = a.selected().unwrap();
@@ -1776,32 +1822,60 @@ mod tests {
     #[test]
     fn move_wraps_within_the_page_over_windows_and_panes() {
         let mut a = app();
-        for want in ["@2/%2", "@3", "@3/%3", "@2"] {
+        for want in ["@3", "@2"] {
             a.key(key(KeyCode::Down));
             assert_eq!(sel(&a), want);
         }
         a.key(ctrl('k'));
-        assert_eq!(sel(&a), "@3/%3", "cycles, never to another page");
+        assert_eq!(sel(&a), "@3", "cycles, never to another page");
         a.key(ctrl('p'));
         a.key(ctrl('j'));
         a.key(ctrl('n'));
         assert_eq!(sel(&a), "@2");
-        assert_eq!(a.selected_pane(), None);
+        assert_eq!(
+            a.selected_pane().unwrap().id,
+            "%2",
+            "a window of one pane: its row is the pane's"
+        );
+        // a window of two panes: its row, then a row per pane
+        let mut s = snap();
+        split(&mut s, "@3", "%5");
+        let mut a = app_of(&s);
+        for want in ["@3", "@3/%3", "@3/%5", "@2"] {
+            a.key(key(KeyCode::Down));
+            assert_eq!(sel(&a), want);
+        }
         a.key(key(KeyCode::Down));
-        assert_eq!(a.selected_pane().unwrap().id, "%2");
-        assert_eq!(a.selected().unwrap().wid, "@2", "a pane row's window");
+        assert_eq!(a.selected_pane(), None, "the row of a window of two");
+        a.key(key(KeyCode::Down));
+        assert_eq!(a.selected_pane().unwrap().id, "%3");
+        assert_eq!(a.selected().unwrap().wid, "@3", "a pane row's window");
     }
 
     #[test]
     fn filter_enter_and_esc() {
+        // a window of one pane: ⏎ focuses that pane
         let mut a = app();
         typed(&mut a, "bui");
-        assert_eq!(keys_visible(&a), ["@3", "@3/%3"], "a window with its panes");
+        assert_eq!(keys_visible(&a), ["@3"]);
+        assert!(matches!(
+            a.key(key(KeyCode::Enter)),
+            Action::Switch { pane: Some(p), .. } if p == "%3"
+        ));
+        let mut s = snap();
+        split(&mut s, "@3", "%5");
+        let mut a = app_of(&s);
+        typed(&mut a, "bui");
+        assert_eq!(
+            keys_visible(&a),
+            ["@3", "@3/%3", "@3/%5"],
+            "a window with its panes"
+        );
         assert_eq!(sel(&a), "@3");
         assert_eq!(a.counts(), (1, 2));
         // the selection is kept by key across an update
         a.key(key(KeyCode::Down));
-        a.set_rows(rows_of(&snap()));
+        a.set_rows(rows_of(&s));
         assert_eq!(sel(&a), "@3/%3");
         // ⏎ on a pane row: its window, and that pane
         assert_eq!(
@@ -1855,6 +1929,48 @@ mod tests {
         let ids: Vec<_> = build.panes.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["%3", "%7"]);
         assert_eq!(build.cmd, "fish", "the active pane describes the window");
+    }
+
+    /// A squad window: its tmux-home sidebar at index 0, then claude
+    /// launched by a wrapper under fish, on Kimi's account, its hooks
+    /// running. One line (the sidebar isn't a pane of it), CM kimi, the
+    /// hooks' state, not ended.
+    #[test]
+    fn a_kimi_window_with_its_sidebar_is_one_line() {
+        let mut s = snap();
+        let w = &mut s.windows[3];
+        w.name = "k3-b13-budget".into();
+        let mut side = s.panes[3].clone();
+        side.id = "%8".into();
+        side.index = 0;
+        side.current_command = "bash".into();
+        side.role = "sidebar".into();
+        side.home_role = "sidebar".into();
+        let work = &mut s.panes[3];
+        work.index = 1;
+        work.current_command = "fish".into();
+        for (k, v) in [
+            ("@home_agent", "claude"),
+            ("@home_status", "running"),
+            ("@home_config_dir", "/home/u/.claude-exxo-openrouter"),
+        ] {
+            work.agent_opts.insert(k.into(), v.into());
+        }
+        work.proc_agent = Some(crate::agent::procs::ProcAgent {
+            pid: 9,
+            config_dir: None,
+        });
+        s.panes.push(side);
+        let a = app_of(&s);
+        let r = a.rows.iter().find(|r| r.wid == "@3").unwrap();
+        assert!(r.collapsed());
+        assert_eq!(keys_visible(&a), ["@2", "@3"]);
+        assert_eq!(r.panes[0].cmd, "kimi");
+        assert_eq!(r.cmd, "kimi");
+        let ag = r.panes[0].agent.as_ref().unwrap();
+        assert_eq!(ag.state.kind, crate::agent::AgentKind::Kimi);
+        assert!(!ag.stale, "claude runs under fish");
+        assert_eq!(ag.state.status, crate::agent::Status::Running);
     }
 
     #[test]
@@ -1963,7 +2079,6 @@ mod tests {
         let mut a = app_of(&s);
         a.host = "host.local".into();
         a.key(key(KeyCode::Down));
-        a.key(key(KeyCode::Down));
         assert_eq!(sel(&a), "@3");
         a.key(ctrl('r'));
         assert!(matches!(&a.mode, Mode::Rename { edit, .. } if edit.is_empty()));
@@ -2052,12 +2167,15 @@ mod tests {
 
     #[test]
     fn alt_r_resets_the_selected_lines_window() {
-        let mut a = app();
+        let mut s = snap();
+        split(&mut s, "@2", "%5");
+        let mut a = app_of(&s);
         a.key(key(KeyCode::Down));
         assert_eq!(
             a.key(alt(KeyCode::Char('r'))),
             Action::ResetName("@2".into())
         );
+        a.key(key(KeyCode::Down));
         a.key(key(KeyCode::Down));
         assert_eq!(
             a.key(alt(KeyCode::Char('r'))),
@@ -2092,7 +2210,9 @@ mod tests {
     #[test]
     fn close_verdicts() {
         use crate::ops::ClosePlan;
-        let mut a = app();
+        let mut s = snap();
+        split(&mut s, "@2", "%5");
+        let mut a = app_of(&s);
         assert_eq!(a.key(ctrl('x')), Action::CloseStart("@2".into()));
         a.key(key(KeyCode::Down));
         assert_eq!(
@@ -2140,7 +2260,9 @@ mod tests {
 
     #[test]
     fn alt_n_names_a_new_window_after_the_selection() {
-        let mut a = app();
+        let mut s = snap();
+        split(&mut s, "@2", "%5");
+        let mut a = app_of(&s);
         a.key(alt(KeyCode::Char('n')));
         assert!(matches!(&a.mode, Mode::NewWindow { after, .. } if after == "@2"));
         assert_eq!(a.key(key(KeyCode::Esc)), Action::Redraw);
@@ -2225,6 +2347,7 @@ mod tests {
         a.select_wid("@0"); // alpha/editor, first row of alpha
         assert_eq!(a.tab.as_deref(), Some("$0"), "select pages");
         let mut s = snap();
+        split(&mut s, "@1", "%5");
         s.windows.retain(|w| w.id != "@0");
         a.set_rows(rows_of(&s));
         let under = sel(&a);
@@ -2245,7 +2368,8 @@ mod tests {
             .for_each(|w| w.index += 1);
         a.set_rows(rows_of(&s));
         assert_eq!(sel(&a), under);
-        // its pane is selected, then goes: the window row
+        // its pane is selected, then goes: the window row (now of one
+        // pane, one line)
         a.key(key(KeyCode::Down));
         assert_eq!(sel(&a), "@1/%1");
         s.panes.retain(|p| p.id != "%1");
@@ -2300,10 +2424,10 @@ mod tests {
         a.select_wid("@0");
         assert_eq!(
             keys_visible(&a),
-            ["!@1", "!@1/%1", "@0", "@0/%0", "@1", "@1/%1"],
-            "the copy with its panes, then the windows"
+            ["!@1", "@0", "@1"],
+            "the copy, then the windows (of one pane each: one line)"
         );
-        let panes = &a.rows[a.visible[1].row].panes;
+        let panes = &a.rows[a.visible[0].row].panes;
         assert_eq!(
             panes[0].agent.as_ref().unwrap().state.status,
             crate::agent::Status::Waiting
@@ -2355,10 +2479,7 @@ mod tests {
             .agent_opts
             .insert("@pane_attention".into(), "notification".into());
         let mut a = app_of(&s);
-        assert_eq!(
-            keys_visible(&a),
-            ["!@2", "!@2/%2", "@2", "@2/%2", "@3", "@3/%3"]
-        );
+        assert_eq!(keys_visible(&a), ["!@2", "@2", "@3"]);
         assert_eq!(sel(&a), "@2");
         // from beta/logs: next is alpha/win two, paging there, in NEEDS YOU
         a.key(ctrl('g'));
@@ -2369,8 +2490,8 @@ mod tests {
         assert_eq!(a.tab.as_deref(), Some("$1"));
         a.key(ctrl('g'));
         assert_eq!(sel(&a), "!@1");
-        // from a pane row of a window that doesn't need you: the next one
-        a.select_key("@0/%0");
+        // from a window that doesn't need you: the next one
+        a.select_wid("@0");
         a.key(ctrl('g'));
         assert_eq!(sel(&a), "!@1");
         // nothing needs you: a notice, the selection stays
@@ -2389,13 +2510,16 @@ mod tests {
         assert_eq!(a.key(alt(KeyCode::Down)), Action::None);
         // the agent was answered: the selection stays on the window
         let mut s = agent_snap();
+        split(&mut s, "@1", "%5");
         s.panes[1]
             .agent_opts
             .insert("@pane_status".into(), "running".into());
         a.set_rows(rows_of(&s));
         assert_eq!(sel(&a), "@1");
         // and from the copy's pane row: that pane in the window
-        let mut a = agent_app();
+        let mut two = agent_snap();
+        split(&mut two, "@1", "%5");
+        let mut a = app_of(&two);
         a.key(ctrl('g'));
         a.key(key(KeyCode::Down));
         assert_eq!(sel(&a), "!@1/%1");
@@ -2437,10 +2561,11 @@ mod tests {
                 pane: Some("%7".into()),
             }
         );
+        // no agent, one pane: that pane
         a.select_wid("@2");
         assert!(matches!(
             a.key(key(KeyCode::Enter)),
-            Action::Switch { pane: None, .. }
+            Action::Switch { pane: Some(p), .. } if p == "%2"
         ));
     }
 
@@ -2466,7 +2591,7 @@ mod tests {
         let mut a = agent_app();
         a.select_wid("@3");
         assert_eq!(a.next_after_close("@3"), None, "the page's last");
-        a.select_key("@2/%2");
+        a.select_wid("@2");
         assert_eq!(a.next_after_close("@2").as_deref(), Some("@3"));
         // alpha: [!@1, @0, @1]
         a.key(ctrl('g'));
@@ -2503,7 +2628,9 @@ mod tests {
 
     #[test]
     fn swap_moves_over_windows_not_lines() {
-        let mut a = app();
+        let mut s = snap();
+        split(&mut s, "@2", "%5");
+        let mut a = app_of(&s);
         let swap = Action::Swap {
             a: "@2".into(),
             b: "@3".into(),
@@ -2511,6 +2638,7 @@ mod tests {
         assert_eq!(a.key(alt(KeyCode::Down)), swap);
         a.key(key(KeyCode::Down));
         assert_eq!(a.key(alt(KeyCode::Down)), swap, "from its pane row too");
+        a.key(key(KeyCode::Down));
         a.key(key(KeyCode::Down));
         assert_eq!(
             a.key(alt(KeyCode::Down)),

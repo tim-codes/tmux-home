@@ -43,13 +43,8 @@ fn the_preview_is_coloured_and_the_wheel_scrolls_only_it() {
     o.open_popup();
     o.wait_cursor_on("editor");
     o.wait_for(r"│ROW0300 plain");
-    // a window row: the wheel does nothing
-    o.typed("\x1b[<64;20;10M");
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(o.screen().contains("ROW0300 plain"), "{}", o.screen());
-    // its pane row: the pane is outlined and scrolls
-    o.keys(&["Down"]);
-    o.wait_cursor_on_pane("bash|sh|zsh");
+    // a window of one pane: its row is the pane's, outlined, and it
+    // scrolls (the row of a window of several does nothing: unit tests)
     // the preview's cells carry the pane's red: the outer capture has the
     // SGR right before the text
     let red = regex::Regex::new(r"\x1b\[31m(\x1b\[[0-9;]*m)*ROW0300").unwrap();
@@ -83,15 +78,15 @@ fn the_preview_is_coloured_and_the_wheel_scrolls_only_it() {
     o.keys(&["Down"]);
     o.wait_cursor_on("win two");
     o.keys(&["Up"]);
-    o.wait_cursor_on_pane("");
+    o.wait_cursor_on("editor");
     o.wait_for(r"│ROW0300 plain");
     o.wait_gone(r"↑\d+ │$");
     // the outline: magenta (SGR 35) borders around the selected pane
     let raw = styled_screen(&o);
     assert!(raw.contains("\x1b[35m┌"), "{raw:?}");
-    // a click on a row selects it (row 6: tabs, prompt, header, editor,
-    // its pane, then win two)
-    o.typed("\x1b[<0;20;6M\x1b[<0;20;6m");
+    // a click on a row selects it (row 5: tabs, prompt, header, editor,
+    // then win two)
+    o.typed("\x1b[<0;20;5M\x1b[<0;20;5m");
     o.wait_cursor_on("win two");
     assert!(o.popup_open());
 }

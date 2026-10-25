@@ -74,7 +74,7 @@ fn close_idle_current_and_cursor() {
 
     // closing a row leaves the cursor on the next window
     o.wait_cursor_on("editor");
-    o.keys(&["Down", "Down", "Down", "Down"]);
+    o.keys(&["Down", "Down"]); // windows of one pane: a line each
     o.wait_cursor_on("qtwo");
     o.keys(&["C-x"]);
     o.wait_for(r"^> +.*3/3");
@@ -354,7 +354,7 @@ fn live_redraw_keeps_the_editor() {
     o.wait_for("^rename › editor-x");
     o.keys(&["Escape"]);
     o.wait_for(r"^> +.*3/3");
-    o.keys(&["Down", "Down"]);
+    o.keys(&["Down"]);
     o.wait_cursor_on("win two");
     o.keys(&["M-R"]); // rename the window
     o.wait_for("^rename › win two");

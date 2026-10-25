@@ -634,49 +634,90 @@ fn clip_w(s: &str, w: usize) -> String {
 
 use app::shows_title;
 
-/// The cells of a line, one per column (empty: nothing to show). A
-/// window row has only `#` and `NM`.
+/// The cells of a line, one per column (empty: nothing to show). The row
+/// of a window of several panes has only `#` and `NM`; a pane row and the
+/// row of a window of one pane (collapsed) carry the pane's columns.
 fn cells(app: &App, it: Item, now: u64) -> [Vec<Span<'static>>; NCOLS] {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let r = &app.rows[it.row];
     let mut c: [Vec<Span<'static>>; NCOLS] = Default::default();
-    let mut set = |col: Col, s: Span<'static>| c[col as usize] = vec![s];
-    match it.pane {
-        None => {
-            set(Col::Idx, Span::raw(r.index.to_string()));
-            // nothing per-pane: the pane rows below say it
-            set(Col::Name, Span::raw(r.name.clone()));
-        }
+    let pi = match it.pane {
         Some(pi) => {
-            let p = &r.panes[pi];
             let branch = if pi + 1 == r.panes.len() {
                 '└'
             } else {
                 '├'
             };
-            set(
-                Col::Idx,
-                Span::styled(format!("{branch} .{}", p.index), dim),
-            );
+            c[Col::Idx as usize] = vec![Span::styled(
+                format!("{branch} .{}", r.panes[pi].index),
+                dim,
+            )];
+            let p = &r.panes[pi];
             if !p.name.is_empty() {
-                set(Col::Name, Span::raw(p.name.clone()));
+                c[Col::Name as usize] = vec![Span::raw(p.name.clone())];
             } else if shows_title(&p.title, &app.host) {
-                set(Col::Name, Span::styled(p.title.clone(), dim));
+                c[Col::Name as usize] = vec![Span::styled(p.title.clone(), dim)];
             }
-            set(Col::Cmd, Span::raw(p.cmd.clone()));
-            if let Some(a) = &p.agent {
-                set(Col::State, agents::state_span(a.state.status, a.stale));
-                if let Some(t) = a.state.run_started.filter(|_| a.live()) {
-                    set(Col::Time, Span::raw(crate::agent::elapsed(t, now)));
-                }
+            pi
+        }
+        None => {
+            c[Col::Idx as usize] = vec![Span::raw(r.index.to_string())];
+            c[Col::Name as usize] = vec![Span::raw(r.name.clone())];
+            if !r.collapsed() {
+                // nothing per-pane: the pane rows below say it
+                return c;
             }
-            set(Col::Path, Span::styled(p.path.clone(), dim));
-            if let Some((_, g)) = &p.git {
-                c[Col::Git as usize] = git::badge_pieces(g);
+            // the pane's name or title after the window's, dim, unless
+            // it says nothing more
+            let p = &r.panes[0];
+            let label = p.label();
+            if label != r.name
+                && label != p.cmd
+                && (!p.name.is_empty() || shows_title(&p.title, &app.host))
+            {
+                c[Col::Name as usize].push(Span::styled(format!("  {label}"), dim));
             }
+            0
+        }
+    };
+    let p = &r.panes[pi];
+    let mut set = |col: Col, s: Span<'static>| c[col as usize] = vec![s];
+    set(Col::Cmd, Span::raw(p.cmd.clone()));
+    if let Some(a) = &p.agent {
+        set(Col::State, agents::state_span(a.state.status, a.stale));
+        if let Some(t) = a.state.run_started.filter(|_| a.live()) {
+            set(Col::Time, Span::raw(crate::agent::elapsed(t, now)));
         }
     }
+    set(Col::Path, Span::styled(p.path.clone(), dim));
+    if let Some((_, g)) = &p.git {
+        c[Col::Git as usize] = git::badge_pieces(g);
+    }
     c
+}
+
+/// `cell`'s spans in `w` columns, the first kept whole as long as it can
+/// be: later spans are cut (with `…`) or dropped first.
+fn fit_cell(cell: Vec<Span<'static>>, w: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut room = w;
+    for (i, s) in cell.into_iter().enumerate() {
+        if room == 0 {
+            break;
+        }
+        let sw = s.width();
+        if sw <= room {
+            room -= sw;
+            out.push(s);
+        } else if i == 0 || room > 2 {
+            let t = clip_w(&s.content, room);
+            room = room.saturating_sub(Span::raw(&*t).width());
+            out.push(Span::styled(t, s.style));
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 /// Every line of the page, filter or not: column widths don't move as
@@ -686,14 +727,7 @@ fn page_items(app: &App) -> Vec<Item> {
         .iter()
         .enumerate()
         .filter(|(_, r)| Some(&r.sid) == app.tab.as_ref())
-        .flat_map(|(i, r)| {
-            std::iter::once(Item { row: i, pane: None }).chain((0..r.panes.len()).map(move |p| {
-                Item {
-                    row: i,
-                    pane: Some(p),
-                }
-            }))
-        })
+        .flat_map(|(i, r)| r.items(i))
         .collect()
 }
 
@@ -743,9 +777,7 @@ fn table_spans(t: &Table, cells: [Vec<Span<'static>>; NCOLS]) -> Vec<Span<'stati
         let fitted = if *c == Col::Git {
             git::fit_badge(cell, w)
         } else {
-            cell.into_iter()
-                .map(|s| Span::styled(clip_w(&s.content, w), s.style))
-                .collect()
+            fit_cell(cell, w)
         };
         let pad = w.saturating_sub(spans_width(&fitted));
         out.extend(fitted);
@@ -1414,6 +1446,79 @@ mod tests {
         s
     }
 
+    /// A window of one pane is one line: the window's index and name, its
+    /// pane's columns, and after the name, dim, the pane's name or title
+    /// when it says more (not the host's, the command, or the window's
+    /// name). The name is kept whole first; the title is clipped.
+    #[test]
+    fn a_window_of_one_pane_is_one_line_with_its_title() {
+        let mut s = snap();
+        s.panes[0].title = "✳ Fix the flaky test".into();
+        let mut a = app_of(&s);
+        let sc = screen(&mut a, 200, 50);
+        let ed = line(&sc, " editor");
+        assert!(ed.starts_with("▌▶ 0"), "{sc}");
+        assert!(
+            ed.contains("editor  ✳ Fix the flaky…"),
+            "clipped at NM's cap: {sc}"
+        );
+        assert!(ed.contains("sh") && ed.contains("/tmp"), "{sc}");
+        assert!(!sc.contains("└ .0"), "no pane row: {sc}");
+        // the title's dim; the name isn't
+        let buf = render(&mut a, 200, 50, &Shot::default());
+        let y = (0..50u16)
+            .find(|&y| {
+                (0..200u16)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains(" editor")
+            })
+            .unwrap();
+        let x_of = |c: &str| (0..200u16).find(|&x| buf[(x, y)].symbol() == c).unwrap();
+        assert!(!buf[(x_of("e"), y)].modifier.contains(Modifier::DIM));
+        assert!(buf[(x_of("✳"), y)].modifier.contains(Modifier::DIM));
+        // a long window name keeps its room; the title goes
+        let long = line(&sc, " a much");
+        assert!(
+            !long.contains("host"),
+            "a host-name title says nothing: {sc}"
+        );
+        // a title that is the window's name, or the command, isn't repeated
+        for t in ["editor", "sh"] {
+            let mut s = snap();
+            s.panes[0].title = t.into();
+            let mut a = app_of(&s);
+            let sc = screen(&mut a, 200, 50);
+            assert_eq!(
+                line(&sc, " editor").split_whitespace().collect::<Vec<_>>(),
+                ["▌▶", "0", "editor", "sh", "/tmp"],
+                "{t}: {sc}"
+            );
+        }
+        // a pane's given name shows instead of its title
+        let mut s = snap();
+        s.panes[0].title = "✳ Agent".into();
+        s.panes[0].name = "api work".into();
+        let mut a = app_of(&s);
+        let sc = screen(&mut a, 200, 50);
+        assert!(line(&sc, " editor").contains("editor  api work"), "{sc}");
+        assert!(!sc.contains("✳ Agent"), "{sc}");
+        // a second pane: the window's row is a header again, with pane rows
+        let mut s = snap();
+        let mut p = s.panes[0].clone();
+        p.id = "%5".into();
+        p.index = 1;
+        p.title = "✳ Second".into();
+        s.panes.push(p);
+        let mut a = app_of(&s);
+        let sc = screen(&mut a, 200, 50);
+        assert_eq!(
+            line(&sc, " editor").split_whitespace().collect::<Vec<_>>(),
+            ["▌▶", "0", "editor"]
+        );
+        assert!(line(&sc, "└ .1").contains("✳ Second"), "{sc}");
+    }
+
     #[test]
     fn git_badges_on_pane_rows_and_the_card() {
         let mut a = app_of(&git_snap());
@@ -1428,8 +1533,10 @@ mod tests {
         assert_eq!(s.matches("fix/x (wt) ! ≡").count(), 2, "{s}");
         // a stale status ends in ~
         assert!(line(&s, "~/d/old").contains("legacy ~"), "{s}");
-        // window rows carry no path or badge
-        assert!(!line(&s, " shell").contains("main"), "{s}");
+        // the row of a window of several panes carries no path or badge;
+        // a window of one pane's carries its pane's
+        assert!(line(&s, "1     api").trim_end().ends_with("api"), "{s}");
+        assert!(line(&s, " shell").contains("main +!?"), "{s}");
         // the preview: each pane's banner spells the status out, no card
         let git = line(&s, "│main → ");
         assert!(
@@ -1446,7 +1553,7 @@ mod tests {
         assert!(line(&s, "│fix/x").contains("!"), "{s}");
         assert!(line(&s, "(wt) ←").contains("~/d/app"), "{s}");
         // a stale repo says so in the banner too
-        a.select_key("@2/%2");
+        a.select_wid("@2"); // one pane: its row is the pane
         let s = screen(&mut a, 200, 50);
         assert!(line(&s, "│legacy").contains("~ stale"), "{s}");
         // filtering matches the branch
@@ -1493,7 +1600,7 @@ mod tests {
             "^t              reopen",
             "prefix )  (     next / previous session page",
             "columns",
-            "NM              window name / pane title",
+            "NM              window name (one pane: then its name or title, dim)",
             "GT              — / git badge",
             "git badge",
             "⚠n stray branches",
@@ -1520,11 +1627,12 @@ mod tests {
                 .iter()
                 .position(|l| l.contains("─ NEEDS YOU ─"))
                 .unwrap();
+            // a window of one pane is one line, with the pane's columns
             assert!(lines[needs + 1].contains("fix"), "{s}");
-            assert!(!lines[needs + 1].contains("◐ waiting"), "{s}");
-            assert!(lines[needs + 2].contains("└ .0"), "{s}");
-            assert!(!lines[needs + 2].contains("permission"), "no MS: {s}");
-            assert!(lines[needs + 3].contains("─ dev ─"), "{s}");
+            assert!(lines[needs + 1].contains("◐ waiting"), "{s}");
+            assert!(!lines[needs + 1].contains("permission"), "no MS: {s}");
+            assert!(!s.contains("└ .0         claude  ◐"), "{s}");
+            assert!(lines[needs + 2].contains("─ dev ─"), "{s}");
             // the window row: just index and name; its panes: each one's
             // state and run time
             let api = line(&s, " api");
@@ -1548,13 +1656,9 @@ mod tests {
             for p in &api_panes {
                 assert!(p.contains("● running") && p.contains("12m"), "{s}");
             }
-            assert!(line(&s, " old").ends_with("old"), "{s}");
-            assert!(
-                line(&s, "└ .0         fish").contains("◐ waiting (ended?)"),
-                "{s}"
-            );
+            assert!(line(&s, " old").contains("◐ waiting (ended?)"), "{s}");
             // the fix window is listed twice: pinned, and in its session
-            assert_eq!(s.lines().filter(|l| l.ends_with(" fix")).count(), 2, "{s}");
+            assert_eq!(s.lines().filter(|l| l.contains(" fix  ")).count(), 2, "{s}");
             assert!(line(&s, "> ").ends_with("4/4"), "windows, not lines: {s}");
         }
         // no prompt on a pane row (the pane shows it)
@@ -1920,10 +2024,11 @@ mod tests {
         // tabs, prompt, column header, NEEDS YOU rule, then the copy (y=4)
         assert_eq!(underlined(&mut a), [4]);
         a.key(plain(KeyCode::Esc));
-        // ... its pane (y=5), the dev rule (y=6), then fix in its session
-        a.select_key("@0/%0");
+        // ... (one line: a window of one pane), the dev rule (y=5), then
+        // fix in its session
+        a.select_key("@0");
         a.key(ctrl('r'));
-        assert_eq!(underlined(&mut a), [7]);
+        assert_eq!(underlined(&mut a), [6]);
     }
 
     #[test]
@@ -2394,8 +2499,8 @@ mod tests {
     /// don't reach the filter.
     #[test]
     fn preview_keys_leave_the_editors_alone() {
+        // a window of one pane: its row scrolls the pane
         let mut a = app();
-        a.key(plain(KeyCode::Down));
         screen(&mut a, 200, 50);
         a.key(alt('R')); // the window's name
         for c in [

@@ -187,14 +187,12 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 >                                                                             4/4
    #     NM     CM      ST                  T    PA             GT
  ─ NEEDS YOU ─────────────────────────────────────────────────────────────────────
-   0     fix
-   └ .0         claude  ◐ waiting           12m  ~/d/app.fix-x  fix/x (wt) ! ≡
+   0     fix    kimi    ◐ waiting           12m  ~/d/app.fix-x  fix/x (wt) ! ≡
  ─ dev ───────────────────────────────────────────────────────────────────────────
    1     api
-▌  ├ .0         claude  ● running           12m  ~/d/api        main ! ≡
+▌  ├ .0  tests  claude  ● running           12m  ~/d/api        main ! ≡
    └ .1         fish                             ~/d/api        main ! ≡
- ▶ 3     shell
-   └ .0         fish                             ~/d/a/src      main +!? ⇕⇡2⇣1
+ ▶ 3     shell  fish                             ~/d/a/src      main +!? ⇕⇡2⇣1
 ┌──────────────────────────────────────┬─────────────────────────────────────────┐
 │.0 claude  ● running  12m  opus 5.5   │.1 fish                                  │
 │main → origin/main ≡  !1              │main → origin/main ≡  !1                 │
@@ -210,13 +208,28 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
   `prefix )` / `prefix (` page — tmux's own next/previous-session keys,
   deliberately a prefixed chord rather than a bare key; list navigation
   never pages.
-- **Rows**: every window, and under it every pane but sidebars (single-pane
-  windows too). A window row shows only its index and name (per-pane
-  facts are on the pane rows); a pane row shows `├ .N` / `└ .N`, its title
-  (blank when it is just the host name), command, agent state, run time,
-  directory and git badge. Claude Code's executable is named after its
-  version; a pane tagged as an agent (`@home_agent`, else the legacy
-  `@pane_agent`) shows the agent's name there instead.
+- **Rows**: every window, and under it every pane but sidebars. A window
+  of one pane (sidebars don't count) is a single line: its row carries
+  the pane's columns, and after the window's name, dim, the pane's name
+  or title when it says more (Claude Code's `✳ task`; clipped first).
+  Otherwise the window row shows only its index and name, and each pane
+  row `├ .N` / `└ .N`, its name (`^r`) or title (blank when it is just the
+  host name), command, agent state, run time, directory and git badge. A
+  one-pane window's row acts as its pane too: `^r` names it, the preview
+  outlines and scrolls it, `⏎` focuses it.
+- **Agents** in `CM`: the launcher's `@agent` marker as it is set
+  (`claude`, `kimi`; `@agent_model` is the banner's model), else an agent
+  found under the pane: Claude Code's executable is named after its
+  version (or `claude`), and a wrapper (`sh -c "claude-kickoff …; exec
+  $SHELL"`) can leave it under the shell, which tmux then reports as the
+  pane's command, so each refresh walks the process tree from
+  `pane_pid` (one read of the process table, about 2 ms). It is `kimi`
+  when its account is the OpenRouter one (`@home_config_dir`, else the
+  process's `CLAUDE_CONFIG_DIR`, read once per process), else `claude`.
+  Else a pane tagged by hooks (`@home_agent`, else the legacy
+  `@pane_agent`) running a version-named command shows the tag. The
+  "(ended?)" check uses the same: a Claude Code process under the pane
+  is alive, whatever tmux reports.
 - **Columns** (`# NM CM ST T PA GT`, dim, under the filter) are sized
   per page from what they hold, so values line up. Narrow terminals drop
   `GT`, then `PA`, `T`, `CM`, `ST`; `#` and the name stay.
@@ -230,9 +243,9 @@ a time). Use a throwaway server (`tmux -L scratch`) as the tests do.
 | `prefix )` `prefix (` | next / previous session page (wraps); the filter is kept and applies to the new page |
 | `↑` `↓` `^p` `^n` `^k` `^j` | move over windows and panes (wraps within the page) |
 | `PgUp` `PgDn` | page |
-| `S-↑` `S-↓` | scroll the selected pane in the preview a line (on a pane row; the list stays put) |
+| `S-↑` `S-↓` | scroll the selected pane in the preview a line (on a pane row, or a one-pane window's row; the list stays put) |
 | `S-PgUp` `S-PgDn` | scroll it half a page |
-| mouse wheel | scroll the selected pane, 3 lines a notch, wherever the pointer is; never the list; nothing on a window row |
+| mouse wheel | scroll the selected pane, 3 lines a notch, wherever the pointer is; never the list; nothing on the row of a window of several panes |
 | click | select the row clicked |
 | `←` `→` `Home` `End` `^a` `^e` `^u` `^w` | edit the filter |
 | `⏎` | switch to the window and close: on a pane row also select that pane, on an agent window's row focus the agent's pane |

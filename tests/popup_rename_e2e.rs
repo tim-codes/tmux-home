@@ -96,7 +96,7 @@ fn ctrl_shift_r_is_the_window_key_with_csi_u_extended_keys() {
     o.keys(&["Escape"]);
     o.wait_for(r"^> +.*2/2");
     o.keys(&["C-n"]);
-    o.wait_cursor_on_pane("");
+    o.wait_cursor_on("win two");
     o.typed("win");
     o.wait_for(r"^> win .*1/2");
 }
@@ -121,5 +121,5 @@ fn with_the_xterm_format_ctrl_shift_r_is_ctrl_r_and_m_r_renames_the_window() {
     o.wait_for(r"^> +.*2/2");
     // other keys unaffected
     o.keys(&["C-n"]);
-    o.wait_cursor_on_pane("");
+    o.wait_cursor_on("win two");
 }

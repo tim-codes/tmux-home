@@ -24,10 +24,10 @@ fn badge_on_the_row_and_the_preview_banner() {
         repo.to_str().unwrap(),
     ]);
     o.open_popup();
-    // the app window's pane row: command, path, then the badge (pushed
-    // by the daemon)
-    o.wait_for(r"^ +└ \.0 .*/app +main !\? ≡");
-    o.keys(&["Down", "Down", "Down", "Down"]);
+    // the app window's row (one pane: the pane's columns): command,
+    // path, then the badge (pushed by the daemon)
+    o.wait_for(r"^ +\d+ +app +\S+ .*/app +main !\? ≡");
+    o.keys(&["Down", "Down"]);
     o.wait_cursor_on("app");
     // the pane's banner atop its capture: its command, then git spelled
     // out (branch → upstream, in sync, counts), then where it is
