@@ -90,17 +90,28 @@ impl Row {
     }
 }
 
-/// The command a pane shows: Claude Code's executable is named after its
-/// version (`2.1.296`), so a pane tagged as an agent whose command is a
-/// bare `N.N.N` shows the agent's name instead: `@home_agent` (tmux-home's
-/// hooks), else the legacy `@pane_agent` older sessions still carry.
-/// Anything else, an untagged version-named process included, is shown as
-/// tmux reports it.
+/// The command a pane shows. The launcher's marker (`@agent`) as it is
+/// set; else, where an agent is known to run — a Claude Code process under
+/// the pane (`agent::procs`; a wrapper can leave it under the shell, which
+/// tmux then reports), or a pane tagged as an agent whose command is a
+/// bare `N.N.N` (Claude Code's executable is named after its version) —
+/// the agent's name (`agent::kind_of`: claude, kimi, or the tag of
+/// `@home_agent`, else the legacy `@pane_agent`). Anything else, an
+/// untagged version-named process included, is shown as tmux reports it.
 pub fn display_cmd(p: &crate::tmux::snapshot::Pane) -> String {
+    use crate::agent::{AgentKind, kind_of, marker};
+    if let Some(m) = marker(p) {
+        return m.to_string();
+    }
     let tag = |k: &str| p.agent_opts.get(k).filter(|v| !v.is_empty());
-    match tag("@home_agent").or_else(|| tag("@pane_agent")) {
-        Some(agent) if crate::agent::is_version(&p.current_command) => agent.clone(),
-        _ => p.current_command.clone(),
+    let hooks = tag("@home_agent")
+        .or_else(|| tag("@pane_agent"))
+        .map(|t| AgentKind::parse(t));
+    let known =
+        p.proc_agent.is_some() || (hooks.is_some() && crate::agent::is_version(&p.current_command));
+    match kind_of(p, hooks).filter(|_| known) {
+        Some(k) => k.name().to_string(),
+        None => p.current_command.clone(),
     }
 }
 
@@ -1567,6 +1578,25 @@ mod tests {
         assert_eq!(display_cmd(&tagged("2.1.296", &both)), "claude");
         let empty = [("@home_agent", ""), ("@pane_agent", "claude")];
         assert_eq!(display_cmd(&tagged("2.1.296", &empty)), "claude");
+        // the launcher's marker, as it is set, on any command
+        let marked = [("@agent", "kimi"), ("@home_agent", "claude")];
+        assert_eq!(display_cmd(&tagged("fish", &marked)), "kimi");
+        // a Claude Code process under the shell (a wrapper's launch):
+        // claude, or kimi on Kimi's account; tagged or not
+        let found = |cmd: &str, opts: &[(&str, &str)]| {
+            let mut p = tagged(cmd, opts);
+            p.proc_agent = Some(crate::agent::procs::ProcAgent {
+                pid: 7,
+                config_dir: None,
+            });
+            display_cmd(&p)
+        };
+        assert_eq!(found("fish", &[]), "claude");
+        let kimi = [("@home_config_dir", "/u/.claude-exxo-openrouter")];
+        assert_eq!(found("fish", &kimi), "kimi");
+        assert_eq!(display_cmd(&tagged("fish", &kimi)), "fish", "no process");
+        let kimi_tagged = [("@home_agent", "claude"), kimi[0]];
+        assert_eq!(display_cmd(&tagged("2.1.310", &kimi_tagged)), "kimi");
         // in the rows: the pane's command, the hay and an automatic name
         let mut s = snap();
         s.panes[3] = Pane {

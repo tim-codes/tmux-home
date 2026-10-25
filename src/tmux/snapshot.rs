@@ -123,6 +123,13 @@ pub struct Pane {
     pub window_width: u32,
     #[serde(default)]
     pub window_height: u32,
+    /// `pane_pid`: the process the pane was started with.
+    #[serde(default)]
+    pub pid: u32,
+    /// The Claude Code process under `pid`, if any (`agent::procs`): set
+    /// by `read_snapshot`, not by `parse`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_agent: Option<crate::agent::procs::ProcAgent>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Hash)]
@@ -145,10 +152,10 @@ const REC_END: &str = "\x1e\n";
 // The agent options sit between the fixed fields and the names; a prompt is
 // stored with newlines and `|` replaced, but a literal \x1f in one would
 // shift the fields after it (the record is then misread, not lost).
-const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{?#{@home_role},#{@home_role},#{@pane_role}}\x1f#{pane_tty}\x1f#{@home_role}\x1f#{pane_left}\x1f#{pane_top}\x1f#{pane_width}\x1f#{pane_height}\x1f#{window_width}\x1f#{window_height}\x1f#{@home_sidebar_pin}\x1f#{@home_sidebar_off}\x1f";
+const PANE_HEAD: &str = "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{automatic-rename}\x1f#{pane_id}\x1f#{pane_index}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{?#{@home_role},#{@home_role},#{@pane_role}}\x1f#{pane_tty}\x1f#{@home_role}\x1f#{pane_left}\x1f#{pane_top}\x1f#{pane_width}\x1f#{pane_height}\x1f#{window_width}\x1f#{window_height}\x1f#{@home_sidebar_pin}\x1f#{@home_sidebar_off}\x1f#{pane_pid}\x1f";
 const PANE_TAIL: &str = "#{session_name}\x1f#{pane_title}\x1f#{window_name}\x1e";
 /// Fields before the agent options.
-const HEAD_FIELDS: usize = 21;
+const HEAD_FIELDS: usize = 22;
 /// Fields in a `list-panes` record.
 fn pane_fields() -> usize {
     HEAD_FIELDS + crate::agent::OPTIONS.len() + 3
@@ -213,7 +220,9 @@ pub fn read_panes(t: &Tmux, target: &str) -> anyhow::Result<Vec<Pane>> {
 fn read_parsed(t: &Tmux) -> anyhow::Result<Snapshot> {
     let panes = t.run(&["list-panes", "-a", "-F", &PANE_FMT])?;
     let clients = t.run(&["list-clients", "-F", CLIENT_FMT])?;
-    Ok(parse(&panes, &clients))
+    let mut s = parse(&panes, &clients);
+    crate::agent::procs::annotate(&mut s);
+    Ok(s)
 }
 
 /// Number of sessions on the server; an error means the server is
@@ -319,6 +328,8 @@ pub fn parse(panes: &str, clients: &str) -> Snapshot {
             height: num(f[16]),
             window_width: num(f[17]),
             window_height: num(f[18]),
+            pid: num(f[21]),
+            proc_agent: None,
         });
     }
     for rec in records(clients) {
