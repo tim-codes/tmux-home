@@ -162,6 +162,130 @@ pub fn parse_panes(out: &str) -> Vec<LivePane> {
         .collect()
 }
 
+/// A session forked from another, as a process shows it: Claude Code's
+/// backgrounding re-hosts the conversation under a new id in a detached
+/// process (no `TMUX_PANE`, so no hooks reach the pane), started as
+/// `claude --session-id <new> --fork-session --resume <dir>/<parent>.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fork {
+    pub parent: String,
+    pub new: String,
+    /// Seconds since the process started: the smallest is the newest.
+    pub age: u64,
+}
+
+/// How many forks of forks `follow_fork` chases.
+const MAX_FORK_DEPTH: usize = 8;
+
+fn session_id_like(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// `ps` elapsed time, `[[dd-]hh:]mm:ss`, in seconds.
+fn parse_etime(s: &str) -> Option<u64> {
+    let (days, rest) = s
+        .split_once('-')
+        .map_or((0, s), |(d, r)| (d.parse().unwrap_or(0), r));
+    rest.split(':')
+        .try_fold(0u64, |t, f| Some(t * 60 + f.parse::<u64>().ok()?))
+        .map(|t| t + days * 86400)
+}
+
+/// The forks in `ps -axww -o etime=,args=` output: lines whose args have
+/// `--fork-session`, `--session-id <new>` and `--resume <parent>` (a bare
+/// id, or a transcript path ending in `<parent>.jsonl`). Args are split
+/// on whitespace, so a path with spaces is not matched.
+pub fn parse_forks(out: &str) -> Vec<Fork> {
+    out.lines()
+        .filter_map(|l| {
+            let (etime, args) = l.trim_start().split_once(char::is_whitespace)?;
+            let mut t = args.split_whitespace();
+            let (mut forked, mut new, mut from) = (false, None, None);
+            while let Some(a) = t.next() {
+                match a {
+                    "--fork-session" => forked = true,
+                    "--session-id" => new = t.next(),
+                    "--resume" => from = t.next(),
+                    _ => {}
+                }
+            }
+            let from = from?.rsplit('/').next()?;
+            let parent = from.strip_suffix(".jsonl").unwrap_or(from);
+            let new = new?;
+            (forked && session_id_like(parent) && session_id_like(new)).then(|| Fork {
+                parent: parent.into(),
+                new: new.into(),
+                age: parse_etime(etime).unwrap_or(u64::MAX),
+            })
+        })
+        .collect()
+}
+
+/// The fork processes now running; empty when `ps` can't be run.
+fn read_forks() -> Vec<Fork> {
+    std::process::Command::new("ps")
+        .args(["-axww", "-o", "etime=,args="])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_forks(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// Where a session recorded as `id` (transcript `transcript`) has gone by
+/// forking: the newest fork of it, then of that, up to `MAX_FORK_DEPTH`;
+/// each hop needs its transcript beside the recorded one (`exists`). `None`
+/// when it was never forked.
+pub fn follow_fork(
+    id: &str,
+    transcript: &str,
+    forks: &[Fork],
+    exists: impl Fn(&Path) -> bool,
+) -> Option<(String, String)> {
+    let dir = Path::new(transcript).parent()?;
+    let mut cur = (id.to_string(), transcript.to_string());
+    let mut seen = vec![id.to_string()];
+    for _ in 0..MAX_FORK_DEPTH {
+        let next = forks
+            .iter()
+            .filter(|f| f.parent == cur.0 && !seen.contains(&f.new))
+            .filter(|f| exists(&dir.join(format!("{}.jsonl", f.new))))
+            .min_by_key(|f| f.age);
+        let Some(f) = next else { break };
+        seen.push(f.new.clone());
+        cur = (
+            f.new.clone(),
+            dir.join(format!("{}.jsonl", f.new))
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    (cur.0 != id).then_some(cur)
+}
+
+/// Points every Claude pane whose session was forked at the fork; returns
+/// the panes changed. Cwd and account stay: the fork runs in both.
+pub fn adopt_forks(
+    panes: &mut [LivePane],
+    forks: &[Fork],
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<usize> {
+    let mut changed = Vec::new();
+    for (i, p) in panes.iter_mut().enumerate() {
+        if p.agent != "claude" || p.session_id.is_empty() || p.transcript.is_empty() {
+            continue;
+        }
+        if let Some((id, transcript)) = follow_fork(&p.session_id, &p.transcript, forks, &exists) {
+            p.session_id = id;
+            p.transcript = transcript;
+            changed.push(i);
+        }
+    }
+    changed
+}
+
 /// The entries to save from the live panes. A pane is saved when it runs
 /// Claude (a Claude Code process under it, or `looks_alive`) and its hooks have recorded a session with a
 /// transcript. A pane `restore-agents` claimed whose claude hasn't
@@ -405,7 +529,23 @@ pub fn save(t: &Tmux, socket: &Path) -> anyhow::Result<Option<usize>> {
         log(socket, "snapshot: skip save: server not restored yet");
         return Ok(None);
     }
-    let panes = list_panes(t)?;
+    let mut panes = list_panes(t)?;
+    // follow backgrounded sessions to their forks, in the pane's options
+    // too, so the sidebar and later saves agree
+    let forks = read_forks();
+    for i in adopt_forks(&mut panes, &forks, Path::exists) {
+        let p = &panes[i];
+        log(
+            socket,
+            &format!("snapshot: {} follows a fork to {}", p.id, p.session_id),
+        );
+        for (opt, v) in [
+            ("@home_session_id", &p.session_id),
+            ("@home_transcript", &p.transcript),
+        ] {
+            t.run(&["set-option", "-p", "-t", &p.id, opt, v])?;
+        }
+    }
     let prev = load(socket).unwrap_or_default();
     let snap = Snapshot {
         saved: crate::agent::now(),
@@ -739,6 +879,89 @@ mod tests {
         };
         let e = snapshot_entries(&[live], &prev);
         assert_eq!(e[0].session_id, "new");
+    }
+
+    const FORK_PS: &str = "   05:12 /x/versions/2.1.310 --session-id 200e3f73-f8f9-4d97-862a-0a4e7e2b48d2 --fork-session --resume /h/.claude/projects/-p/a0dcc65b-182c-4139-bc09-9d2aa83520c5.jsonl --reply-on-resume
+ 1-02:03:04 claude --bg-pty-host /tmp/cc-daemon-501/x/pty/200e3f73.sock
+       00:09 claude --session-id bbb --fork-session --resume a0dcc65b-182c-4139-bc09-9d2aa83520c5
+       00:01 claude --session-id ccc --resume a0dcc65b-182c-4139-bc09-9d2aa83520c5
+";
+
+    fn fork(parent: &str, new: &str, age: u64) -> Fork {
+        Fork {
+            parent: parent.into(),
+            new: new.into(),
+            age,
+        }
+    }
+
+    #[test]
+    fn forks_are_read_from_process_args() {
+        let f = parse_forks(FORK_PS);
+        assert_eq!(
+            f,
+            [
+                fork(
+                    "a0dcc65b-182c-4139-bc09-9d2aa83520c5",
+                    "200e3f73-f8f9-4d97-862a-0a4e7e2b48d2",
+                    312
+                ),
+                fork("a0dcc65b-182c-4139-bc09-9d2aa83520c5", "bbb", 9),
+            ]
+        );
+        assert_eq!(parse_etime("1-02:03:04"), Some(93784));
+        assert_eq!(parse_etime("12:34"), Some(754));
+        assert_eq!(parse_etime("x"), None);
+        assert!(parse_forks("1:00 claude --fork-session --resume\n").is_empty());
+    }
+
+    #[test]
+    fn a_fork_is_followed_when_its_transcript_exists() {
+        let all = |_: &Path| true;
+        let forks = [
+            fork("a", "b", 50),
+            fork("a", "b2", 10),
+            fork("b2", "c", 5),
+            fork("c", "a", 1),
+        ];
+        // newest fork, then its fork; a cycle back to the start stops
+        assert_eq!(
+            follow_fork("a", "/t/a.jsonl", &forks, all),
+            Some(("c".into(), "/t/c.jsonl".into()))
+        );
+        // a hop without a transcript beside the recorded one isn't taken
+        let no_c = |p: &Path| !p.ends_with("c.jsonl");
+        assert_eq!(
+            follow_fork("a", "/t/a.jsonl", &forks, no_c),
+            Some(("b2".into(), "/t/b2.jsonl".into()))
+        );
+        assert_eq!(follow_fork("a", "/t/a.jsonl", &forks, |_| false), None);
+        assert_eq!(follow_fork("z", "/t/z.jsonl", &forks, all), None);
+        // depth cap
+        let chain: Vec<Fork> = (0..20)
+            .map(|i| fork(&format!("s{i}"), &format!("s{}", i + 1), 1))
+            .collect();
+        let (id, _) = follow_fork("s0", "/t/s0.jsonl", &chain, all).unwrap();
+        assert_eq!(id, format!("s{MAX_FORK_DEPTH}"));
+    }
+
+    #[test]
+    fn a_forked_pane_is_saved_as_its_fork() {
+        let mut panes = [agent_pane("%1", "a"), agent_pane("%2", "other")];
+        let forks = [fork("a", "b", 1)];
+        assert_eq!(adopt_forks(&mut panes, &forks, |_| true), [0]);
+        let e = snapshot_entries(&panes, &Snapshot::default());
+        assert_eq!(
+            (e[0].session_id.as_str(), e[0].transcript.as_str()),
+            ("b", "/t/b.jsonl")
+        );
+        assert_eq!(e[0].cwd, "/w/api", "cwd kept");
+        assert_eq!(
+            e[0].config_dir.as_deref(),
+            Some("/h/.claude-work"),
+            "account kept"
+        );
+        assert_eq!(e[1].session_id, "other");
     }
 
     #[test]
