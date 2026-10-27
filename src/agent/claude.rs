@@ -416,8 +416,13 @@ impl AgentAdapter for Claude {
                 // Only the main context ends a session, so this wipes the
                 // pane even with subagents listed (the sidebar skips it
                 // then, leaving a stale `running`); a payload naming an
-                // `agent_id` is still never trusted to.
-                if !from_subagent(p) {
+                // `agent_id` is still never trusted to. A late SessionEnd
+                // from an old process (another session id than the pane
+                // now records) must not wipe the newer session's record.
+                let id = s(p, "session_id");
+                let stale =
+                    !prior.session_id.is_empty() && !id.is_empty() && prior.session_id != id;
+                if !from_subagent(p) && !stale {
                     w.clear_all();
                 }
             }
@@ -541,6 +546,8 @@ mod tests {
         apply(start, &Claude.on_hook(event, payload, &prior, NOW))
     }
 
+    const T1_ID: &str = "00000000-0000-4000-8000-000000000001";
+
     const T1: &str =
         "/home/user/.claude/projects/-home-user-project/00000000-0000-4000-8000-000000000001.jsonl";
 
@@ -613,6 +620,22 @@ mod tests {
         );
         assert_eq!(get(&m, Key::Model), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A SessionEnd from a session other than the pane's current one (a
+    /// late hook from an old process) leaves the new session's record be.
+    #[test]
+    fn a_stale_session_end_is_ignored() {
+        let end = fixture!("session_end");
+        let sid = end["session_id"].as_str().unwrap();
+        let cur = [(Key::SessionId, "11111111-1111-4111-8111-111111111111")];
+        let m = run(&cur, "", "SessionEnd", &end);
+        assert_eq!(get(&m, Key::SessionId), Some(cur[0].1), "kept");
+        // the pane's own session, or none recorded: wiped
+        let m = run(&[(Key::SessionId, sid)], "", "SessionEnd", &end);
+        assert_eq!(get(&m, Key::SessionId), None);
+        let m = run(&[], "", "SessionEnd", &end);
+        assert_eq!(get(&m, Key::SessionId), None);
     }
 
     #[test]
@@ -1053,6 +1076,7 @@ mod tests {
             .iter()
             .chain(&Key::RESUME)
             .map(|k| (*k, "x"))
+            .map(|(k, v)| (k, if k == Key::SessionId { T1_ID } else { v }))
             .collect();
         let m = run(&start, "", "SessionEnd", &fixture!("session_end"));
         assert!(m.is_empty(), "{m:?}");
@@ -1094,7 +1118,12 @@ mod tests {
             get(&m, Key::SessionId),
             Some("00000000-0000-4000-8000-000000000001")
         );
-        let m = run(&start, "", "SessionEnd", &fixture!("session_end"));
+        // the pane's own session ends
+        let own: Vec<_> = start
+            .iter()
+            .map(|&(k, v)| (k, if k == Key::SessionId { T1_ID } else { v }))
+            .collect();
+        let m = run(&own, "", "SessionEnd", &fixture!("session_end"));
         assert!(m.is_empty(), "{m:?}");
         // a SessionEnd naming an agent_id is never trusted to wipe
         let m = run(&start, "", "SessionEnd", &json!({"agent_id": "a"}));
