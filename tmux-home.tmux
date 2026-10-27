@@ -105,6 +105,10 @@ rust_q=$(q "$RUST_BIN")
 # Which binary runs is decided when the key is pressed, so a build that
 # finishes later (first install, TPM update) is used without a reload.
 cmd="if [ -x $rust_q ]; then $popup$rust_q popup; else ${tmux_q}display-message -c #{q:client_name} $(q "$missing"); fi"
+# A popup whose client goes away (the terminal is closed with it open) is
+# hung up and exits 129. run-shell would report that over the session's
+# active pane, where it outlives the client and masks the pane on reattach.
+cmd+="; s=\$?; [ \$s -eq 129 ] && s=0; exit \$s"
 
 for key in $keys; do
 	t bind-key "$key" run-shell -b "$cmd"

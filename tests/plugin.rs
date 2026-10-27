@@ -60,6 +60,9 @@ fn default_binds_prefix_dot_to_the_rust_popup() {
     assert!(b.contains("-e TMUX_HOME_PREFIX=C-b"), "{b}");
     assert!(b.contains("-e TMUX_HOME_KEYS=."), "{b}");
     assert!(b.contains(&format!("{BIN} popup")), "{b}");
+    // a popup hung up with its client (exit 129) isn't reported
+    let unescaped = b.replace("\\$", "$"); // list-keys shows $s as \$s
+    assert!(unescaped.contains("[ $s -eq 129 ] && s=0; exit $s"), "{b}");
     assert_eq!(
         s.tmux(&["list-keys", "-T", "prefix", "w"]),
         w_before,
