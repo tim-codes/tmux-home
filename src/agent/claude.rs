@@ -546,6 +546,8 @@ mod tests {
         apply(start, &Claude.on_hook(event, payload, &prior, NOW))
     }
 
+    const T1_ID: &str = "00000000-0000-4000-8000-000000000001";
+
     const T1: &str =
         "/home/user/.claude/projects/-home-user-project/00000000-0000-4000-8000-000000000001.jsonl";
 
@@ -1074,6 +1076,7 @@ mod tests {
             .iter()
             .chain(&Key::RESUME)
             .map(|k| (*k, "x"))
+            .map(|(k, v)| (k, if k == Key::SessionId { T1_ID } else { v }))
             .collect();
         let m = run(&start, "", "SessionEnd", &fixture!("session_end"));
         assert!(m.is_empty(), "{m:?}");
@@ -1115,7 +1118,12 @@ mod tests {
             get(&m, Key::SessionId),
             Some("00000000-0000-4000-8000-000000000001")
         );
-        let m = run(&start, "", "SessionEnd", &fixture!("session_end"));
+        // the pane's own session ends
+        let own: Vec<_> = start
+            .iter()
+            .map(|&(k, v)| (k, if k == Key::SessionId { T1_ID } else { v }))
+            .collect();
+        let m = run(&own, "", "SessionEnd", &fixture!("session_end"));
         assert!(m.is_empty(), "{m:?}");
         // a SessionEnd naming an agent_id is never trusted to wipe
         let m = run(&start, "", "SessionEnd", &json!({"agent_id": "a"}));
