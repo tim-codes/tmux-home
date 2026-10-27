@@ -110,6 +110,8 @@ pub struct LivePane {
     pub dead: bool,
     pub agent: String,
     pub session_id: String,
+    /// `@home_forked_from`: see `home::Key::ForkedFrom`.
+    pub forked_from: String,
     pub claim: String,
     pub typed: bool,
     pub transcript: String,
@@ -126,7 +128,7 @@ pub struct LivePane {
 }
 
 /// The fields `LivePane` reads; free text (path, session name) last.
-pub const PANE_FMT: &str = "#{pane_id}\x1f#{window_index}\x1f#{pane_index}\x1f#{pane_current_command}\x1f#{pane_in_mode}\x1f#{pane_dead}\x1f#{@home_agent}\x1f#{@home_session_id}\x1f#{@home_restore}\x1f#{@home_restore_typed}\x1f#{@home_transcript}\x1f#{@home_cwd}\x1f#{@home_config_dir}\x1f#{pane_pid}\x1f#{@home_pane_name}\x1f#{pane_current_path}\x1f#{session_name}\x1e";
+pub const PANE_FMT: &str = "#{pane_id}\x1f#{window_index}\x1f#{pane_index}\x1f#{pane_current_command}\x1f#{pane_in_mode}\x1f#{pane_dead}\x1f#{@home_agent}\x1f#{@home_session_id}\x1f#{@home_restore}\x1f#{@home_restore_typed}\x1f#{@home_transcript}\x1f#{@home_cwd}\x1f#{@home_config_dir}\x1f#{@home_forked_from}\x1f#{pane_pid}\x1f#{@home_pane_name}\x1f#{pane_current_path}\x1f#{session_name}\x1e";
 
 /// Parses `list-panes -F PANE_FMT` output; malformed records are dropped.
 pub fn parse_panes(out: &str) -> Vec<LivePane> {
@@ -134,8 +136,8 @@ pub fn parse_panes(out: &str) -> Vec<LivePane> {
         .map(|r| r.trim_start_matches('\n'))
         .filter(|r| !r.is_empty())
         .filter_map(|r| {
-            let f: Vec<&str> = r.splitn(17, '\x1f').collect();
-            if f.len() != 17 {
+            let f: Vec<&str> = r.splitn(18, '\x1f').collect();
+            if f.len() != 18 {
                 return None;
             }
             Some(LivePane {
@@ -152,11 +154,12 @@ pub fn parse_panes(out: &str) -> Vec<LivePane> {
                 transcript: f[10].into(),
                 cwd: f[11].into(),
                 config_dir: f[12].into(),
-                pid: f[13].parse().unwrap_or(0),
+                forked_from: f[13].into(),
+                pid: f[14].parse().unwrap_or(0),
                 agent_proc: false,
-                pane_name: f[14].into(),
-                path: f[15].into(),
-                session: f[16].into(),
+                pane_name: f[15].into(),
+                path: f[16].into(),
+                session: f[17].into(),
             })
         })
         .collect()
@@ -278,7 +281,12 @@ pub fn adopt_forks(
             continue;
         }
         if let Some((id, transcript)) = follow_fork(&p.session_id, &p.transcript, forks, &exists) {
-            p.session_id = id;
+            // the pane's process runs the original; a chain keeps it
+            if p.forked_from.is_empty() {
+                p.forked_from = std::mem::replace(&mut p.session_id, id);
+            } else {
+                p.session_id = id;
+            }
             p.transcript = transcript;
             changed.push(i);
         }
@@ -542,6 +550,7 @@ pub fn save(t: &Tmux, socket: &Path) -> anyhow::Result<Option<usize>> {
         for (opt, v) in [
             ("@home_session_id", &p.session_id),
             ("@home_transcript", &p.transcript),
+            ("@home_forked_from", &p.forked_from),
         ] {
             t.run(&["set-option", "-p", "-t", &p.id, opt, v])?;
         }
@@ -761,7 +770,7 @@ mod tests {
 
     #[test]
     fn parses_list_panes() {
-        let out = "%3\x1f1\x1f0\x1f2.1.295\x1f0\x1f0\x1fclaude\x1fsid\x1f\x1f\x1f/t/sid.jsonl\x1f/w\x1f/h/.c\x1f42\x1fapi\x1f/w/x\x1fmain\x1e\n%4\x1f2\x1f1\x1ffish\x1f1\x1f0\x1f\x1f\x1fsid2\x1f1\x1f\x1f\x1f\x1f\x1f\x1f/w\x1fmy session\x1e\nbroken\x1e\n";
+        let out = "%3\x1f1\x1f0\x1f2.1.295\x1f0\x1f0\x1fclaude\x1fsid\x1f\x1f\x1f/t/sid.jsonl\x1f/w\x1f/h/.c\x1fparent\x1f42\x1fapi\x1f/w/x\x1fmain\x1e\n%4\x1f2\x1f1\x1ffish\x1f1\x1f0\x1f\x1f\x1fsid2\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f/w\x1fmy session\x1e\nbroken\x1e\n";
         let p = parse_panes(out);
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].id, "%3");
@@ -769,6 +778,7 @@ mod tests {
         assert_eq!(p[0].command, "2.1.295");
         assert_eq!(p[0].transcript, "/t/sid.jsonl");
         assert_eq!(p[0].config_dir, "/h/.c");
+        assert_eq!(p[0].forked_from, "parent");
         assert_eq!(p[0].path, "/w/x");
         assert_eq!(
             (p[0].pane_name.as_str(), p[1].pane_name.as_str()),
@@ -962,6 +972,32 @@ mod tests {
             "account kept"
         );
         assert_eq!(e[1].session_id, "other");
+    }
+
+    #[test]
+    fn adopting_a_fork_records_the_original_session() {
+        let mut panes = [agent_pane("%1", "a")];
+        let forks = [fork("a", "b", 1), fork("b", "c", 1)];
+        assert_eq!(adopt_forks(&mut panes, &forks, |_| true), [0]);
+        assert_eq!(
+            (panes[0].session_id.as_str(), panes[0].forked_from.as_str()),
+            ("c", "a")
+        );
+        // the next save follows a further fork; the original stays
+        let forks = [fork("a", "b", 1), fork("b", "c", 1), fork("c", "d", 1)];
+        assert_eq!(adopt_forks(&mut panes, &forks, |_| true), [0]);
+        assert_eq!(
+            (panes[0].session_id.as_str(), panes[0].forked_from.as_str()),
+            ("d", "a")
+        );
+        // the parent's own hook wrote `a` back: re-followed, still `a`
+        panes[0].session_id = "a".into();
+        panes[0].transcript = "/t/a.jsonl".into();
+        assert_eq!(adopt_forks(&mut panes, &forks, |_| true), [0]);
+        assert_eq!(
+            (panes[0].session_id.as_str(), panes[0].forked_from.as_str()),
+            ("d", "a")
+        );
     }
 
     #[test]

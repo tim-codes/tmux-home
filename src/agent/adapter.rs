@@ -33,6 +33,9 @@ pub struct Prior {
     pub wait_reason: String,
     /// `@home_session_id`: the session the pane last recorded.
     pub session_id: String,
+    /// `@home_forked_from`: the session the pane's process runs when
+    /// `session_id` is a fork `restore::save` followed.
+    pub forked_from: String,
     /// The agent's config directory from the hook's own environment
     /// (`AgentAdapter::config_env`; the hook inherits the agent's), `None`
     /// when unset or empty: which account the session belongs to.

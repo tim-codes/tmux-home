@@ -49,6 +49,10 @@ pub enum Key {
     Transcript,
     Cwd,
     ConfigDir,
+    /// The session the pane's process actually runs, once `restore::save`
+    /// followed it to a fork (`SessionId` then names the fork): its
+    /// SessionEnd still clears the pane.
+    ForkedFrom,
 }
 
 impl Key {
@@ -73,7 +77,7 @@ impl Key {
     /// What `tmux-home restore-agents` needs to resume the pane's session
     /// after a reboot (with `SessionId`). Not in `OPTIONS`: the daemon's
     /// poll never reads them.
-    pub const RESUME: [Key; 3] = [Key::Transcript, Key::Cwd, Key::ConfigDir];
+    pub const RESUME: [Key; 4] = [Key::Transcript, Key::Cwd, Key::ConfigDir, Key::ForkedFrom];
 
     pub fn option(self) -> &'static str {
         match self {
@@ -95,6 +99,7 @@ impl Key {
             Key::Transcript => "@home_transcript",
             Key::Cwd => "@home_cwd",
             Key::ConfigDir => "@home_config_dir",
+            Key::ForkedFrom => "@home_forked_from",
         }
     }
 }
