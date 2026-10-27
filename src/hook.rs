@@ -118,7 +118,7 @@ pub fn apply_event(
 /// one call: tmux-agent-sidebar's `@pane_bg_cmd` (set by its PostToolUse
 /// hook, cleared by its refresh sweep), `@home_bg_cmd` (from the last
 /// Stop's `background_tasks`), `@home_status` / `@home_attention` /
-/// `@home_wait_reason`, and `@home_session_id`. (`config_dir` comes from
+/// `@home_wait_reason`, `@home_session_id` and `@home_forked_from`. (`config_dir` comes from
 /// the environment, not the pane: left `None`.)
 pub fn read_prior(t: &Tmux, pane: &str) -> anyhow::Result<Prior> {
     let out = t.run(&[
@@ -126,7 +126,7 @@ pub fn read_prior(t: &Tmux, pane: &str) -> anyhow::Result<Prior> {
         "-p",
         "-t",
         pane,
-        "#{@home_subagents}\x1f#{@pane_bg_cmd}\x1f#{@home_bg_cmd}\x1f#{@home_status}\x1f#{@home_attention}\x1f#{@home_wait_reason}\x1f#{@home_session_id}",
+        "#{@home_subagents}\x1f#{@pane_bg_cmd}\x1f#{@home_bg_cmd}\x1f#{@home_status}\x1f#{@home_attention}\x1f#{@home_wait_reason}\x1f#{@home_session_id}\x1f#{@home_forked_from}",
     ])?;
     let out = out.strip_suffix('\n').unwrap_or(&out);
     let mut f = out.split('\x1f').map(|v| v.trim().to_string());
@@ -138,6 +138,7 @@ pub fn read_prior(t: &Tmux, pane: &str) -> anyhow::Result<Prior> {
         attention: f.next().unwrap_or_default(),
         wait_reason: f.next().unwrap_or_default(),
         session_id: f.next().unwrap_or_default(),
+        forked_from: f.next().unwrap_or_default(),
         config_dir: None,
     })
 }

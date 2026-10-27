@@ -186,6 +186,10 @@ fn resume_meta(w: &mut Writes, p: &Value, prior: &Prior, session_start: bool) {
         w.set_or_unset(Key::Cwd, s(p, "cwd"));
     }
     w.set_or_unset(Key::ConfigDir, prior.config_dir.as_deref().unwrap_or(""));
+    // a session other than the one forked from (a new process) ends the fork
+    if !prior.forked_from.is_empty() && (session_start || prior.forked_from != id) {
+        w.unset(Key::ForkedFrom);
+    }
 }
 
 /// How much of a transcript's end `last_model` reads: one bounded read
@@ -420,8 +424,12 @@ impl AgentAdapter for Claude {
                 // from an old process (another session id than the pane
                 // now records) must not wipe the newer session's record.
                 let id = s(p, "session_id");
-                let stale =
-                    !prior.session_id.is_empty() && !id.is_empty() && prior.session_id != id;
+                // the parent a fork was followed from is the pane's own
+                let ours = id == prior.forked_from;
+                let stale = !ours
+                    && !prior.session_id.is_empty()
+                    && !id.is_empty()
+                    && prior.session_id != id;
                 if !from_subagent(p) && !stale {
                     w.clear_all();
                 }
@@ -519,6 +527,7 @@ mod tests {
             attention: find(Key::Attention),
             wait_reason: find(Key::WaitReason),
             session_id: find(Key::SessionId),
+            forked_from: find(Key::ForkedFrom),
             config_dir: None,
         };
         apply(start, &Claude.on_hook(event, payload, &prior, NOW))
@@ -540,6 +549,7 @@ mod tests {
         };
         let prior = Prior {
             session_id: find(Key::SessionId),
+            forked_from: find(Key::ForkedFrom),
             config_dir: config_dir.map(String::from),
             ..Prior::default()
         };
@@ -636,6 +646,59 @@ mod tests {
         assert_eq!(get(&m, Key::SessionId), None);
         let m = run(&[], "", "SessionEnd", &end);
         assert_eq!(get(&m, Key::SessionId), None);
+    }
+
+    /// A fork-followed pane records the fork as its session, but its own
+    /// process still runs the parent: the parent's SessionEnd clears it.
+    #[test]
+    fn the_forked_from_parents_session_end_clears() {
+        let end = fixture!("session_end");
+        let parent = end["session_id"].as_str().unwrap();
+        let start: Vec<(Key, &str)> = Key::ALL
+            .iter()
+            .chain(&Key::RESUME)
+            .map(|k| (*k, "x"))
+            .map(|(k, v)| match k {
+                Key::SessionId => (k, "fork-id"),
+                Key::ForkedFrom => (k, parent),
+                _ => (k, v),
+            })
+            .collect();
+        let m = run(&start, "", "SessionEnd", &end);
+        assert!(m.is_empty(), "{m:?}");
+        // an unrelated id is still stale
+        let other = [
+            (Key::SessionId, "fork-id"),
+            (Key::ForkedFrom, "other-parent"),
+        ];
+        let m = run(&other, "", "SessionEnd", &end);
+        assert_eq!(get(&m, Key::SessionId), Some("fork-id"), "kept");
+        assert_eq!(get(&m, Key::ForkedFrom), Some("other-parent"), "kept");
+    }
+
+    /// A new process in the pane drops `forked_from`, so the old parent's
+    /// late SessionEnd can't wipe the new session; a later hook from a
+    /// session other than the parent drops it too, the parent's keeps it.
+    #[test]
+    fn a_new_session_drops_forked_from() {
+        let end = fixture!("session_end");
+        let parent = end["session_id"].as_str().unwrap();
+        let rec = [(Key::SessionId, "fork-id"), (Key::ForkedFrom, parent)];
+        let m = run(
+            &rec,
+            "",
+            "SessionStart",
+            &json!({"session_id": "b", "source": "startup"}),
+        );
+        assert_eq!(get(&m, Key::ForkedFrom), None);
+        assert_eq!(get(&m, Key::SessionId), Some("b"));
+        for event in ["UserPromptSubmit", "Stop"] {
+            let m = run(&rec, "", event, &json!({"session_id": "b"}));
+            assert_eq!(get(&m, Key::ForkedFrom), None, "{event}");
+            let m = run(&rec, "", event, &json!({"session_id": parent}));
+            assert_eq!(get(&m, Key::ForkedFrom), Some(parent), "{event}");
+            assert_eq!(get(&m, Key::SessionId), Some(parent), "{event}");
+        }
     }
 
     #[test]
