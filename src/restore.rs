@@ -22,7 +22,10 @@
 //!   (`@home_restore_done`, set by the post-restore hook, or by the config
 //!   when there was nothing to restore) is saved: until then its panes
 //!   aren't the user's sessions yet, and a save would overwrite the
-//!   snapshot the restore needs.
+//!   snapshot the restore needs. An entry a restore read and didn't resume
+//!   is marked pending (`Entry::pending_since`) and kept by every save
+//!   until a pane runs it again, `tmux-home agents-drop` drops it, or it is
+//!   `PENDING_MAX_AGE` old; the next restore tries it after the rest.
 //! - **Restore** (`tmux-home restore-agents`, from
 //!   `@resurrect-hook-post-restore-all`). Once per server (a run that
 //!   claims nothing doesn't count, so a later restore can still try): each saved
@@ -93,7 +96,17 @@ pub struct Entry {
     /// given back to the pane it is restored into.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_name: Option<String>,
+    /// Pending: a restore read this entry and didn't resume it (Unix
+    /// seconds, when that first happened). Kept across saves, though no
+    /// pane runs it, until it is resumed (a pane runs it again), dropped
+    /// (`tmux-home agents-drop`) or `PENDING_MAX_AGE` old; a later restore
+    /// tries it again, after the entries saved running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_since: Option<u64>,
 }
+
+/// How long an entry stays pending: a week.
+pub const PENDING_MAX_AGE: u64 = 7 * 24 * 3600;
 
 impl Entry {
     pub fn location(&self) -> String {
@@ -335,6 +348,7 @@ pub fn snapshot_entries(panes: &[LivePane], prev: &Snapshot) -> Vec<Entry> {
                 },
                 config_dir: (!p.config_dir.is_empty()).then(|| p.config_dir.clone()),
                 pane_name: (!p.pane_name.is_empty()).then(|| p.pane_name.clone()),
+                pending_since: None,
             });
         } else if !p.claim.is_empty()
             && p.session_id.is_empty()
@@ -352,6 +366,53 @@ pub fn snapshot_entries(panes: &[LivePane], prev: &Snapshot) -> Vec<Entry> {
         }
     }
     out
+}
+
+/// Adds to `out` (the entries from the live panes) the pending entries of
+/// `prev` that are neither running again (in `out`) nor `PENDING_MAX_AGE`
+/// old at `now`.
+pub fn carry_pending(out: &mut Vec<Entry>, prev: &Snapshot, now: u64) {
+    for e in &prev.entries {
+        let Some(since) = e.pending_since else {
+            continue;
+        };
+        if now.saturating_sub(since) < PENDING_MAX_AGE
+            && !out.iter().any(|o| o.session_id == e.session_id)
+        {
+            out.push(e.clone());
+        }
+    }
+}
+
+/// Marks `entries` pending in `snap` from `now` (an entry already pending
+/// keeps its time); one `snap` no longer has (a save since dropped it) is
+/// added back.
+pub fn mark_pending(snap: &mut Snapshot, entries: &[Entry], now: u64) {
+    for e in entries {
+        match snap
+            .entries
+            .iter_mut()
+            .find(|s| s.session_id == e.session_id)
+        {
+            Some(s) => {
+                s.pending_since.get_or_insert(now);
+            }
+            None => snap.entries.push(Entry {
+                pending_since: Some(e.pending_since.unwrap_or(now)),
+                ..e.clone()
+            }),
+        }
+    }
+}
+
+/// Drops the pending entries with these session ids, or every pending
+/// one (`all`); the number dropped. Entries saved running are left: the
+/// next save writes them again anyway.
+pub fn drop_entries(snap: &mut Snapshot, ids: &[String], all: bool) -> usize {
+    let before = snap.entries.len();
+    snap.entries
+        .retain(|e| e.pending_since.is_none() || !(all || ids.contains(&e.session_id)));
+    before - snap.entries.len()
 }
 
 /// Shells the resume command is written for: POSIX shells and fish (≥ 3,
@@ -546,7 +607,10 @@ pub fn plan<'a>(
 ) -> Vec<(&'a Entry, Result<&'a LivePane, String>)> {
     let mut taken: Vec<&str> = Vec::new();
     let mut out: Vec<Option<Result<&'a LivePane, String>>> = vec![None; snap.entries.len()];
-    let order = || 0..snap.entries.len();
+    // entries saved running first, then pending ones (`Entry::pending_since`)
+    let mut idx: Vec<usize> = (0..snap.entries.len()).collect();
+    idx.sort_by_key(|&i| snap.entries[i].pending_since.is_some());
+    let order = || idx.iter().copied();
     for i in order() {
         let e = &snap.entries[i];
         if let Some(p) = direct(panes, e) {
@@ -652,7 +716,6 @@ pub fn snapshot_cli(socket: Option<PathBuf>) -> anyhow::Result<()> {
 /// Writes the snapshot; `None`, leaving the old one, when the server isn't
 /// done restoring (`RESTORE_DONE` unset).
 pub fn save(t: &Tmux, socket: &Path) -> anyhow::Result<Option<usize>> {
-    use std::io::Write;
     if global(t, RESTORE_DONE).is_empty() {
         log(socket, "snapshot: skip save: server not restored yet");
         return Ok(None);
@@ -675,26 +738,105 @@ pub fn save(t: &Tmux, socket: &Path) -> anyhow::Result<Option<usize>> {
             t.run(&["set-option", "-p", "-t", &p.id, opt, v])?;
         }
     }
+    let _lock = snapshot_lock(socket)?;
     let prev = load(socket).unwrap_or_default();
+    let now = crate::agent::now();
+    let mut entries = snapshot_entries(&panes, &prev);
+    carry_pending(&mut entries, &prev, now);
     let snap = Snapshot {
-        saved: crate::agent::now(),
-        entries: snapshot_entries(&panes, &prev),
+        saved: now,
+        entries,
     };
+    write(socket, &snap)?;
+    Ok(Some(snap.entries.len()))
+}
+
+/// Writes `snap` as the snapshot, atomically (temp file + rename).
+fn write(socket: &Path, snap: &Snapshot) -> anyhow::Result<()> {
+    use std::io::Write;
     let path = snapshot_path(socket)?;
     let dir = path.parent().expect("state dir");
+    let tmp = dir.join(format!("{SNAPSHOT}.{}.tmp", std::process::id()));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&serde_json::to_vec_pretty(snap)?)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Read-modify-writes of the snapshot (a save, marking entries pending,
+/// dropping them) take turns: an exclusive lock on `agents.lock` beside
+/// it, which also creates the state dir.
+fn snapshot_lock(socket: &Path) -> anyhow::Result<std::fs::File> {
+    let path = snapshot_path(socket)?.with_file_name("agents.lock");
     {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(dir)?;
+            .create(path.parent().expect("state dir"))?;
     }
-    let tmp = dir.join(format!("{SNAPSHOT}.{}.tmp", std::process::id()));
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(&serde_json::to_vec_pretty(&snap)?)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(Some(snap.entries.len()))
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    f.lock()?;
+    Ok(f)
+}
+
+/// Loads the snapshot, applies `f` and writes it back, under the lock.
+fn update<R>(socket: &Path, f: impl FnOnce(&mut Snapshot) -> R) -> anyhow::Result<R> {
+    let _lock = snapshot_lock(socket)?;
+    let mut snap = load(socket)?;
+    let r = f(&mut snap);
+    write(socket, &snap)?;
+    Ok(r)
+}
+
+/// Marks entries a restore didn't resume pending (`Entry::pending_since`),
+/// so the saves after it keep them. One whose transcript is gone is left
+/// to go: it can't be resumed.
+fn keep_pending(socket: &Path, skipped: &[Entry]) {
+    let skipped: Vec<Entry> = skipped
+        .iter()
+        .filter(|e| Path::new(&e.transcript).exists())
+        .cloned()
+        .collect();
+    if skipped.is_empty() {
+        return;
+    }
+    let now = crate::agent::now();
+    match update(socket, |s| mark_pending(s, &skipped, now)) {
+        Ok(()) => log(
+            socket,
+            &format!(
+                "pending: {} kept for a later restore (tmux-home agents-drop drops them)",
+                skipped
+                    .iter()
+                    .map(|e| e.session_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        ),
+        Err(e) => log(socket, &format!("pending: {e:#}")),
+    }
+}
+
+/// `tmux-home agents-drop [--pending] [<session-id>...]`: drops pending
+/// entries from the snapshot, so no restore tries them again. Prints how
+/// many were dropped.
+pub fn drop_cli(socket: Option<PathBuf>, ids: Vec<String>, all: bool) -> anyhow::Result<()> {
+    let Some(socket) = crate::client::current_socket(socket) else {
+        anyhow::bail!("not inside tmux (pass --socket)");
+    };
+    if ids.is_empty() && !all {
+        anyhow::bail!("name the session ids to drop, or --pending for every pending one");
+    }
+    let n = update(&socket, |s| drop_entries(s, &ids, all))?;
+    log(&socket, &format!("pending: dropped {n}"));
+    println!("dropped {n} pending agent session(s)");
+    Ok(())
 }
 
 /// `tmux-home restore-agents [--worker]`. Always exits 0.
@@ -731,6 +873,7 @@ fn claim(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
     let snap = load(socket)?;
     let panes = list_panes(t)?;
     let mut claimed = 0;
+    let mut skipped = Vec::new();
     for (e, r) in plan(&snap, &panes, Path::exists) {
         match r {
             Ok(p) => {
@@ -755,16 +898,22 @@ fn claim(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
                 }
                 claimed += 1;
             }
-            Err(why) => log(
-                socket,
-                &format!("skip {} {}: {why}", e.location(), e.session_id),
-            ),
+            Err(why) => {
+                log(
+                    socket,
+                    &format!("skip {} {}: {why}", e.location(), e.session_id),
+                );
+                if why != "already restored" {
+                    skipped.push(e.clone());
+                }
+            }
         }
     }
     log(
         socket,
         &format!("restore: {claimed} of {} saved agents", snap.entries.len()),
     );
+    keep_pending(socket, &skipped);
     if claimed > 0 {
         t.run(&["set-option", "-g", GUARD, &crate::agent::now().to_string()])?;
         spawn_worker(socket)?;
@@ -854,6 +1003,7 @@ fn run_worker(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
                     socket,
                     &format!("skip {} {}: {why}", e.location(), e.session_id),
                 );
+                keep_pending(socket, std::slice::from_ref(e));
             }
         }
     }
@@ -876,6 +1026,7 @@ mod tests {
             cwd: "/w/api".into(),
             config_dir: None,
             pane_name: None,
+            pending_since: None,
         }
     }
 
@@ -966,6 +1117,7 @@ mod tests {
                 cwd: "/w/api".into(),
                 config_dir: Some("/h/.claude-work".into()),
                 pane_name: None,
+                pending_since: None,
             }
         );
         // no cwd recorded: the pane's directory; no account: None
@@ -1448,6 +1600,91 @@ mod tests {
         let panes = shifted_window(false);
         let p = plan(&snap, &panes, |_| true);
         assert_eq!(p[1].1.as_ref().unwrap().id, "%11", "exact");
+        assert!(p[0].1.is_err(), "{:?}", p[0].1);
+    }
+
+    fn pend(sid: &str, since: u64) -> Entry {
+        Entry {
+            session_id: sid.into(),
+            pending_since: Some(since),
+            ..entry()
+        }
+    }
+
+    fn sids(e: &[Entry]) -> Vec<&str> {
+        e.iter().map(|e| e.session_id.as_str()).collect()
+    }
+
+    /// 2026-11-02: the autosave after a partly failed restore saved only
+    /// the panes running claude, and the six it hadn't resumed were gone.
+    #[test]
+    fn unresumed_entries_stay_pending_until_resumed_or_too_old() {
+        let now = 10 * PENDING_MAX_AGE;
+        let prev = Snapshot {
+            saved: 1,
+            entries: vec![
+                pend("p", now - 60),
+                // not pending: a session that was running at the last
+                // save and has since been exited
+                Entry {
+                    session_id: "exited".into(),
+                    ..entry()
+                },
+                pend("old", now - PENDING_MAX_AGE),
+                pend("live", now - 60),
+            ],
+        };
+        let mut e = snapshot_entries(&[agent_pane("%1", "live")], &prev);
+        carry_pending(&mut e, &prev, now);
+        assert_eq!(sids(&e), ["live", "p"]);
+        assert_eq!(e[0].pending_since, None, "resumed: running again");
+        assert_eq!(e[1].pending_since, Some(now - 60), "kept as it was");
+    }
+
+    #[test]
+    fn marking_pending_keeps_the_first_time_and_adds_what_is_missing() {
+        let mut s = Snapshot {
+            saved: 1,
+            entries: vec![entry()],
+        };
+        let x = Entry {
+            session_id: "x".into(),
+            ..entry()
+        };
+        mark_pending(&mut s, &[entry(), x.clone()], 50);
+        assert_eq!(sids(&s.entries), [entry().session_id.as_str(), "x"]);
+        assert!(s.entries.iter().all(|e| e.pending_since == Some(50)));
+        mark_pending(&mut s, &[x], 60);
+        assert_eq!(s.entries[1].pending_since, Some(50));
+    }
+
+    #[test]
+    fn pending_entries_are_dropped_by_id_or_all_at_once() {
+        let mut s = Snapshot {
+            saved: 1,
+            entries: vec![entry(), pend("a", 1), pend("b", 1)],
+        };
+        assert_eq!(drop_entries(&mut s, &["a".to_string()], false), 1);
+        assert_eq!(sids(&s.entries), [entry().session_id.as_str(), "b"]);
+        assert_eq!(drop_entries(&mut s, &[], true), 1);
+        assert_eq!(sids(&s.entries), [entry().session_id.as_str()]);
+    }
+
+    #[test]
+    fn fresh_entries_are_placed_before_pending_ones() {
+        let snap = Snapshot {
+            saved: 1,
+            entries: vec![
+                Entry {
+                    pending_since: Some(1),
+                    ..at(4, 2, "/w/api", "old")
+                },
+                at(4, 2, "/w/api", "new"),
+            ],
+        };
+        let panes = shifted_window(false);
+        let p = plan(&snap, &panes, |_| true);
+        assert_eq!(p[1].1.as_ref().unwrap().id, "%11");
         assert!(p[0].1.is_err(), "{:?}", p[0].1);
     }
 

@@ -311,6 +311,7 @@ fn write_snapshot(s: &TestServer, id: &str, proj: &Path, transcript: &Path) {
             cwd: proj.to_str().unwrap().into(),
             config_dir: None,
             pane_name: Some("api work".into()),
+            pending_since: None,
         }],
     };
     let file = snapshot_file(s);
@@ -477,6 +478,57 @@ fn a_pane_whose_index_shifted_is_still_resumed() {
     let rlog = restore_log(&s);
     assert!(rlog.contains("pane index shifted 1.0\u{2192}1.1"), "{rlog}");
     assert!(rlog.contains("restore: 1 of 1 saved agents"), "{rlog}");
+    drop(dirs);
+}
+
+fn load_snapshot(s: &TestServer) -> tmux_home::restore::Snapshot {
+    serde_json::from_slice(&std::fs::read(snapshot_file(s)).unwrap()).unwrap()
+}
+
+/// An entry a restore couldn't resume stays in the snapshot, pending,
+/// through the saves after it (2026-11-02: the next autosave erased six),
+/// until it is dropped.
+#[test]
+fn an_unresumed_entry_survives_later_saves_until_dropped() {
+    let _env = TestEnv::new();
+    let dirs = temp_base("pending");
+    let base = dirs.base.clone();
+    let proj = base.join("proj");
+    let other = base.join("other");
+    for d in [&proj, &other] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let transcript = base.join("t.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let s = TestServer::start();
+    s.tmux(&["set", "-g", "@home-restore-agents", "on"]);
+    let id = "00000000-0000-4000-8000-0000000000c1";
+    write_snapshot(&s, id, &proj, &transcript);
+    // alpha:1.0 is in the wrong directory, and nothing else fits
+    window(&s, 1, &other, "/usr/bin:/bin", None);
+    run(&s, "restore-agents");
+    let rlog = restore_log(&s);
+    assert!(rlog.contains("restore: 0 of 1 saved agents"), "{rlog}");
+    let snap = load_snapshot(&s);
+    assert_eq!(snap.entries.len(), 1);
+    assert!(snap.entries[0].pending_since.is_some(), "{snap:?}");
+
+    // a save: no pane runs it, but it is kept
+    run(&s, "agents-snapshot");
+    let snap = load_snapshot(&s);
+    let got: Vec<&str> = snap.entries.iter().map(|e| e.session_id.as_str()).collect();
+    assert_eq!(got, [id]);
+
+    let out = Command::new(BIN)
+        .args(["agents-drop", "--pending", "--socket"])
+        .arg(&s.socket)
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(load_snapshot(&s).entries.is_empty());
+    run(&s, "agents-snapshot");
+    assert!(load_snapshot(&s).entries.is_empty());
     drop(dirs);
 }
 
