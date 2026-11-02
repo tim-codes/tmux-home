@@ -43,6 +43,12 @@
 //!   idle shell in its window in that directory, logged as `pane index
 //!   shifted`; with several, none (ambiguous, logged).
 //!
+//! - **Sidebars.** The snapshot also keeps where the tmux-home sidebars
+//!   were; after a restore, one that resurrect brought back as a plain
+//!   shell (it typed the sidebar's command into another pane) is made a
+//!   sidebar again in place, or closed if its window has one
+//!   (`stale_sidebars`).
+//!
 //! Everything is logged to `<state_dir>/restore.log`; neither command ever
 //! fails resurrect's hook.
 
@@ -119,6 +125,11 @@ pub struct Snapshot {
     /// Unix seconds.
     pub saved: u64,
     pub entries: Vec<Entry>,
+    /// Where the tmux-home sidebars were (`session:window.pane`): a pane
+    /// resurrect restores from one of these that comes back as a plain
+    /// shell is made a sidebar again, or closed (`stale_sidebars`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidebars: Vec<String>,
 }
 
 /// One pane, as `PANE_FMT` lists it.
@@ -368,6 +379,37 @@ pub fn snapshot_entries(panes: &[LivePane], prev: &Snapshot) -> Vec<Entry> {
     out
 }
 
+/// The locations of the tmux-home sidebars among `panes`.
+pub fn sidebar_locations(panes: &[LivePane]) -> Vec<String> {
+    panes
+        .iter()
+        .filter(|p| p.role == crate::sidebar::ROLE && !p.dead)
+        .map(|p| format!("{}:{}.{}", p.session, p.window, p.pane))
+        .collect()
+}
+
+/// Panes resurrect restored from a saved sidebar's location (`saved`)
+/// that are a plain idle shell instead (it typed the sidebar's command
+/// into another pane, or not at all), each with whether its window has a
+/// tmux-home sidebar already. Only a pane whose start command names the
+/// location counts: by index alone it could be any pane.
+pub fn stale_sidebars<'a>(panes: &'a [LivePane], saved: &[String]) -> Vec<(&'a LivePane, bool)> {
+    panes
+        .iter()
+        .filter(|p| idle_shell(p))
+        .filter(|p| restored_from(&p.start).is_some_and(|l| saved.contains(&l)))
+        .map(|p| {
+            let has = panes.iter().any(|q| {
+                q.session == p.session
+                    && q.window == p.window
+                    && q.role == crate::sidebar::ROLE
+                    && !q.dead
+            });
+            (p, has)
+        })
+        .collect()
+}
+
 /// Adds to `out` (the entries from the live panes) the pending entries of
 /// `prev` that are neither running again (in `out`) nor `PENDING_MAX_AGE`
 /// old at `now`.
@@ -577,6 +619,8 @@ fn shifted<'a>(
         .iter()
         .filter(|p| p.session == e.session && p.window == e.window && p.path == e.path)
         .filter(|p| idle_shell(p) && !taken.contains(&p.id.as_str()))
+        // one resurrect restored from another location is that one's
+        .filter(|p| restored_from(&p.start).is_none_or(|l| l == e.location()))
         .collect();
     match c.as_slice() {
         [] => Ok(None),
@@ -746,6 +790,7 @@ pub fn save(t: &Tmux, socket: &Path) -> anyhow::Result<Option<usize>> {
     let snap = Snapshot {
         saved: now,
         entries,
+        sidebars: sidebar_locations(&panes),
     };
     write(socket, &snap)?;
     Ok(Some(snap.entries.len()))
@@ -849,10 +894,63 @@ pub fn restore_cli(socket: Option<PathBuf>, worker: bool) -> anyhow::Result<()> 
     let r = if worker {
         run_worker(&t, &socket)
     } else {
+        if let Err(e) = repair_sidebars(&t, &socket) {
+            log(&socket, &format!("sidebars: {e:#}"));
+        }
         claim(&t, &socket)
     };
     if let Err(e) = r {
         log(&socket, &format!("restore: {e:#}"));
+    }
+    Ok(())
+}
+
+/// Server option: `repair_sidebars` has run on this server.
+const SIDEBARS_REPAIRED: &str = "@home_sidebars_repaired";
+
+/// Once per server, after a restore: each saved sidebar that came back as
+/// a plain shell (`stale_sidebars`) is made a sidebar again in place
+/// (`respawn-pane`, so no index moves), or closed when its window has a
+/// sidebar already.
+fn repair_sidebars(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
+    if !global(t, SIDEBARS_REPAIRED).is_empty() {
+        return Ok(());
+    }
+    t.run(&["set-option", "-g", SIDEBARS_REPAIRED, "1"])?;
+    let snap = load(socket)?;
+    if snap.sidebars.is_empty() {
+        return Ok(());
+    }
+    let panes = list_panes(t)?;
+    let bin = crate::sidebar::sidebar_bin();
+    let mut given: Vec<(String, u32)> = Vec::new();
+    for (p, has) in stale_sidebars(&panes, &snap.sidebars) {
+        let win = (p.session.clone(), p.window);
+        let what = if has || given.contains(&win) {
+            t.run(&["kill-pane", "-t", &p.id]).map(|_| "closed")
+        } else {
+            given.push(win);
+            t.run(&[
+                "respawn-pane",
+                "-k",
+                "-t",
+                &p.id,
+                "/bin/sh",
+                "-c",
+                "\"$0\" sidebar --managed; exit",
+                &bin.to_string_lossy(),
+            ])
+            .and_then(|_| crate::sidebar::mark(t, &p.id))
+            .map(|_| "made a sidebar again")
+        };
+        let loc = format!("{}:{}.{}", p.session, p.window, p.pane);
+        match what {
+            Ok(w) => log(
+                socket,
+                &format!("sidebars: {loc} ({}), a stale shell: {w}", p.id),
+            ),
+            Err(e) => log(socket, &format!("sidebars: {loc} ({}): {e:#}", p.id)),
+        }
     }
     Ok(())
 }
@@ -1149,6 +1247,7 @@ mod tests {
     fn snapshot_keeps_claimed_panes_until_their_claude_records_itself() {
         let prev = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![entry()],
         };
         let id = entry().session_id;
@@ -1428,6 +1527,7 @@ mod tests {
     fn plan_never_claims_twice() {
         let snap = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![
                 entry(),
                 Entry {
@@ -1519,17 +1619,27 @@ mod tests {
     fn a_shifted_pane_is_found_by_the_location_resurrect_restored_it_from() {
         let snap = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![at(4, 1, "/w/api", "a")],
         };
         let panes = shifted_window(true);
         let p = plan(&snap, &panes, |_| true);
         assert_eq!(p[0].1.as_ref().unwrap().id, "%11");
+        // a pane restored from another location is never the fallback
+        let snap = Snapshot {
+            saved: 1,
+            sidebars: Vec::new(),
+            entries: vec![at(4, 5, "/h", "a")],
+        };
+        let p = plan(&snap, &panes, |_| true);
+        assert!(p[0].1.is_err(), "{:?}", p[0].1);
     }
 
     #[test]
     fn a_shifted_pane_is_found_by_its_directory_when_it_is_the_only_one() {
         let snap = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![at(4, 1, "/w/api", "a")],
         };
         let panes = shifted_window(false);
@@ -1538,6 +1648,7 @@ mod tests {
         // not a sidebar, even one in the saved directory
         let snap = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![at(4, 0, "/h", "a")],
         };
         let p = plan(&snap, &panes, |_| true);
@@ -1548,6 +1659,7 @@ mod tests {
     fn an_ambiguous_shift_is_skipped_and_says_why() {
         let snap = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![at(4, 1, "/w/api", "a")],
         };
         let mut panes = shifted_window(false);
@@ -1573,6 +1685,7 @@ mod tests {
     fn nothing_in_the_saved_directory_keeps_the_old_reason() {
         let snap = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![at(4, 1, "/w/gone", "a")],
         };
         let panes = shifted_window(false);
@@ -1586,6 +1699,7 @@ mod tests {
         // two entries that both fit the one pane in /w/api
         let snap = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![at(4, 2, "/w/api", "a"), at(4, 1, "/w/api", "b")],
         };
         let panes = shifted_window(false);
@@ -1595,6 +1709,7 @@ mod tests {
         // an exact match is never taken by another entry's fallback
         let snap = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![at(4, 1, "/w/api", "b"), at(4, 2, "/w/api", "a")],
         };
         let panes = shifted_window(false);
@@ -1622,6 +1737,7 @@ mod tests {
         let now = 10 * PENDING_MAX_AGE;
         let prev = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![
                 pend("p", now - 60),
                 // not pending: a session that was running at the last
@@ -1645,6 +1761,7 @@ mod tests {
     fn marking_pending_keeps_the_first_time_and_adds_what_is_missing() {
         let mut s = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![entry()],
         };
         let x = Entry {
@@ -1662,6 +1779,7 @@ mod tests {
     fn pending_entries_are_dropped_by_id_or_all_at_once() {
         let mut s = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![entry(), pend("a", 1), pend("b", 1)],
         };
         assert_eq!(drop_entries(&mut s, &["a".to_string()], false), 1);
@@ -1674,6 +1792,7 @@ mod tests {
     fn fresh_entries_are_placed_before_pending_ones() {
         let snap = Snapshot {
             saved: 1,
+            sidebars: Vec::new(),
             entries: vec![
                 Entry {
                     pending_since: Some(1),
@@ -1686,6 +1805,41 @@ mod tests {
         let p = plan(&snap, &panes, |_| true);
         assert_eq!(p[1].1.as_ref().unwrap().id, "%11");
         assert!(p[0].1.is_err(), "{:?}", p[0].1);
+    }
+
+    #[test]
+    fn sidebar_locations_are_saved() {
+        let panes = [sidebar_pane("%40", 4, 0), agent_pane("%1", "a")];
+        assert_eq!(sidebar_locations(&panes), ["main:4.0"]);
+    }
+
+    /// 2026-11-02: the old sidebar came back as a fish shell replaying its
+    /// scrollback (resurrect typed its command into the pane that had
+    /// shifted into its place).
+    #[test]
+    fn a_saved_sidebar_restored_as_a_shell_is_found() {
+        let saved = vec!["main:4.0".to_string(), "main:5.0".to_string()];
+        // window 4: a sidebar was added beside it, so the shell goes;
+        // window 5: none, so the shell becomes the sidebar
+        let panes = vec![
+            sidebar_pane("%40", 4, 0),
+            restored(shell("%10", "main", 4, 1, "/h"), "main:4.0"),
+            restored(shell("%11", "main", 4, 2, "/w/api"), "main:4.1"),
+            restored(shell("%20", "main", 5, 0, "/h"), "main:5.0"),
+            restored(shell("%21", "main", 5, 1, "/w/api"), "main:5.1"),
+        ];
+        let got: Vec<(&str, bool)> = stale_sidebars(&panes, &saved)
+            .into_iter()
+            .map(|(p, has)| (p.id.as_str(), has))
+            .collect();
+        assert_eq!(got, [("%10", true), ("%20", false)]);
+        // restored as a sidebar after all, busy, in a mode, or not one
+        // saved as a sidebar: left alone
+        let mut panes = panes;
+        panes[1].role = "sidebar".into();
+        panes[3].command = "nvim".into();
+        assert!(stale_sidebars(&panes, &saved).is_empty());
+        assert!(stale_sidebars(&shifted_window(true), &[]).is_empty());
     }
 
     #[test]
@@ -1702,6 +1856,7 @@ mod tests {
     fn snapshot_file_round_trips() {
         let s = Snapshot {
             saved: 7,
+            sidebars: Vec::new(),
             entries: vec![entry()],
         };
         let back: Snapshot = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();

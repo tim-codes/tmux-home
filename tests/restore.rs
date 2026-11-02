@@ -301,6 +301,7 @@ fn restore_log(s: &TestServer) -> String {
 fn write_snapshot(s: &TestServer, id: &str, proj: &Path, transcript: &Path) {
     let snap = tmux_home::restore::Snapshot {
         saved: 1,
+        sidebars: Vec::new(),
         entries: vec![tmux_home::restore::Entry {
             session: "alpha".into(),
             window: 1,
@@ -529,6 +530,71 @@ fn an_unresumed_entry_survives_later_saves_until_dropped() {
     assert!(load_snapshot(&s).entries.is_empty());
     run(&s, "agents-snapshot");
     assert!(load_snapshot(&s).entries.is_empty());
+    drop(dirs);
+}
+
+/// A saved sidebar that resurrect brought back as a plain shell (its
+/// start command names the saved location) is made a sidebar again in
+/// place, or closed when its window already has one.
+#[test]
+fn a_sidebar_restored_as_a_shell_is_made_a_sidebar_again() {
+    let _env = TestEnv::new();
+    let dirs = temp_base("stale");
+    let base = dirs.base.clone();
+    let contents = base.join("pane_contents");
+    std::fs::create_dir_all(&contents).unwrap();
+    let s = TestServer::start();
+    let snap = tmux_home::restore::Snapshot {
+        saved: 1,
+        entries: Vec::new(),
+        sidebars: vec!["alpha:1.0".into(), "alpha:2.0".into()],
+    };
+    let file = snapshot_file(&s);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, serde_json::to_vec(&snap).unwrap()).unwrap();
+    let restored = |loc: &str| {
+        let f = contents.join(format!("pane-{loc}"));
+        std::fs::write(&f, "old sidebar\n").unwrap();
+        format!("cat '{}'; exec /bin/sh -i", f.display())
+    };
+    let w1 = window(&s, 1, &base, "/usr/bin:/bin", Some(&restored("alpha:1.0")));
+    let w2 = window(&s, 2, &base, "/usr/bin:/bin", Some(&restored("alpha:2.0")));
+    // window 2 got a sidebar meanwhile (as the daemon's pin did)
+    let side = s
+        .tmux(&[
+            "split-window",
+            "-d",
+            "-b",
+            "-h",
+            "-t",
+            &w2,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "sleep 600",
+        ])
+        .trim()
+        .to_string();
+    s.tmux(&["set-option", "-p", "-t", &side, "@home_role", "sidebar"]);
+    wait_until("shells up", || {
+        [&w1, &w2]
+            .iter()
+            .all(|p| tmux_home::restore::restorable_shell(&opt(&s, p, "pane_current_command")))
+    });
+    run(&s, "restore-agents");
+    assert_eq!(opt(&s, &w1, "@home_role"), "sidebar");
+    assert!(
+        opt(&s, &w1, "pane_start_command").contains("sidebar --managed"),
+        "{}",
+        opt(&s, &w1, "pane_start_command")
+    );
+    let left = s.tmux(&["list-panes", "-t", "alpha:2", "-F", "#{pane_id}"]);
+    assert_eq!(left.trim(), side, "the stale shell closed");
+    let rlog = restore_log(&s);
+    assert!(
+        rlog.contains("made a sidebar again") && rlog.contains("closed"),
+        "{rlog}"
+    );
     drop(dirs);
 }
 
