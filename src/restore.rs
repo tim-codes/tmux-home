@@ -59,6 +59,9 @@ pub const GUARD: &str = "@home_agents_restored";
 /// restore), so its panes are the user's: set by the config, in
 /// resurrect's post-restore hook. `agents-snapshot` saves only then.
 pub const RESTORE_DONE: &str = "@home_restore_done";
+/// Server option: a restore has started (set by the config just before it
+/// runs resurrect's restore); until `RESTORE_DONE` it may be in flight.
+pub const RESTORE_STARTED: &str = "@home_restore_started";
 /// Pane option: the session id `restore-agents` claimed the pane for.
 pub const CLAIM: &str = "@home_restore";
 /// Pane option: the resume command has been typed into the pane.
