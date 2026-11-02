@@ -430,7 +430,9 @@ this section, and §7, §8, §10 and §13 where they conflict.
   server option `@home_save_last`, set to "now" on the daemon's first look,
   so the first save is an interval after start. One save at a time (the
   task awaits it; killed after 300 s); logged to `<state dir>/autosave.log`.
-  Sidebar creation waits on the same `@home_restore_done` (at most 60 s).
+  Sidebar creation waits on the same `@home_restore_done`: without limit
+  once `@home_restore_started` is set (a restore under way), else at most
+  60 s; and never splits a window with an untyped `restore-agents` claim.
 - Agent restore (pass 7, `src/restore.rs`; opt-in). The Claude hook keeps
   each pane's session in its options (`@home_session_id`,
   `@home_transcript`, `@home_cwd`, `@home_config_dir`). `tmux-home
@@ -446,7 +448,12 @@ this section, and §7, §8, §10 and §13 where they conflict.
   CLAUDE_CONFIG_DIR[=<dir>] claude --resume <id>` into each restored pane
   that is at a shell prompt in the saved directory and whose transcript
   still exists, one every `@home-restore-agents-delay` seconds from a
-  detached process.
+  detached process. A pane is matched by the location in its resurrect
+  start command, else by index, else (index shifted) as the window's one
+  idle shell in the saved directory. Entries it skips are kept pending
+  (`pending_since`) through later saves until resumed, dropped
+  (`tmux-home agents-drop`) or a week old. Saved sidebar locations that
+  come back as plain shells are respawned as sidebars (or closed).
 
 **Install:** a TPM plugin. `tmux-home.tmux` binds `@home-keys` (default `.`)
 and starts the daemon; without a built binary the key shows a one-line

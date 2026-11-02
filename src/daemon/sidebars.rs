@@ -7,10 +7,14 @@
 //!   or it already has a sidebar. Each window is decided once, when first
 //!   seen, so closing its sidebar with `prefix E` sticks. Auto-create is
 //!   allowed (and stays so) once the server is past its start-up (`Gate`):
-//!   at least `min_age` old, done restoring (until `@home_restore_done` is
-//!   set — by resurrect's post-restore hook, or by the config when there is
-//!   nothing to restore — at most `restore_hold`), and its windows and
-//!   panes unchanged for `stable`.
+//!   at least `min_age` old, done restoring (`@home_restore_done`, set by
+//!   resurrect's post-restore hook, or by the config when there is nothing
+//!   to restore), and its windows and panes unchanged for `stable`. Once a
+//!   restore has started (`@home_restore_started`, set by the config just
+//!   before it restores) the server waits for `@home_restore_done` however
+//!   long the restore takes: on 2026-11-02 the hook came 100 s after the
+//!   server started, and a time limit let sidebars in mid-restore. Only
+//!   with no restore under way is the wait capped, at `restore_hold`.
 //!   Windows that exist at that moment are never given one: a restore
 //!   creates windows by index and later selects panes and types commands by
 //!   index, so a sidebar added mid-restore shifts every index after it.
@@ -18,7 +22,9 @@
 //!   `sidebar-toggle --pin`; a linked window counts if any of its sessions
 //!   is pinned) that lacks a sidebar gets one at once — no start-up gate,
 //!   except never while a restore may be running — unless it is marked
-//!   `@home_sidebar_off`. A pinned window that loses its sidebar (the window
+//!   `@home_sidebar_off`. No sidebar, pinned or auto-created, is added to
+//!   a window with a pane `restore-agents` has claimed and not yet typed
+//!   into (`@home_restore` without `@home_restore_typed`). A pinned window that loses its sidebar (the window
 //!   toggle, `q`, a kill) is marked so, and keeps none until the session is
 //!   pinned again. The state dir's `pins` file keeps the pinned names: when
 //!   auto-create becomes allowed (after a restore) the sessions named there
@@ -113,10 +119,12 @@ impl Gate {
     }
 
     /// The start-up phase at server age `age`: restoring until
-    /// `restore_done` (`@home_restore_done` set), for at most
-    /// `restore_hold`; then young until `min_age`.
-    pub fn startup(&self, age: Duration, restore_done: bool) -> Startup {
-        if !restore_done && age < self.restore_hold {
+    /// `restore_done` (`@home_restore_done` set) — for as long as it takes
+    /// once a restore has started (`restore_started`,
+    /// `@home_restore_started`, set by the config before it restores),
+    /// else for at most `restore_hold`; then young until `min_age`.
+    pub fn startup(&self, age: Duration, restore_done: bool, restore_started: bool) -> Startup {
+        if !restore_done && (restore_started || age < self.restore_hold) {
             Startup::Restoring
         } else if age >= self.min_age {
             Startup::Past
@@ -584,10 +592,35 @@ fn startup(t: &Tmux, gate: &Gate, start: Option<u64>) -> Startup {
         return Startup::Restoring;
     };
     let age = Duration::from_secs(crate::agent::now().saturating_sub(start));
-    let done = !sidebar::global_option(t, "@home_restore_done")
-        .trim()
-        .is_empty();
-    gate.startup(age, done)
+    let set = |name: &str| !sidebar::global_option(t, name).trim().is_empty();
+    gate.startup(
+        age,
+        set(crate::restore::RESTORE_DONE),
+        set(crate::restore::RESTORE_STARTED),
+    )
+}
+
+/// The panes' restore claims as `list-panes -F CLAIMS_FMT` prints them.
+const CLAIMS_FMT: &str = "#{@home_restore}\x1f#{@home_restore_typed}";
+
+/// A pane of the window is claimed by `restore-agents` and not yet typed
+/// into: the restore isn't done with that window.
+fn restore_pending(out: &str) -> bool {
+    out.lines().any(|l| {
+        let (claim, typed) = l.split_once('\x1f').unwrap_or((l, ""));
+        !claim.is_empty() && typed.is_empty()
+    })
+}
+
+/// Whether `window` may be given a sidebar now: not while a pane in it
+/// waits for `restore-agents` to type its resume command (it finds the
+/// pane by ID, but a split still moves what the user sees mid-restore),
+/// nor when its panes can't be read.
+fn may_add(t: &Tmux, window: &str) -> bool {
+    match t.run(&["list-panes", "-t", window, "-F", CLAIMS_FMT]) {
+        Ok(out) => !restore_pending(&out),
+        Err(_) => false,
+    }
 }
 
 /// Carries out a plan (blocking: tmux commands, the state files). Failures
@@ -649,6 +682,10 @@ fn execute(t: &Tmux, plan: Plan) {
     let place = Placement::read(t);
     let bin = sidebar::sidebar_bin();
     for w in adds {
+        if !may_add(t, &w) {
+            // a pinned window is tried again later (`RETRY_ADD`)
+            continue;
+        }
         // the split is -d; still, never leave the focus on the sidebar
         let active = t.run(&["display-message", "-p", "-t", &w, "#{pane_id}"]);
         match sidebar::add(t, &w, &place, &bin) {
@@ -820,11 +857,38 @@ mod tests {
         use Startup::*;
         let g = Gate::default();
         let s = Duration::from_secs;
-        assert_eq!(g.startup(s(10), true), Young);
-        assert_eq!(g.startup(s(30), true), Past);
-        assert_eq!(g.startup(s(30), false), Restoring, "not done");
-        assert_eq!(g.startup(s(10), false), Restoring, "not done");
-        assert_eq!(g.startup(s(60), false), Past, "held at most 60 s");
+        // (age, @home_restore_done, @home_restore_started)
+        assert_eq!(g.startup(s(10), true, true), Young);
+        assert_eq!(g.startup(s(30), true, true), Past);
+        assert_eq!(g.startup(s(30), true, false), Past);
+        assert_eq!(g.startup(s(30), false, false), Restoring, "not done");
+        assert_eq!(g.startup(s(10), false, false), Restoring, "not done");
+        // no restore under way: held at most `restore_hold`
+        assert_eq!(g.startup(s(60), false, false), Past, "held at most 60 s");
+    }
+
+    /// 2026-11-02: resurrect's post-restore hook came 100 s after the
+    /// server started; the 60 s hold let pinned windows get sidebars mid-
+    /// restore, which shifted every pane index after them. A restore that
+    /// has started holds until it is done, however long it takes.
+    #[test]
+    fn a_restore_under_way_holds_the_gate_until_it_is_done() {
+        use Startup::*;
+        let g = Gate::default();
+        let s = Duration::from_secs;
+        for age in [10, 60, 100, 3600] {
+            assert_eq!(g.startup(s(age), false, true), Restoring, "{age} s");
+        }
+        assert_eq!(g.startup(s(100), true, true), Past);
+    }
+
+    #[test]
+    fn a_window_with_a_claim_not_yet_typed_has_restore_pending() {
+        // `#{@home_restore}\x1f#{@home_restore_typed}` per pane
+        assert!(!restore_pending(""));
+        assert!(!restore_pending("\x1f\n\x1f\n"), "no claims");
+        assert!(!restore_pending("sid\x1f1\n\x1f\n"), "typed already");
+        assert!(restore_pending("\x1f\nsid\x1f\n"), "claimed, not typed");
     }
 
     #[test]

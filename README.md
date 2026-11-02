@@ -752,11 +752,14 @@ created from then on, except in sessions named in `@home-sidebar-exclude`
 it, so closing one with `prefix E` sticks. Auto-create starts only once the
 server is past its start-up: at least 30 seconds old, its windows and panes
 unchanged for 5 seconds, and the restore done, `@home_restore_done` set
-(see below; at most 60 seconds' wait). Windows that exist at that moment
+(see below; however long it takes once `@home_restore_started` says a
+restore is under way, else at most 60 seconds' wait). Windows that exist at that moment
 never get one. (A restore creates windows and later selects panes and types
 commands into them by index; a sidebar added in between would shift them.)
 Pinned sessions don't wait for any of this (only for a restore to finish),
 and `@home-sidebar-exclude` doesn't apply to them: pinning is explicit.
+No sidebar is added to a window while `restore-agents` has a pane in it
+claimed and not yet typed into.
 A sidebar first seen by the daemon (a restored one keeps its saved width) is
 set to the sidebar width. When a window's last other pane exits, the
 daemon closes its sidebar, so no window is left holding only a sidebar; a
@@ -780,14 +783,18 @@ set -g @resurrect-hook-post-restore-all 'tmux set -g @home_restore_done 1'
 
 `@home_restore_done` is tmux-home's "this server's windows are the user's"
 signal: until it is set, nothing is autosaved, `agents-snapshot` saves
-nothing, and sidebars wait (at most 60 seconds). Your config sets it: the
+nothing, and sidebars wait: for as long as the restore takes when
+`@home_restore_started` is set (set it just before restoring, as below),
+else at most 60 seconds. A resurrect restore can take well over a minute,
+and a sidebar split into a window it hasn't reached shifts the pane
+indexes it restores by. Your config sets it: the
 post-restore hook above after a restore, and directly on a server that has
 nothing to restore. For example, restoring from the config when the
 server starts (in place of continuum's `@continuum-restore`), once per
 server (a reload finds the flag set and does nothing):
 
 ```tmux
-run-shell -b '[ -n "$(tmux show -gqv @home_restore_done)" ] || if [ -e ~/.local/share/tmux/resurrect/last ]; then ~/.tmux/plugins/tmux-resurrect/scripts/restore.sh; else tmux set -g @home_restore_done 1; fi'
+run-shell -b '[ -n "$(tmux show -gqv @home_restore_done)" ] || if [ -e ~/.local/share/tmux/resurrect/last ]; then tmux set -g @home_restore_started 1; ~/.tmux/plugins/tmux-resurrect/scripts/restore.sh; else tmux set -g @home_restore_done 1; fi'
 ```
 
 (after TPM's `run`, with your `@resurrect-dir` if you set one; restore.sh
@@ -848,7 +855,11 @@ and Stop record the session's id, transcript, directory and account
   sessions yet, and a save would overwrite the snapshot the restore needs
   (it logs `skip save: server not restored yet` instead). A server that
   starts with nothing to restore must set it too, e.g. in tmux.conf when
-  resurrect has no `last` snapshot.
+  resurrect has no `last` snapshot. A session a restore didn't resume is
+  kept, pending, through the saves after it (though no pane runs it), and
+  the next restore tries it again, until a pane runs it, a week has
+  passed, or `tmux-home agents-drop <session-id>…` (or `--pending`, all
+  of them) drops it. The tmux-home sidebars' locations are saved too.
 - **Restore.** After a restore, once per tmux server, `restore-agents`
   takes each saved pane that is back at a shell prompt (fish, bash, zsh,
   sh, …) in the saved directory, and whose transcript still exists
@@ -862,6 +873,13 @@ and Stop record the session's id, transcript, directory and account
   `@home-restore-agents-delay` seconds (default 2) from a background
   process, so a dozen sessions don't start their MCP servers at once.
   `env` runs the `claude` on `PATH`, not a shell function of that name.
+  A saved pane is found by the location resurrect restored it from (with
+  `@resurrect-capture-pane-contents on` its start command names it), else
+  at its saved index; when a pane added ahead of it has shifted its index,
+  by being the one idle shell in its window in the saved directory
+  (logged as `pane index shifted`; several such shells: skipped, logged).
+  A saved sidebar that came back as a plain shell is made a sidebar again
+  in place, or closed if its window has one already.
   Exiting claude leaves you at the shell. Every skip, and every resume, is
   logged to `restore.log` beside `agents.json`; a second restore on the
   same server (`prefix C-r`) types nothing, unless the first resumed

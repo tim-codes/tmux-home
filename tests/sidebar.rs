@@ -311,6 +311,59 @@ fn pins_survive_a_restart_through_the_state_file() {
     });
 }
 
+/// A restore under way (`@home_restore_started`, not yet done) holds pins
+/// back however long it takes (2026-11-02: a time limit let them in mid-
+/// restore, shifting resurrect's pane indexes); and a window with a pane
+/// `restore-agents` claimed but hasn't typed into gets none until it has.
+#[test]
+fn pins_wait_for_a_restore_under_way_and_for_pending_claims() {
+    let _env = TestEnv::new();
+    let s = TestServer::start();
+    toggle(&s, &["--pin", "--window", "alpha:0"]);
+    let s = TestServer::restart(s);
+    s.tmux(&["new-window", "-d", "-t", "alpha:"]);
+    s.tmux(&["set-option", "-gu", "@home_restore_done"]);
+    s.tmux(&["set-option", "-g", "@home_restore_started", "1"]);
+    quick_gate(&s);
+    // no hold by the clock at all: only the restore holds it
+    s.tmux(&["set-environment", "-g", "TMUX_HOME_RESTORE_HOLD", "0"]);
+    s.tmux(&[
+        "set-option",
+        "-p",
+        "-t",
+        "alpha:1.0",
+        "@home_restore",
+        "sid",
+    ]);
+    install_binding(&s);
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(fmt(&s, "alpha:", "#{@home_sidebar_pin}"), "", "restoring");
+    assert!(sidebars(&s, "alpha:0").is_empty(), "restoring");
+    s.tmux(&["set-option", "-g", "@home_restore_done", "1"]);
+    wait_until("a sidebar in alpha:0", || {
+        sidebars(&s, "alpha:0").len() == 1
+    });
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(sidebars(&s, "alpha:1").is_empty(), "a claim not typed yet");
+    s.tmux(&[
+        "set-option",
+        "-p",
+        "-t",
+        "alpha:1.0",
+        "@home_restore_typed",
+        "1",
+    ]);
+    // the pin is tried again after RETRY_ADD (10 s)
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while sidebars(&s, "alpha:1").len() != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no sidebar in alpha:1"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Auto-create's start-up gate, shortened: no minimum age, windows and
 /// panes unchanged for 300 ms. Set before the daemon starts (it reads
 /// the server's global environment).

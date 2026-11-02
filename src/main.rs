@@ -94,6 +94,17 @@ enum Cmd {
         #[arg(long, hide = true)]
         worker: bool,
     },
+    /// Drop agent sessions a restore left pending (kept in the snapshot
+    /// for a later restore) by session id, or all of them (`--pending`).
+    AgentsDrop {
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+        /// Every pending entry.
+        #[arg(long)]
+        pending: bool,
+        /// Session ids to drop.
+        ids: Vec<String>,
+    },
     /// R0 spike: measure control-mode side effects on a server and print a report.
     SpikeControl {
         #[arg(long)]
@@ -124,6 +135,11 @@ fn main() -> anyhow::Result<()> {
         } => return tmux_home::sidebar::toggle(socket, pin, window),
         Cmd::Query { socket, json: _ } => return tmux_home::client::query(socket),
         Cmd::AgentsSnapshot { socket } => return tmux_home::restore::snapshot_cli(socket),
+        Cmd::AgentsDrop {
+            socket,
+            pending,
+            ids,
+        } => return tmux_home::restore::drop_cli(socket, ids, pending),
         Cmd::RestoreAgents { socket, worker } => {
             return tmux_home::restore::restore_cli(socket, worker);
         }
@@ -145,6 +161,7 @@ fn main() -> anyhow::Result<()> {
         | Cmd::SidebarToggle { .. }
         | Cmd::AgentsSnapshot { .. }
         | Cmd::RestoreAgents { .. }
+        | Cmd::AgentsDrop { .. }
         | Cmd::Hook { .. } => {
             unreachable!()
         }
