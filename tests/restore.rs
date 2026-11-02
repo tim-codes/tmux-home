@@ -434,6 +434,52 @@ fn a_restore_that_claims_nothing_leaves_the_next_free() {
     drop(dirs);
 }
 
+/// A pane split in ahead of the saved one (2026-11-02: a sidebar added
+/// mid-restore) moves it to the next index; it is found by its directory
+/// as the window's one idle shell there, and resumed.
+#[test]
+fn a_pane_whose_index_shifted_is_still_resumed() {
+    let _env = TestEnv::new();
+    let dirs = temp_base("shifted");
+    let base = dirs.base.clone();
+    let proj = base.join("proj");
+    let other = base.join("other");
+    for d in [&proj, &other] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let (bin, log) = fake_claude_cli(&base);
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let transcript = base.join("t.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let s = TestServer::start();
+    s.tmux(&["set", "-g", "@home-restore-agents", "on"]);
+    s.tmux(&["set", "-g", "@home-restore-agents-delay", "0.2"]);
+    let id = "00000000-0000-4000-8000-0000000000e1";
+    write_snapshot(&s, id, &proj, &transcript);
+    let p = window(&s, 1, &proj, &path, None);
+    // the saved alpha:1.0 is now alpha:1.1
+    s.tmux(&[
+        "split-window",
+        "-d",
+        "-b",
+        "-h",
+        "-t",
+        &p,
+        "-c",
+        other.to_str().unwrap(),
+    ]);
+    assert_eq!(opt(&s, &p, "pane_index"), "1");
+    run(&s, "restore-agents");
+    assert_eq!(opt(&s, &p, "@home_restore"), id, "claimed");
+    wait_until("resumed", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| !l.is_empty())
+    });
+    let rlog = restore_log(&s);
+    assert!(rlog.contains("pane index shifted 1.0\u{2192}1.1"), "{rlog}");
+    assert!(rlog.contains("restore: 1 of 1 saved agents"), "{rlog}");
+    drop(dirs);
+}
+
 /// Through tmux-resurrect itself (skipped when it isn't installed): its
 /// save runs `agents-snapshot` from the post-save hook, the server goes
 /// away, a new one on the same socket restores, and the post-restore hook

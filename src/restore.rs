@@ -33,6 +33,12 @@
 //!   `@home_restore_typed`), so a dozen sessions don't start their MCP
 //!   servers at once and resurrect isn't held up. Typing into the shell
 //!   (not `respawn-pane`) leaves a usable shell when claude exits.
+//!   An entry's pane is the one resurrect restored from its location (its
+//!   start command names it), else the one at its location; when neither
+//!   is in the saved directory (a pane added ahead of it shifted its
+//!   index, as a sidebar split in mid-restore did on 2026-11-02), the one
+//!   idle shell in its window in that directory, logged as `pane index
+//!   shifted`; with several, none (ambiguous, logged).
 //!
 //! Everything is logged to `<state_dir>/restore.log`; neither command ever
 //! fails resurrect's hook.
@@ -125,13 +131,18 @@ pub struct LivePane {
     /// A Claude Code process runs under the pane (`agent::procs`; set by
     /// `list_panes`): a wrapper can leave it under the pane's shell.
     pub agent_proc: bool,
+    /// `@home_role`: `sidebar` marks a tmux-home sidebar.
+    pub role: String,
     pub pane_name: String,
+    /// `pane_start_command`: for a pane resurrect restored with its
+    /// contents, names the location it was saved at (`restored_from`).
+    pub start: String,
     pub path: String,
     pub session: String,
 }
 
 /// The fields `LivePane` reads; free text (path, session name) last.
-pub const PANE_FMT: &str = "#{pane_id}\x1f#{window_index}\x1f#{pane_index}\x1f#{pane_current_command}\x1f#{pane_in_mode}\x1f#{pane_dead}\x1f#{@home_agent}\x1f#{@home_session_id}\x1f#{@home_restore}\x1f#{@home_restore_typed}\x1f#{@home_transcript}\x1f#{@home_cwd}\x1f#{@home_config_dir}\x1f#{@home_forked_from}\x1f#{pane_pid}\x1f#{@home_pane_name}\x1f#{pane_current_path}\x1f#{session_name}\x1e";
+pub const PANE_FMT: &str = "#{pane_id}\x1f#{window_index}\x1f#{pane_index}\x1f#{pane_current_command}\x1f#{pane_in_mode}\x1f#{pane_dead}\x1f#{@home_agent}\x1f#{@home_session_id}\x1f#{@home_restore}\x1f#{@home_restore_typed}\x1f#{@home_transcript}\x1f#{@home_cwd}\x1f#{@home_config_dir}\x1f#{@home_forked_from}\x1f#{pane_pid}\x1f#{@home_role}\x1f#{@home_pane_name}\x1f#{pane_start_command}\x1f#{pane_current_path}\x1f#{session_name}\x1e";
 
 /// Parses `list-panes -F PANE_FMT` output; malformed records are dropped.
 pub fn parse_panes(out: &str) -> Vec<LivePane> {
@@ -139,8 +150,8 @@ pub fn parse_panes(out: &str) -> Vec<LivePane> {
         .map(|r| r.trim_start_matches('\n'))
         .filter(|r| !r.is_empty())
         .filter_map(|r| {
-            let f: Vec<&str> = r.splitn(18, '\x1f').collect();
-            if f.len() != 18 {
+            let f: Vec<&str> = r.splitn(20, '\x1f').collect();
+            if f.len() != 20 {
                 return None;
             }
             Some(LivePane {
@@ -160,9 +171,11 @@ pub fn parse_panes(out: &str) -> Vec<LivePane> {
                 forked_from: f[13].into(),
                 pid: f[14].parse().unwrap_or(0),
                 agent_proc: false,
-                pane_name: f[15].into(),
-                path: f[16].into(),
-                session: f[17].into(),
+                role: f[15].into(),
+                pane_name: f[16].into(),
+                start: f[17].into(),
+                path: f[18].into(),
+                session: f[19].into(),
             })
         })
         .collect()
@@ -442,6 +455,18 @@ pub fn check(
     command(e)
 }
 
+/// The location (`session:window.pane`) resurrect restored a pane from,
+/// read from its start command: with `@resurrect-capture-pane-contents`
+/// it is `cat '<dir>/pane-<location>'; exec <shell>`. Resurrect saves and
+/// `agents-snapshot` (its post-save hook) runs at the same moment, so this
+/// is the location the snapshot saved, however the pane has moved since.
+pub fn restored_from(start: &str) -> Option<String> {
+    let (_, rest) = start.split_once("cat '")?;
+    let (file, _) = rest.split_once('\'')?;
+    let (_, loc) = file.rsplit_once("/pane-")?;
+    (!loc.is_empty()).then(|| loc.to_string())
+}
+
 /// The live pane at `e`'s location.
 pub fn find<'a>(panes: &'a [LivePane], e: &Entry) -> Option<&'a LivePane> {
     panes
@@ -449,24 +474,116 @@ pub fn find<'a>(panes: &'a [LivePane], e: &Entry) -> Option<&'a LivePane> {
         .find(|p| p.session == e.session && p.window == e.window && p.pane == e.pane)
 }
 
+/// The pane that is `e`'s for sure: the one resurrect restored from `e`'s
+/// location (`restored_from`), else the one at that location, if it is
+/// in the saved directory, isn't a sidebar and wasn't restored from
+/// somewhere else.
+fn direct<'a>(panes: &'a [LivePane], e: &Entry) -> Option<&'a LivePane> {
+    let loc = e.location();
+    let mut from = panes
+        .iter()
+        .filter(|p| restored_from(&p.start).as_deref() == Some(loc.as_str()));
+    if let (Some(p), None) = (from.next(), from.next()) {
+        return Some(p);
+    }
+    find(panes, e).filter(|p| {
+        p.path == e.path
+            && p.role != crate::sidebar::ROLE
+            && restored_from(&p.start).is_none_or(|l| l == loc)
+    })
+}
+
+/// A pane at an idle shell prompt, unclaimed: one a resume can go into.
+fn idle_shell(p: &LivePane) -> bool {
+    !p.dead
+        && !p.in_mode
+        && p.claim.is_empty()
+        && !p.typed
+        && p.role != crate::sidebar::ROLE
+        && restorable_shell(&p.command)
+}
+
+/// When `e`'s location doesn't hold it (its pane index shifted: a pane was
+/// added before it, as a sidebar split in mid-restore did on 2026-11-02),
+/// the one idle shell in its session and window in the saved directory
+/// that no other entry has. Several: ambiguous, so none, and why.
+fn shifted<'a>(
+    panes: &'a [LivePane],
+    e: &Entry,
+    taken: &[&str],
+) -> Result<Option<&'a LivePane>, String> {
+    let c: Vec<&LivePane> = panes
+        .iter()
+        .filter(|p| p.session == e.session && p.window == e.window && p.path == e.path)
+        .filter(|p| idle_shell(p) && !taken.contains(&p.id.as_str()))
+        .collect();
+    match c.as_slice() {
+        [] => Ok(None),
+        [p] => Ok(Some(p)),
+        _ => Err(format!(
+            "pane index shifted, ambiguous: {} idle shells in {:?} in {}:{} ({})",
+            c.len(),
+            e.path,
+            e.session,
+            e.window,
+            c.iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        )),
+    }
+}
+
 /// What `restore-agents` claims: for each entry, its pane and command, or
 /// why it is skipped. A pane already claimed or typed into is never
-/// claimed again.
+/// claimed again, nor is one pane claimed for two entries. Entries whose
+/// pane is where it was saved (`direct`) are placed first; the rest then
+/// fall back to a shifted pane (`shifted`) among the panes left.
 pub fn plan<'a>(
     snap: &'a Snapshot,
     panes: &'a [LivePane],
     exists: impl Fn(&Path) -> bool,
 ) -> Vec<(&'a Entry, Result<&'a LivePane, String>)> {
+    let mut taken: Vec<&str> = Vec::new();
+    let mut out: Vec<Option<Result<&'a LivePane, String>>> = vec![None; snap.entries.len()];
+    let order = || 0..snap.entries.len();
+    for i in order() {
+        let e = &snap.entries[i];
+        if let Some(p) = direct(panes, e) {
+            out[i] = Some(if !p.claim.is_empty() || p.typed {
+                Err("already restored".to_string())
+            } else if taken.contains(&p.id.as_str()) {
+                Err(format!("pane {} taken by another entry", p.id))
+            } else {
+                check(e, Some(p), false, &exists).map(|_| p)
+            });
+            taken.push(&p.id);
+        }
+    }
+    for i in order() {
+        if out[i].is_some() {
+            continue;
+        }
+        let e = &snap.entries[i];
+        let r = match shifted(panes, e, &taken) {
+            Ok(Some(p)) => {
+                taken.push(&p.id);
+                check(e, Some(p), false, &exists).map(|_| p)
+            }
+            Ok(None) => match find(panes, e) {
+                Some(p) if (!p.claim.is_empty() || p.typed) && p.path == e.path => {
+                    Err("already restored".to_string())
+                }
+                p => check(e, p, false, &exists).map(|_| p.expect("checked")),
+            },
+            Err(why) => Err(why),
+        };
+        out[i] = Some(r);
+    }
     snap.entries
         .iter()
-        .map(|e| {
-            let p = find(panes, e);
-            let r = match p {
-                Some(p) if !p.claim.is_empty() || p.typed => Err("already restored".to_string()),
-                _ => check(e, p, false, &exists).map(|_| p.expect("checked")),
-            };
-            (e, r)
-        })
+        .zip(out)
+        .map(|(e, r)| (e, r.expect("planned")))
         .collect()
 }
 
@@ -617,6 +734,21 @@ fn claim(t: &Tmux, socket: &Path) -> anyhow::Result<()> {
     for (e, r) in plan(&snap, &panes, Path::exists) {
         match r {
             Ok(p) => {
+                if (p.window, p.pane) != (e.window, e.pane) {
+                    log(
+                        socket,
+                        &format!(
+                            "{} {}: pane index shifted {}.{}\u{2192}{}.{} ({})",
+                            e.location(),
+                            e.session_id,
+                            e.window,
+                            e.pane,
+                            p.window,
+                            p.pane,
+                            p.id
+                        ),
+                    );
+                }
                 t.run(&["set-option", "-p", "-t", &p.id, CLAIM, &e.session_id])?;
                 if let Some(n) = e.pane_name.as_deref().filter(|n| !n.is_empty()) {
                     t.run(&["set-option", "-p", "-t", &p.id, crate::ops::PANE_NAME, n])?;
@@ -773,9 +905,11 @@ mod tests {
 
     #[test]
     fn parses_list_panes() {
-        let out = "%3\x1f1\x1f0\x1f2.1.295\x1f0\x1f0\x1fclaude\x1fsid\x1f\x1f\x1f/t/sid.jsonl\x1f/w\x1f/h/.c\x1fparent\x1f42\x1fapi\x1f/w/x\x1fmain\x1e\n%4\x1f2\x1f1\x1ffish\x1f1\x1f0\x1f\x1f\x1fsid2\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f/w\x1fmy session\x1e\nbroken\x1e\n";
+        let out = "%3\x1f1\x1f0\x1f2.1.295\x1f0\x1f0\x1fclaude\x1fsid\x1f\x1f\x1f/t/sid.jsonl\x1f/w\x1f/h/.c\x1fparent\x1f42\x1f\x1fapi\x1fcat 'x/pane-main:1.0'; exec fish\x1f/w/x\x1fmain\x1e\n%4\x1f2\x1f1\x1ffish\x1f1\x1f0\x1f\x1f\x1fsid2\x1f1\x1f\x1f\x1f\x1f\x1f\x1fsidebar\x1f\x1f\x1f/w\x1fmy session\x1e\nbroken\x1e\n";
         let p = parse_panes(out);
         assert_eq!(p.len(), 2);
+        assert_eq!(p[0].start, "cat 'x/pane-main:1.0'; exec fish");
+        assert_eq!((p[0].role.as_str(), p[1].role.as_str()), ("", "sidebar"));
         assert_eq!(p[0].id, "%3");
         assert_eq!((p[0].window, p[0].pane), (1, 0));
         assert_eq!(p[0].command, "2.1.295");
@@ -1171,6 +1305,150 @@ mod tests {
         assert_eq!(p[0].1.as_ref().unwrap().id, "%1");
         assert_eq!(p[1].1.as_ref().unwrap_err(), "already restored");
         assert_eq!(p[2].1.as_ref().unwrap_err(), "already restored");
+    }
+
+    fn restored(p: LivePane, from: &str) -> LivePane {
+        LivePane {
+            start: format!(
+                "cat '/h/.local/share/tmux/resurrect/restore/pane_contents//pane-{from}'; exec /opt/homebrew/bin/fish"
+            ),
+            ..p
+        }
+    }
+
+    fn sidebar_pane(id: &str, window: u32, pane: u32) -> LivePane {
+        LivePane {
+            command: "bash".into(),
+            role: "sidebar".into(),
+            ..shell(id, "main", window, pane, "/h")
+        }
+    }
+
+    #[test]
+    fn the_location_a_pane_was_restored_from() {
+        let p = restored(shell("%1", "main", 4, 2, "/w"), "main:4.1");
+        assert_eq!(restored_from(&p.start).as_deref(), Some("main:4.1"));
+        // as tmux shows it, quoted
+        assert_eq!(
+            restored_from("\"cat '/d/pane_contents//pane-my s:1.0'; exec fish\"").as_deref(),
+            Some("my s:1.0")
+        );
+        assert_eq!(restored_from(""), None);
+        assert_eq!(restored_from("/bin/sh -c \"x\""), None);
+    }
+
+    /// 2026-11-02: a sidebar split in at index 0 mid-restore moved each
+    /// window's restored panes up one: the claude pane saved at main:4.1
+    /// came back at main:4.2, and main:4.1 was the old sidebar's shell.
+    fn shifted_window(with_start: bool) -> Vec<LivePane> {
+        let mut v = vec![
+            sidebar_pane("%40", 4, 0),
+            shell("%10", "main", 4, 1, "/h"),
+            shell("%11", "main", 4, 2, "/w/api"),
+        ];
+        if with_start {
+            v[1] = restored(v[1].clone(), "main:4.0");
+            v[2] = restored(v[2].clone(), "main:4.1");
+        }
+        v
+    }
+
+    fn at(window: u32, pane: u32, path: &str, sid: &str) -> Entry {
+        Entry {
+            window,
+            pane,
+            path: path.into(),
+            session_id: sid.into(),
+            ..entry()
+        }
+    }
+
+    #[test]
+    fn a_shifted_pane_is_found_by_the_location_resurrect_restored_it_from() {
+        let snap = Snapshot {
+            saved: 1,
+            entries: vec![at(4, 1, "/w/api", "a")],
+        };
+        let panes = shifted_window(true);
+        let p = plan(&snap, &panes, |_| true);
+        assert_eq!(p[0].1.as_ref().unwrap().id, "%11");
+    }
+
+    #[test]
+    fn a_shifted_pane_is_found_by_its_directory_when_it_is_the_only_one() {
+        let snap = Snapshot {
+            saved: 1,
+            entries: vec![at(4, 1, "/w/api", "a")],
+        };
+        let panes = shifted_window(false);
+        let p = plan(&snap, &panes, |_| true);
+        assert_eq!(p[0].1.as_ref().unwrap().id, "%11");
+        // not a sidebar, even one in the saved directory
+        let snap = Snapshot {
+            saved: 1,
+            entries: vec![at(4, 0, "/h", "a")],
+        };
+        let p = plan(&snap, &panes, |_| true);
+        assert_eq!(p[0].1.as_ref().unwrap().id, "%10");
+    }
+
+    #[test]
+    fn an_ambiguous_shift_is_skipped_and_says_why() {
+        let snap = Snapshot {
+            saved: 1,
+            entries: vec![at(4, 1, "/w/api", "a")],
+        };
+        let mut panes = shifted_window(false);
+        panes.push(shell("%12", "main", 4, 3, "/w/api"));
+        let p = plan(&snap, &panes, |_| true);
+        let err = p[0].1.as_ref().unwrap_err();
+        assert!(
+            err.contains("ambiguous") && err.contains("2 idle shells"),
+            "{err}"
+        );
+        // a busy pane or one in a mode isn't a candidate
+        panes[3].command = "nvim".into();
+        let p = plan(&snap, &panes, |_| true);
+        assert_eq!(p[0].1.as_ref().unwrap().id, "%11");
+        // another window's pane in the directory isn't either
+        let mut panes = shifted_window(false);
+        panes.push(shell("%13", "main", 5, 1, "/w/api"));
+        let p = plan(&snap, &panes, |_| true);
+        assert_eq!(p[0].1.as_ref().unwrap().id, "%11");
+    }
+
+    #[test]
+    fn nothing_in_the_saved_directory_keeps_the_old_reason() {
+        let snap = Snapshot {
+            saved: 1,
+            entries: vec![at(4, 1, "/w/gone", "a")],
+        };
+        let panes = shifted_window(false);
+        let p = plan(&snap, &panes, |_| true);
+        let err = p[0].1.as_ref().unwrap_err();
+        assert!(err.contains("saved in \"/w/gone\""), "{err}");
+    }
+
+    #[test]
+    fn a_pane_is_claimed_for_one_entry_only() {
+        // two entries that both fit the one pane in /w/api
+        let snap = Snapshot {
+            saved: 1,
+            entries: vec![at(4, 2, "/w/api", "a"), at(4, 1, "/w/api", "b")],
+        };
+        let panes = shifted_window(false);
+        let p = plan(&snap, &panes, |_| true);
+        assert_eq!(p[0].1.as_ref().unwrap().id, "%11");
+        assert!(p[1].1.is_err(), "{:?}", p[1].1);
+        // an exact match is never taken by another entry's fallback
+        let snap = Snapshot {
+            saved: 1,
+            entries: vec![at(4, 1, "/w/api", "b"), at(4, 2, "/w/api", "a")],
+        };
+        let panes = shifted_window(false);
+        let p = plan(&snap, &panes, |_| true);
+        assert_eq!(p[1].1.as_ref().unwrap().id, "%11", "exact");
+        assert!(p[0].1.is_err(), "{:?}", p[0].1);
     }
 
     #[test]
