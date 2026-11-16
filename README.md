@@ -809,6 +809,16 @@ runs `$(@resurrect-save-script-path) quiet` as continuum did, one save at a
 time; the first comes an interval after the daemon starts, and the time of
 the last is kept in `@home_save_last`, so a daemon restart keeps the
 rhythm. Saves, failures and skips go to `autosave.log` in the state dir.
+A save runs in its own process group: one that takes over 5 minutes is
+killed together with everything it started (resurrect's subshells, its
+`ps` per pane, the post-save hook), and no save starts while any of them
+is still alive. A due save is skipped while the 1-minute load average is
+above `@home-save-max-load` (default twice the logical CPUs; 0 = no
+limit) and tried again 15 seconds later:
+
+```tmux
+set -g @home-save-max-load 24      # skip autosaves above this load (0: never)
+```
 
 **Coming from tmux-continuum:** remove its `@plugin` line (and
 `@continuum-restore`, `@continuum-save-interval`), restore from the
