@@ -18,8 +18,16 @@
 //!   continuum runs it, with `$TMUX` naming this server (the script and its
 //!   hooks run bare `tmux`) and the tmux binary's directory first on `PATH`.
 //! - **One at a time:** the task waits for each save (at most
-//!   `SAVE_TIMEOUT`, then it is killed) before it looks again, so two saves
-//!   of its own never overlap; ticks missed meanwhile are dropped.
+//!   `SAVE_TIMEOUT`) before it looks again, so two saves of its own never
+//!   overlap; ticks missed meanwhile are dropped. A save runs in its own
+//!   process group, and a timed-out one is killed as a group: resurrect's
+//!   subshells, its `ps` per pane and the post-save hook with it. (Killing
+//!   only the script left those running, re-parented to launchd, while the
+//!   next save started: 14 at once under load, issue #35.) While any
+//!   process of the last save's group is still alive, no new save starts.
+//! - **Not under load:** a due save is skipped while the 1-minute load
+//!   average is above `@home-save-max-load` (default twice the logical
+//!   CPUs; 0 = no limit), and tried again on the next tick.
 //!
 //! Saves, failures and skips go to `<state_dir>/autosave.log`.
 
@@ -39,6 +47,50 @@ pub const LAST: &str = "@home_save_last";
 pub const LOG: &str = "autosave.log";
 /// A save that takes longer is killed.
 pub const SAVE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Skip a due save while the 1-minute load average is above this
+/// (default `default_max_load()`; 0 = no limit).
+pub const OPT_MAX_LOAD: &str = "@home-save-max-load";
+
+/// Twice the logical CPUs.
+pub fn default_max_load() -> f64 {
+    std::thread::available_parallelism().map_or(8, |n| n.get()) as f64 * 2.0
+}
+
+/// `@home-save-max-load`: a non-negative number; else the default.
+pub fn parse_max_load(v: &str) -> f64 {
+    match v.trim().parse::<f64>() {
+        Ok(x) if x.is_finite() && x >= 0.0 => x,
+        _ => default_max_load(),
+    }
+}
+
+/// True when a save should wait for the load to drop.
+pub fn too_loaded(load: Option<f64>, max: f64) -> bool {
+    max > 0.0 && load.is_some_and(|l| l > max)
+}
+
+/// The 1-minute load average, if the system tells.
+fn load_avg() -> Option<f64> {
+    let mut l = [0f64; 3];
+    // SAFETY: getloadavg writes at most 1 element into a 3-element buffer
+    let n = unsafe { libc::getloadavg(l.as_mut_ptr(), 1) };
+    (n >= 1).then_some(l[0])
+}
+
+/// True while any process of group `pgid` is alive.
+fn group_alive(pgid: i32) -> bool {
+    // SAFETY: signal 0 only checks; a negative pid names the group
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+fn kill_group(pgid: i32) {
+    // SAFETY: SIGKILL to the save's own process group, never pgid <= 1
+    if pgid > 1 {
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -124,6 +176,7 @@ struct Look {
     interval: u64,
     restore_done: bool,
     last: Option<u64>,
+    max_load: f64,
 }
 
 fn look(t: &Tmux) -> Look {
@@ -131,6 +184,7 @@ fn look(t: &Tmux) -> Look {
         interval: parse_interval(&global(t, OPT_INTERVAL)),
         restore_done: !global(t, "@home_restore_done").is_empty(),
         last: global(t, LAST).parse().ok(),
+        max_load: parse_max_load(&global(t, OPT_MAX_LOAD)),
     }
 }
 
@@ -145,8 +199,9 @@ fn save_script(t: &Tmux) -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".tmux/plugins/tmux-resurrect/scripts/save.sh"))
 }
 
-/// Runs one save; a line for the log.
-async fn save(t: &Tmux) -> String {
+/// Runs one save in its own process group; a line for the log. `group`
+/// gets the group's id as soon as the script starts.
+async fn save(t: &Tmux, group: &mut Option<i32>) -> String {
     let (script, pid) = {
         let t = t.clone();
         match tokio::task::spawn_blocking(move || {
@@ -177,10 +232,29 @@ async fn save(t: &Tmux) -> String {
         .env("PATH", path)
         .current_dir("/")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
     let t0 = Instant::now();
-    match tokio::time::timeout(SAVE_TIMEOUT, c.output()).await {
-        Err(_) => format!("autosave: {} timed out, killed", script.display()),
+    let child = match c.spawn() {
+        Ok(c) => c,
+        Err(e) => return format!("autosave: {}: {e}", script.display()),
+    };
+    // process_group(0): the group's id is the script's pid
+    let pgid = child.id().map(|p| p as i32);
+    *group = pgid;
+    match tokio::time::timeout(SAVE_TIMEOUT, child.wait_with_output()).await {
+        Err(_) => {
+            if let Some(g) = pgid {
+                kill_group(g);
+            }
+            format!(
+                "autosave: {} timed out after {}s, killed its process group",
+                script.display(),
+                SAVE_TIMEOUT.as_secs()
+            )
+        }
         Ok(Err(e)) => format!("autosave: {}: {e}", script.display()),
         Ok(Ok(out)) if out.status.success() => {
             format!("autosave: saved in {:.1}s", t0.elapsed().as_secs_f64())
@@ -202,6 +276,11 @@ pub(super) fn spawn(shared: Arc<Shared>, cfg: Config) -> JoinHandle<()> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // log a skip once per stretch of not being restored
         let mut skipped = false;
+        // ... and once per stretch of high load, or of a save still running
+        let mut load_skipped = false;
+        let mut busy_skipped = false;
+        // the last save's process group
+        let mut group: Option<i32> = None;
         loop {
             tick.tick().await;
             let l = {
@@ -232,10 +311,39 @@ pub(super) fn spawn(shared: Arc<Shared>, cfg: Config) -> JoinHandle<()> {
                 }
                 Decision::Save => {
                     skipped = false;
+                    if let Some(g) = group.filter(|g| group_alive(*g)) {
+                        if !busy_skipped {
+                            log(
+                                &socket,
+                                &format!(
+                                    "autosave: skip: last save's process group {g} still running"
+                                ),
+                            );
+                            busy_skipped = true;
+                        }
+                        continue;
+                    }
+                    busy_skipped = false;
+                    let load = load_avg();
+                    if too_loaded(load, l.max_load) {
+                        if !load_skipped {
+                            log(
+                                &socket,
+                                &format!(
+                                    "autosave: skip: load {:.1} above {} ({OPT_MAX_LOAD})",
+                                    load.unwrap_or_default(),
+                                    l.max_load
+                                ),
+                            );
+                            load_skipped = true;
+                        }
+                        continue;
+                    }
+                    load_skipped = false;
                     let _ = t
                         .run_async(&["set-option", "-g", LAST, &now.to_string()])
                         .await;
-                    let msg = save(&t).await;
+                    let msg = save(&t, &mut group).await;
                     log(&socket, &msg);
                 }
             }
@@ -246,6 +354,7 @@ pub(super) fn spawn(shared: Arc<Shared>, cfg: Config) -> JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
 
     #[test]
     fn interval_option() {
@@ -256,6 +365,47 @@ mod tests {
         for bad in ["-1", "x", "1.5"] {
             assert_eq!(parse_interval(bad), 5, "{bad}");
         }
+    }
+
+    #[test]
+    fn max_load_option() {
+        let d = default_max_load();
+        assert!(d >= 2.0);
+        assert_eq!(parse_max_load(""), d);
+        assert_eq!(parse_max_load(" 12.5 "), 12.5);
+        assert_eq!(parse_max_load("0"), 0.0);
+        for bad in ["-1", "x", "inf", "NaN"] {
+            assert_eq!(parse_max_load(bad), d, "{bad}");
+        }
+    }
+
+    #[test]
+    fn load_gate() {
+        assert!(!too_loaded(Some(57.0), 0.0), "0 = no limit");
+        assert!(too_loaded(Some(57.0), 24.0));
+        assert!(!too_loaded(Some(24.0), 24.0));
+        assert!(!too_loaded(None, 24.0), "unknown load never blocks");
+    }
+
+    #[test]
+    fn group_kill_takes_orphans_with_it() {
+        // a parent that leaves a long-lived child behind, as save.sh's
+        // subshells were left when only the script was killed
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60 & sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let g = child.id() as i32;
+        assert!(group_alive(g));
+        kill_group(g);
+        let mut child = child;
+        let _ = child.wait();
+        let t0 = Instant::now();
+        while group_alive(g) && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!group_alive(g), "the backgrounded sleep died too");
     }
 
     #[test]

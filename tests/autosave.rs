@@ -104,6 +104,7 @@ fn saves_on_the_interval_only_once_restored_and_one_at_a_time() {
         script.to_str().unwrap(),
     ]);
     s.tmux(&["set", "-g", "@home-save-interval", "1"]);
+    s.tmux(&["set", "-g", "@home-save-max-load", "0"]);
     let _d = daemon(&s);
 
     // not restored: never saved, the skip logged once
@@ -133,6 +134,7 @@ fn saves_on_the_interval_only_once_restored_and_one_at_a_time() {
 
     // 0: off
     s.tmux(&["set", "-g", "@home-save-interval", "0"]);
+    s.tmux(&["set", "-g", "@home-save-max-load", "0"]);
     std::thread::sleep(Duration::from_millis(1700)); // a save in flight ends
     let n = runs(&log).len();
     std::thread::sleep(Duration::from_millis(2000));
@@ -153,6 +155,7 @@ fn the_first_save_waits_an_interval() {
         script.to_str().unwrap(),
     ]);
     s.tmux(&["set", "-g", "@home-save-interval", "3"]);
+    s.tmux(&["set", "-g", "@home-save-max-load", "0"]);
     let _d = daemon(&s);
     std::thread::sleep(Duration::from_millis(1500));
     assert!(runs(&log).is_empty(), "not at once");
@@ -188,6 +191,7 @@ fn runs_resurrects_save_into_its_dir() {
     ]);
     s.tmux(&["new-window", "-d", "-t", "alpha:", "-n", "marked"]);
     s.tmux(&["set", "-g", "@home-save-interval", "1"]);
+    s.tmux(&["set", "-g", "@home-save-max-load", "0"]);
     let _d = daemon(&s);
     wait_until("a resurrect save", || rdir.join("last").exists());
     let layout = std::fs::read_to_string(rdir.join("last")).unwrap();
@@ -197,4 +201,35 @@ fn runs_resurrects_save_into_its_dir() {
             .any(|l| l.starts_with("window\talpha\t1\t:marked")),
         "{layout}"
     );
+}
+
+/// Above `@home-save-max-load` a due save is skipped (logged once) and
+/// tried again each tick; lifting the limit lets it run.
+#[test]
+fn skips_saves_under_load() {
+    let d = temp("autosave-load");
+    let log = d.0.join("runs.log");
+    let script = fake_save(&d.0, &log, 0.1);
+    let s = TestServer::start();
+    s.tmux(&["set", "-g", "@home_restore_done", "1"]);
+    s.tmux(&[
+        "set",
+        "-g",
+        "@resurrect-save-script-path",
+        script.to_str().unwrap(),
+    ]);
+    s.tmux(&["set", "-g", "@home-save-interval", "1"]);
+    // any machine running this test has a load above this
+    s.tmux(&["set", "-g", "@home-save-max-load", "0.0001"]);
+    let _d = daemon(&s);
+
+    std::thread::sleep(Duration::from_millis(3000));
+    assert!(runs(&log).is_empty(), "{:?}", runs(&log));
+    let alog = autosave_log(&s);
+    assert_eq!(alog.matches("skip: load").count(), 1, "{alog}");
+
+    s.tmux(&["set", "-g", "@home-save-max-load", "0"]);
+    wait_until("a save once the limit is lifted", || {
+        runs(&log).iter().any(|l| l == "end")
+    });
 }
